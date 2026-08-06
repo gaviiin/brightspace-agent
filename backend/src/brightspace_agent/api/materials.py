@@ -116,8 +116,10 @@ def get_material_file(
             # `sandbox` with no tokens: even if something did render, it
             # renders in an opaque origin with scripts, forms and top-level
             # navigation disabled -- so it cannot reach this origin's own
-            # endpoints. Applied to every /file response, PDFs included
-            # (the browser's built-in PDF viewer is unaffected).
+            # endpoints. Applied to every /file response, PDFs included:
+            # measured against the same request with no CSP at all, this
+            # header made no difference to how Chromium handled an
+            # iframe'd PDF.
             "Content-Security-Policy": "sandbox",
         },
     )
