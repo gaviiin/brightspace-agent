@@ -215,8 +215,10 @@ def _seed_course_content(session_factory, blob_store, course_id, *, with_syllabu
     )
 
 
-def _run(session_factory, backend, course_id, blob_store=None):
-    return asyncio.run(run_taxonomy_stage(session_factory, backend, course_id, blob_store=blob_store))
+def _run(session_factory, backend, course_id, blob_store=None, *, force=False):
+    return asyncio.run(
+        run_taxonomy_stage(session_factory, backend, course_id, blob_store=blob_store, force=force)
+    )
 
 
 def _topics(session_factory, course_id, version) -> list[Topic]:
@@ -692,7 +694,115 @@ def test_changed_inputs_miss_the_cache(session_factory, blob_store, backend, cou
 
 
 # --------------------------------------------------------------------------
-# (5) Degraded inputs
+# (5) A user-edited taxonomy outranks the agent's
+# --------------------------------------------------------------------------
+
+
+def _mark_one_topic_user_authored(session_factory, course_id, version) -> None:
+    """Simulate what pipeline/taxonomy_apply.py leaves behind after a
+    student's structural edit: at least one topic at the current version
+    with created_by='user'."""
+    with session_factory() as session:
+        topic = session.execute(
+            select(Topic)
+            .where(Topic.course_id == course_id, Topic.taxonomy_version == version)
+            .order_by(Topic.order_index)
+        ).scalars().first()
+        topic.name = "Arrays, Lists and Friends"
+        topic.created_by = "user"
+        session.commit()
+
+
+def test_full_run_leaves_a_user_edited_taxonomy_alone(session_factory, blob_store, backend, course_id):
+    """Regression: a full pipeline run used to silently revert taxonomy edits.
+
+    After a student's structural edit minted v2 with created_by='user'
+    topics, the next full run re-proposed from the same summaries, digested
+    differently from the edited map, and wrote the AGENT's taxonomy at v3 --
+    the student's edit gone, plus a re-classification bill for the whole
+    course. The stage now declines before it even asks the model.
+    """
+    _seed_course_content(session_factory, blob_store, course_id)
+    _run(session_factory, backend, course_id, blob_store)
+    assert _taxonomy_version(session_factory, course_id) == 1
+    _mark_one_topic_user_authored(session_factory, course_id, 1)
+    edited_slugs = [topic.slug for topic in _topics(session_factory, course_id, 1)]
+
+    # A stub that would happily propose something completely different --
+    # if it were ever asked.
+    stub = _StubBackend(
+        TaxonomyOut(
+            topics=[
+                TopicDef(slug="agent-one", name="Agent One", description="a"),
+                TopicDef(slug="agent-two", name="Agent Two", description="b"),
+                TopicDef(slug="agent-three", name="Agent Three", description="c"),
+            ],
+            edges=[],
+        )
+    )
+
+    stats = _run(session_factory, stub, course_id, blob_store)
+
+    assert stub.calls == 0  # not asked at all: declining is free
+    assert stats.skipped_user_taxonomy is True
+    assert stats.unchanged is True
+    assert stats.taxonomy_version == 1
+    assert stats.topics == 0
+    assert _taxonomy_version(session_factory, course_id) == 1
+    assert [topic.slug for topic in _topics(session_factory, course_id, 1)] == edited_slugs
+    assert _topics(session_factory, course_id, 2) == []  # no v3-style revert
+
+
+def test_force_re_proposes_over_a_user_edited_taxonomy(session_factory, blob_store, backend, course_id):
+    """The escape hatch: an explicit force run does write the agent's
+    taxonomy at a new version, user edits and all."""
+    _seed_course_content(session_factory, blob_store, course_id)
+    _run(session_factory, backend, course_id, blob_store)
+    _mark_one_topic_user_authored(session_factory, course_id, 1)
+
+    stub = _StubBackend(
+        TaxonomyOut(
+            topics=[
+                TopicDef(slug="agent-one", name="Agent One", description="a"),
+                TopicDef(slug="agent-two", name="Agent Two", description="b"),
+                TopicDef(slug="agent-three", name="Agent Three", description="c"),
+            ],
+            edges=[],
+        )
+    )
+
+    stats = _run(session_factory, stub, course_id, blob_store, force=True)
+
+    assert stub.calls == 1
+    assert stats.skipped_user_taxonomy is False
+    assert stats.unchanged is False
+    assert stats.taxonomy_version == 2
+    assert _taxonomy_version(session_factory, course_id) == 2
+    v2 = _topics(session_factory, course_id, 2)
+    assert [topic.slug for topic in v2] == ["agent-one", "agent-two", "agent-three"]
+    assert all(topic.created_by == "agent" for topic in v2)
+    # The edited version is history, not deleted.
+    assert len(_topics(session_factory, course_id, 1)) == 4
+
+
+def test_agent_authored_taxonomy_is_not_treated_as_user_edited(
+    session_factory, blob_store, backend, course_id
+):
+    """Sanity check on the other side of the guard: an ordinary
+    agent-authored taxonomy must still be re-proposable without `force`."""
+    _seed_course_content(session_factory, blob_store, course_id)
+    _run(session_factory, backend, course_id, blob_store)
+    counting = _CountingBackend(backend)
+
+    stats = _run(session_factory, counting, course_id, blob_store)
+
+    assert stats.skipped_user_taxonomy is False
+    assert stats.cached_hits == 1  # it really did go through the normal path
+    assert stats.unchanged is True
+
+
+# --------------------------------------------------------------------------
+# (6) Degraded inputs
 # --------------------------------------------------------------------------
 
 

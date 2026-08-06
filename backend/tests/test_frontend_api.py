@@ -284,6 +284,32 @@ def test_pipeline_run_with_stages_filter_only_runs_requested_stages(client, db_s
     assert status["stages"][0]["status"] == "complete"
 
 
+def test_pipeline_run_forwards_force_taxonomy_and_defaults_it_off(client, app, db_session_factory):
+    """`forceTaxonomy` is the only way to let S2 re-propose over a taxonomy
+    the student edited (see pipeline/stages/taxonomy.py). It has to default
+    to off: the ordinary Run button must never revert a user's edit."""
+    course_id = _add_course(db_session_factory)
+    seen: list[bool] = []
+    real_start = type(app.state.runner).start
+
+    def recording_start(self, cid, stages=None, *, force_taxonomy=False):
+        seen.append(force_taxonomy)
+        return real_start(self, cid, stages, force_taxonomy=force_taxonomy)
+
+    app.state.runner.start = recording_start.__get__(app.state.runner)
+
+    client.post(f"/api/courses/{course_id}/pipeline/run", json={"stages": ["assemble"]}, headers=CSRF_HEADERS)
+    _wait_for_pipeline_idle(client, course_id)
+    client.post(
+        f"/api/courses/{course_id}/pipeline/run",
+        json={"stages": ["assemble"], "forceTaxonomy": True},
+        headers=CSRF_HEADERS,
+    )
+    _wait_for_pipeline_idle(client, course_id)
+
+    assert seen == [False, True]
+
+
 def test_pipeline_status_shape(client, db_session_factory):
     course_id = _add_course(db_session_factory)
     resp = client.get(f"/api/courses/{course_id}/pipeline/status")

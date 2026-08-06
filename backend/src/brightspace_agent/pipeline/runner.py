@@ -293,9 +293,16 @@ class PipelineRunner:
         caller already committed stays committed regardless."""
         return course_id in self._active
 
-    def start(self, course_id: int, stages: list[str] | None = None) -> int:
+    def start(
+        self, course_id: int, stages: list[str] | None = None, *, force_taxonomy: bool = False
+    ) -> int:
         """Launch a background run for `course_id`. Returns a run token.
-        Raises `RunActiveError` if a run is already active for this course."""
+        Raises `RunActiveError` if a run is already active for this course.
+
+        `force_taxonomy` lets S2 re-propose over a taxonomy the student has
+        edited (see pipeline/stages/taxonomy.py's `force`). Default False:
+        an ordinary run leaves a user-edited taxonomy exactly as it is.
+        """
         if course_id in self._active:
             raise RunActiveError(course_id)
 
@@ -313,14 +320,27 @@ class PipelineRunner:
         self.event_bus.publish(
             {"type": "pipeline", "courseId": course_id, "runToken": run_token, "stage": None, "status": "run-started"}
         )
-        task = asyncio.create_task(self._execute(course_id, run_token, requested_stages, hooks))
+        task = asyncio.create_task(
+            self._execute(course_id, run_token, requested_stages, hooks, force_taxonomy)
+        )
         self._tasks[course_id] = task
         return run_token
 
     async def _execute(
-        self, course_id: int, run_token: int, requested_stages: set[str] | None, hooks: _RunHooks
+        self,
+        course_id: int,
+        run_token: int,
+        requested_stages: set[str] | None,
+        hooks: _RunHooks,
+        force_taxonomy: bool = False,
     ) -> None:
-        config = {"configurable": {"hooks": hooks, "requested_stages": requested_stages}}
+        config = {
+            "configurable": {
+                "hooks": hooks,
+                "requested_stages": requested_stages,
+                "force_taxonomy": force_taxonomy,
+            }
+        }
         initial_state: PipelineState = {"course_id": course_id, "stage_stats": {}, "error": None}
         try:
             # astream (not ainvoke) so per-node completion is observed as it

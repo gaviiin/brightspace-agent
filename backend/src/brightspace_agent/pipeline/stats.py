@@ -24,6 +24,13 @@ class StageStats:
     edges: int = 0
     taxonomy_version: int = 0
     unchanged: bool = False
+    # S2 declined to propose at all because the course's current taxonomy
+    # contains at least one user-authored topic: re-proposing would
+    # overwrite a student's own edit with the agent's map. Distinct from
+    # `unchanged` (which means "the agent proposed, and it matched"), so
+    # "we skipped you" is never mistaken for "we agreed with you". Cleared
+    # by an explicit forceTaxonomy run -- see run_taxonomy_stage's `force`.
+    skipped_user_taxonomy: bool = False
 
     # S3 classify
     classified: int = 0  # materials that got at least one assignment

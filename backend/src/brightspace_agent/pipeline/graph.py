@@ -136,6 +136,14 @@ def _requested_stages(config: RunnableConfig | None) -> set[str] | None:
     return _configurable(config).get("requested_stages")
 
 
+def _force_taxonomy(config: RunnableConfig | None) -> bool:
+    """Per-run opt-in to re-proposing over a user-edited taxonomy (see
+    run_taxonomy_stage's `force`). Absent -> False, so every existing
+    caller -- including a graph-level test invoking the compiled graph
+    directly -- keeps the safe default."""
+    return bool(_configurable(config).get("force_taxonomy"))
+
+
 def build_pipeline_graph(deps: PipelineDeps):
     """Compile the four-stage graph once; every run reuses this same
     compiled object (course_id and per-run hooks travel through the
@@ -182,7 +190,11 @@ def build_pipeline_graph(deps: PipelineDeps):
         hooks.on_start(stage)
         try:
             stats = await run_taxonomy_stage(
-                deps.session_factory, deps.backend, state["course_id"], blob_store=deps.blob_store
+                deps.session_factory,
+                deps.backend,
+                state["course_id"],
+                blob_store=deps.blob_store,
+                force=_force_taxonomy(config),
             )
         except Exception as exc:  # noqa: BLE001 -- includes TaxonomyStageError (too-small proposal)
             logger.warning("taxonomy stage failed for course %s: %s", state["course_id"], exc)

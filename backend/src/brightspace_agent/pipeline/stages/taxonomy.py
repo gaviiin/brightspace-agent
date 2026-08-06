@@ -26,6 +26,12 @@ Step 4 is skipped entirely when the validated proposal digests to the same
 taxonomy the course is already on: re-running the pipeline on an unchanged
 course must be a true no-op, because every new version would otherwise force
 S3 to re-classify (and re-bill) every material against an identical map.
+
+Steps 1-4 are skipped entirely -- before the LLM call -- when the course's
+current taxonomy contains any user-authored topic (`created_by='user'`, as
+pipeline/taxonomy_apply.py leaves them). The student's map wins by default;
+a caller that genuinely wants the agent's opinion again has to ask for it
+(`force=True`, surfaced as `forceTaxonomy` on POST /pipeline/run).
 """
 
 from __future__ import annotations
@@ -97,6 +103,7 @@ async def run_taxonomy_stage(
     course_id: int,
     *,
     blob_store: BlobStore | None = None,
+    force: bool = False,
 ) -> StageStats:
     """Propose and persist a new taxonomy version for `course_id`.
 
@@ -105,9 +112,34 @@ async def run_taxonomy_stage(
     course's topic schedule outright); without it, the stage falls back to
     the syllabus material's summary.
 
+    `force` overrides the user-taxonomy guard below. Default `False`: a
+    course whose current taxonomy contains any user-authored topic is left
+    alone (no LLM call, no write, `stats.skipped_user_taxonomy`). `True`
+    re-proposes anyway, which will write the agent's taxonomy at a new
+    version over the student's -- only pass it when a caller has explicitly
+    asked for that (see the `forceTaxonomy` flag on POST /pipeline/run).
+
     Raises `TaxonomyStageError` if the model's proposal is unusable.
     """
-    return await asyncio.to_thread(_run_sync, session_factory, backend, course_id, blob_store)
+    return await asyncio.to_thread(_run_sync, session_factory, backend, course_id, blob_store, force)
+
+
+def _has_user_topics(session: Session, course_id: int, version: int) -> bool:
+    """True if any topic at `version` was authored (or renamed, or merged)
+    by the student rather than the agent -- see pipeline/taxonomy_apply.py's
+    `_assign_slug_and_owner` for exactly when `created_by` becomes 'user'."""
+    return (
+        session.execute(
+            select(Topic.id)
+            .where(
+                Topic.course_id == course_id,
+                Topic.taxonomy_version == version,
+                Topic.created_by == "user",
+            )
+            .limit(1)
+        ).first()
+        is not None
+    )
 
 
 def _run_sync(
@@ -115,6 +147,7 @@ def _run_sync(
     backend: LLMBackend,
     course_id: int,
     blob_store: BlobStore | None,
+    force: bool = False,
 ) -> StageStats:
     stats = StageStats()
     model = backend.model_for_tier(_TIER)
@@ -123,6 +156,25 @@ def _run_sync(
         course = session.get(Course, course_id)
         if course is None:
             raise TaxonomyStageError(f"no course with id {course_id}")
+
+        # A student's own taxonomy outranks the agent's. Once an edit has
+        # minted a version carrying user-authored topics, the next full run
+        # would otherwise propose from the same summaries, digest
+        # differently from the edited map, and write the AGENT's taxonomy at
+        # version+1 -- silently reverting the edit, with re-classification
+        # billed on top. Checked before the LLM call, so declining costs
+        # nothing.
+        if not force and _has_user_topics(session, course_id, course.taxonomy_version):
+            stats.unchanged = True
+            stats.skipped_user_taxonomy = True
+            stats.taxonomy_version = course.taxonomy_version
+            logger.info(
+                "taxonomy: course %s is on a user-edited taxonomy (version %d); "
+                "leaving it alone (pass force=True to re-propose over it)",
+                course_id, course.taxonomy_version,
+            )
+            return stats
+
         inputs = _gather_inputs(session, course, blob_store)
         user_prompt = _build_user_prompt(inputs)
         cache_key = _cache_key(user_prompt, model)

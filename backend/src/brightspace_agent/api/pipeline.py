@@ -49,6 +49,11 @@ def _get_course_or_404(session: Session, course_id: int) -> Course:
 
 class PipelineRunRequest(CamelModel):
     stages: list[str] | None = None
+    # Opt-in to letting S2 re-propose over a taxonomy the student has
+    # edited by hand (see pipeline/stages/taxonomy.py's `force`). Default
+    # False, so the ordinary "Run pipeline" button can never silently
+    # revert a user's taxonomy edit; forcing is API-only for now.
+    force_taxonomy: bool = False
 
 
 class PipelineRunResponse(CamelModel):
@@ -64,8 +69,9 @@ async def start_pipeline_run(
 ) -> PipelineRunResponse:
     _get_course_or_404(session, course_id)
     stages = payload.stages if payload is not None else None
+    force_taxonomy = payload.force_taxonomy if payload is not None else False
     try:
-        run_token = runner.start(course_id, stages)
+        run_token = runner.start(course_id, stages, force_taxonomy=force_taxonomy)
     except RunActiveError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return PipelineRunResponse(run_token=run_token)
