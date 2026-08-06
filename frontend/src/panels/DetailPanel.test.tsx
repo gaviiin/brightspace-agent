@@ -1,0 +1,148 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { GraphPayload, MaterialDetail } from "../api/types";
+import { useUiStore } from "../state/uiStore";
+
+vi.mock("../api/client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../api/client")>();
+  return { ...actual, getMaterial: vi.fn() };
+});
+
+import { getMaterial } from "../api/client";
+import { DetailPanel } from "./DetailPanel";
+
+const mockedGetMaterial = vi.mocked(getMaterial);
+
+function fixturePayload(): GraphPayload {
+  return {
+    topics: [
+      { id: 1, slug: "intro", name: "Intro", description: "Intro topic desc.", orderIndex: 0, materialCount: 1 },
+      { id: 2, slug: "advanced", name: "Advanced", description: "Advanced topic desc.", orderIndex: 1, materialCount: 0 },
+      { id: 3, slug: "related-topic", name: "Related Topic", description: "", orderIndex: 2, materialCount: 0 },
+    ],
+    materials: [
+      { id: 10, title: "Lecture 1", kind: "other", status: "summarized", maxConfidence: 0.9 },
+    ],
+    // Topic 1 must be understood before Topic 2 -> from Topic 1's detail,
+    // this is a "required by" chip (Topic 2 requires Topic 1).
+    topicEdges: [
+      { fromTopicId: 1, toTopicId: 2, relation: "prerequisite" },
+      { fromTopicId: 1, toTopicId: 3, relation: "related" },
+    ],
+    attachments: [{ topicId: 1, materialId: 10, confidence: 0.9, rationale: "on topic" }],
+    meta: { taxonomyVersion: 1, orphanCount: 0 },
+  };
+}
+
+function renderWithQueryClient(ui: ReactNode) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
+}
+
+beforeEach(() => {
+  useUiStore.setState({ expandedTopicIds: new Set(), selection: null });
+  mockedGetMaterial.mockReset();
+});
+
+afterEach(cleanup);
+
+describe("DetailPanel: nothing selected", () => {
+  it("shows a hint", () => {
+    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+    expect(screen.getByText(/select a topic or material/i)).toBeTruthy();
+  });
+});
+
+describe("DetailPanel: topic selected", () => {
+  it("renders the topic's materials and edge chips", () => {
+    useUiStore.setState({ selection: { type: "topic", id: 1 } });
+    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+
+    expect(screen.getByText("Intro")).toBeTruthy();
+    expect(screen.getByText("Intro topic desc.")).toBeTruthy();
+    expect(screen.getByText("Lecture 1")).toBeTruthy();
+    expect(screen.getByText(/required by: Advanced/)).toBeTruthy();
+    expect(screen.getByText(/related: Related Topic/)).toBeTruthy();
+  });
+
+  it("clicking an edge chip moves the selection to that topic", () => {
+    useUiStore.setState({ selection: { type: "topic", id: 1 } });
+    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+
+    fireEvent.click(screen.getByText(/required by: Advanced/));
+
+    expect(useUiStore.getState().selection).toEqual({ type: "topic", id: 2 });
+  });
+
+  it("clicking a material in the topic's list selects that material", () => {
+    useUiStore.setState({ selection: { type: "topic", id: 1 } });
+    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+
+    fireEvent.click(screen.getByText("Lecture 1"));
+
+    expect(useUiStore.getState().selection).toEqual({ type: "material", id: 10 });
+  });
+});
+
+describe("DetailPanel: material selected", () => {
+  function materialFixture(): MaterialDetail {
+    return {
+      id: 10,
+      courseId: 1,
+      title: "Lecture 1",
+      kind: "other",
+      status: "summarized",
+      mime: null,
+      sizeBytes: null,
+      sourceUrl: null,
+      summary: "This lecture covers the basics.",
+      keyTerms: ["alpha", "beta"],
+      topicIds: [1],
+    };
+  }
+
+  it("renders the summary and key terms once loaded", async () => {
+    mockedGetMaterial.mockResolvedValue(materialFixture());
+    useUiStore.setState({ selection: { type: "material", id: 10 } });
+    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+
+    expect(await screen.findByText("This lecture covers the basics.")).toBeTruthy();
+    expect(screen.getByText("alpha")).toBeTruthy();
+    expect(screen.getByText("beta")).toBeTruthy();
+    expect(mockedGetMaterial).toHaveBeenCalledWith(10);
+  });
+
+  it("shows a topic chip with confidence, wired to select that topic", async () => {
+    mockedGetMaterial.mockResolvedValue(materialFixture());
+    useUiStore.setState({ selection: { type: "material", id: 10 } });
+    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+
+    const chip = await screen.findByText(/Intro.*90%/);
+    fireEvent.click(chip);
+
+    expect(useUiStore.getState().selection).toEqual({ type: "topic", id: 1 });
+  });
+
+  it("omits the Open in Brightspace link when there is no http sourceUrl", async () => {
+    mockedGetMaterial.mockResolvedValue(materialFixture());
+    useUiStore.setState({ selection: { type: "material", id: 10 } });
+    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+
+    await screen.findByText("This lecture covers the basics.");
+    expect(screen.queryByText(/Open in Brightspace/)).toBeNull();
+  });
+
+  it("shows an Open in Brightspace link when sourceUrl starts with http", async () => {
+    mockedGetMaterial.mockResolvedValue({ ...materialFixture(), sourceUrl: "https://example.d2l.com/x" });
+    useUiStore.setState({ selection: { type: "material", id: 10 } });
+    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+
+    const link = (await screen.findByText(/Open in Brightspace/)).closest("a");
+    expect(link?.getAttribute("href")).toBe("https://example.d2l.com/x");
+    expect(link?.getAttribute("target")).toBe("_blank");
+    expect(link?.getAttribute("rel")).toContain("noopener");
+  });
+});

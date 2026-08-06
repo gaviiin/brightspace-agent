@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>BrightSpace Agent</title>
+    <style>
+      body {
+        font: 13px/1.4 -apple-system, system-ui, sans-serif;
+        width: 320px;
+        margin: 0;
+        padding: 12px;
+        color: #202124;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 12px;
+      }
+      section {
+        margin-bottom: 14px;
+        padding-bottom: 12px;
+        border-bottom: 1px solid #e0e0e0;
+      }
+      section:last-child {
+        border-bottom: none;
+        margin-bottom: 0;
+        padding-bottom: 0;
+      }
+      h2 {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #5f6368;
+        margin: 0 0 6px;
+      }
+      label {
+        display: block;
+        margin-bottom: 4px;
+        color: #5f6368;
+      }
+      input[type="text"] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 5px 6px;
+        margin-bottom: 6px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        font: inherit;
+      }
+      button {
+        padding: 5px 10px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        background: #f8f9fa;
+        cursor: pointer;
+        font: inherit;
+      }
+      button:hover {
+        background: #eee;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .status-dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #bbb;
+        flex: none;
+      }
+      .status-dot.ok {
+        background: #34a853;
+      }
+      .status-dot.bad {
+        background: #ea4335;
+      }
+      #course-list {
+        list-style: none;
+        margin: 8px 0 0;
+        padding: 0;
+      }
+      #course-list li {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 0;
+      }
+      #course-list li span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #progress-bar-track {
+        background: #eee;
+        border-radius: 4px;
+        height: 6px;
+        overflow: hidden;
+        margin: 6px 0;
+      }
+      #progress-bar-fill {
+        background: #1a73e8;
+        height: 100%;
+        width: 0%;
+      }
+      #needs-login-banner {
+        display: none;
+        background: #fce8e6;
+        color: #a50e0e;
+        padding: 6px 8px;
+        border-radius: 4px;
+        margin-top: 6px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      #needs-login-banner.visible {
+        display: flex;
+      }
+      .muted {
+        color: #5f6368;
+        margin: 4px 0 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>BrightSpace Agent</h1>
+
+    <section id="backend-section">
+      <h2>Backend</h2>
+      <label for="token">Pairing token</label>
+      <input id="token" type="text" autocomplete="off" />
+      <div class="row">
+        <button id="test-connection" type="button">Test connection</button>
+        <span class="status-dot" id="backend-status-dot"></span>
+        <span id="backend-status-text" class="muted"></span>
+      </div>
+    </section>
+
+    <section id="brightspace-section">
+      <h2>Brightspace</h2>
+      <label for="origin">School origin</label>
+      <input id="origin" type="text" placeholder="https://school.brightspace.com" autocomplete="off" />
+      <div class="row">
+        <button id="use-current-tab" type="button">Use current tab</button>
+        <button id="connect" type="button">Connect</button>
+      </div>
+      <p id="brightspace-status" class="muted"></p>
+    </section>
+
+    <section id="courses-section">
+      <h2>Courses</h2>
+      <button id="discover" type="button">Discover</button>
+      <ul id="course-list"></ul>
+    </section>
+
+    <section id="progress-section">
+      <h2>Progress</h2>
+      <div id="progress-bar-track"><div id="progress-bar-fill"></div></div>
+      <p id="progress-text" class="muted">No sync running</p>
+      <p id="error-count" class="muted"></p>
+      <div id="needs-login-banner">
+        <span>Brightspace login expired.</span>
+        <button id="resume" type="button">Resume</button>
+      </div>
+    </section>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

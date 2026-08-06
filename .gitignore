@@ -1,1 +1,12 @@
 .worktrees/
+.superpowers/
+node_modules/
+dist/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+frontend/test-results/
+frontend/playwright-report/
+frontend/blob-report/
