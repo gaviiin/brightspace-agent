@@ -64,12 +64,39 @@ export interface RateLimitedFetcherOptions {
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Ceiling on any single 429 wait. A tenant is free to send
+ * `Retry-After: 86400`; honoring that literally would park the sync
+ * (and the service worker's alarm-driven watchdog) for a day. Two minutes
+ * is long enough to be a real backoff and short enough that the user's
+ * next retry still happens today. */
+const MAX_RETRY_DELAY_MS = 120_000;
+
+/**
+ * `Retry-After` in milliseconds, or null if it isn't a usable delay.
+ *
+ * The header is allowed to be an HTTP-date rather than a delay in seconds,
+ * and a proxy in front of a tenant can put anything at all there. `Number()`
+ * on either gives NaN, and `sleep(NaN)` resolves on the next tick -- so a
+ * single malformed header turned the backoff into a hot retry loop hammering
+ * a server that just told us to slow down. Anything not a finite,
+ * non-negative number of seconds is a miss, and the caller falls back to its
+ * exponential backoff (the HTTP-date form included: parsing it would need a
+ * clock-skew-tolerant date diff for a header D2L doesn't send).
+ */
+function parseRetryAfterMs(header: string | null): number | null {
+  if (header === null) return null;
+  const seconds = Number.parseFloat(header);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return seconds * 1000;
+}
+
 /**
  * Wraps global fetch with:
  *  - a concurrency cap (at most `maxConcurrent` requests in flight),
  *  - a shared cooldown when D2L reports a low X-Rate-Limit-Remaining,
- *  - 429 handling (Retry-After if present, else jittered exponential
- *    backoff), and
+ *  - 429 handling (Retry-After when it parses as a usable delay, else
+ *    jittered exponential backoff -- either way capped at
+ *    MAX_RETRY_DELAY_MS), and
  *  - immediate, non-retried failure on 401/403 (SessionExpiredError).
  */
 export class RateLimitedFetcher {
@@ -148,10 +175,9 @@ export class RateLimitedFetcher {
         break;
       }
 
-      const retryAfter = response.headers.get("Retry-After");
-      const delayMs =
-        retryAfter !== null ? Number(retryAfter) * 1000 : Math.random() * this.baseBackoffMs * 2 ** attempt;
-      await this.sleepImpl(delayMs);
+      const backoffMs = Math.random() * this.baseBackoffMs * 2 ** attempt;
+      const retryAfterMs = parseRetryAfterMs(response.headers.get("Retry-After"));
+      await this.sleepImpl(Math.min(retryAfterMs ?? backoffMs, MAX_RETRY_DELAY_MS));
     }
 
     throw new RateLimitError(`D2L rate limit exceeded after ${this.maxAttempts} attempts`);

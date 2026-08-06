@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import type { FlowEdge, FlowNode, MaterialNodeData, TopicNodeData } from "./transform";
+import type { FlowEdge, FlowEdgeRelation, FlowNode, MaterialNodeData, TopicNodeData } from "./transform";
 import { layoutFlow, MATERIAL_NODE_SIZE, TOPIC_NODE_SIZE } from "./layout";
 
 function topicNode(id: string): FlowNode {
@@ -21,8 +21,13 @@ function materialNode(id: string): FlowNode {
   };
 }
 
-function edge(id: string, source: string, target: string, type: FlowEdge["type"] = "attachment"): FlowEdge {
-  return { id, source, target, type };
+function edge(
+  id: string,
+  source: string,
+  target: string,
+  relation: FlowEdgeRelation = "attachment",
+): FlowEdge {
+  return { id, source, target, data: { relation } };
 }
 
 describe("layoutFlow", () => {

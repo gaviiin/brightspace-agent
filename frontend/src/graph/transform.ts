@@ -16,6 +16,8 @@
 //   visual meaning for the user -- it only steers the layout.
 // - Topic edges (prerequisite/related) are always visible, directed
 //   fromTopicId -> toTopicId exactly as the wire type names them.
+// - Every edge carries its kind in `data.relation` (see FlowEdgeRelation),
+//   never in React Flow's `edge.type`.
 import type { Edge, Node } from "@xyflow/react";
 
 import type { GraphAttachment, GraphMaterial, GraphPayload, GraphTopic } from "../api/types";
@@ -37,8 +39,21 @@ export type TopicFlowNode = Node<TopicNodeData, "topic">;
 export type MaterialFlowNode = Node<MaterialNodeData, "material">;
 export type FlowNode = TopicFlowNode | MaterialFlowNode;
 
-export type FlowEdgeType = "prerequisite" | "related" | "attachment";
-export type FlowEdge = Edge<Record<string, never>, FlowEdgeType>;
+/** What an edge MEANS. Deliberately carried in `edge.data.relation`, not in
+ * React Flow's own `edge.type`: `type` names a registered *renderer*, and
+ * React Flow falls back to the default renderer (logging error 011 as it
+ * goes) for anything it doesn't recognize -- so setting it to
+ * "prerequisite" bought a console warning per edge and changed nothing
+ * about how the edge drew. The entire visual difference between relations
+ * is stroke/marker styling, which edges.ts applies from this
+ * discriminator. */
+export type FlowEdgeRelation = "prerequisite" | "related" | "attachment";
+
+export interface FlowEdgeData extends Record<string, unknown> {
+  relation: FlowEdgeRelation;
+}
+
+export type FlowEdge = Edge<FlowEdgeData>;
 
 export function topicNodeId(topicId: number): string {
   return `topic-${topicId}`;
@@ -103,7 +118,7 @@ export function toFlow(
     for (const attachment of attachments) {
       edges.push({
         id: `att-${attachment.topicId}-${material.id}`,
-        type: "attachment",
+        data: { relation: "attachment" },
         source: topicNodeId(attachment.topicId),
         target: materialNodeId(material.id),
       });
@@ -113,7 +128,7 @@ export function toFlow(
   for (const topicEdge of payload.topicEdges) {
     edges.push({
       id: `topic-edge-${topicEdge.fromTopicId}-${topicEdge.toTopicId}-${topicEdge.relation}`,
-      type: topicEdge.relation,
+      data: { relation: topicEdge.relation },
       source: topicNodeId(topicEdge.fromTopicId),
       target: topicNodeId(topicEdge.toTopicId),
     });

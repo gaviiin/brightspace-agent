@@ -97,6 +97,17 @@ def _estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> flo
 # --------------------------------------------------------------------------
 
 
+# Output budget per tier. The fast tier answers one small structured
+# question at a time (a DocSummary, a 1-3 topic classification), so 2048 is
+# plenty. The smart tier is S2's whole-course taxonomy: up to 30 topics,
+# each with a name, a slug, a description and module hints, plus the edge
+# list -- comfortably past 2048 output tokens on a real course, and a
+# truncated response fails schema validation, burns the one retry, and
+# raises LLMCallError, i.e. the stage fails on exactly the courses big
+# enough to need it most.
+_MAX_TOKENS_BY_TIER: dict[Tier, int] = {"fast": 2048, "smart": 8192}
+
+
 class AnthropicBackend:
     """Real backend: one `ChatAnthropic` per tier (lazily built, cached),
     structured output via `with_structured_output(schema, include_raw=True)`
@@ -118,7 +129,7 @@ class AnthropicBackend:
             self._chat_models[tier] = ChatAnthropic(
                 model=self.model_for_tier(tier),
                 api_key=self._settings.anthropic_api_key,
-                max_tokens=2048,
+                max_tokens=_MAX_TOKENS_BY_TIER[tier],
             )
         return self._chat_models[tier]
 

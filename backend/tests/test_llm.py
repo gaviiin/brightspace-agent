@@ -198,6 +198,18 @@ def test_anthropic_backend_model_for_tier_matches_settings():
     assert backend.model_for_tier("smart") == Settings().smart_model
 
 
+def test_smart_tier_gets_a_larger_output_budget_than_fast():
+    """S2 asks one call for a whole course's taxonomy -- up to 30 topics
+    with descriptions and hints, plus the edge list. At the old flat 2048,
+    a big course's answer got truncated mid-JSON, failed schema validation,
+    burned the single retry, and raised LLMCallError: the stage failed on
+    exactly the courses that needed it most."""
+    backend = AnthropicBackend(Settings(anthropic_api_key="fake-key-not-used"))
+
+    assert backend._get_chat_model("fast").max_tokens == 2048
+    assert backend._get_chat_model("smart").max_tokens == 8192
+
+
 # --------------------------------------------------------------------------
 # make_backend selection
 # --------------------------------------------------------------------------

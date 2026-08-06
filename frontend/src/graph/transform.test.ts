@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { GraphPayload } from "../api/types";
+import { styleEdge } from "./edges";
 import { materialNodeId, toFlow, topicNodeId } from "./transform";
 
 // ---------------------------------------------------------------------------
@@ -44,14 +45,20 @@ describe("toFlow: collapsed graph", () => {
     expect(topicNodes).toHaveLength(3); // topics 1, 2, and Unsorted (0)
     expect(materialNodes).toHaveLength(0);
 
-    const topicEdges = edges.filter((e) => e.type === "prerequisite" || e.type === "related");
-    const attachmentEdges = edges.filter((e) => e.type === "attachment");
+    const topicEdges = edges.filter(
+      (e) => e.data?.relation === "prerequisite" || e.data?.relation === "related",
+    );
+    const attachmentEdges = edges.filter((e) => e.data?.relation === "attachment");
     expect(topicEdges).toHaveLength(1);
     expect(topicEdges[0]).toMatchObject({
       source: topicNodeId(1),
       target: topicNodeId(2),
-      type: "prerequisite",
+      data: { relation: "prerequisite" },
     });
+    // React Flow's own `type` is left unset on purpose: it names a
+    // registered renderer, and an unregistered value warns on every render
+    // (see FlowEdgeRelation). The relation lives in `data`.
+    expect(topicEdges[0].type).toBeUndefined();
     expect(attachmentEdges).toHaveLength(0);
   });
 });
@@ -66,7 +73,7 @@ describe("toFlow: expanding a single topic", () => {
     // not expanded here).
     expect(materialNodeIds.sort()).toEqual([materialNodeId(10), materialNodeId(12)].sort());
 
-    const attachmentEdges = edges.filter((e) => e.type === "attachment");
+    const attachmentEdges = edges.filter((e) => e.data?.relation === "attachment");
     expect(attachmentEdges).toHaveLength(2);
     expect(attachmentEdges.map((e) => e.id).sort()).toEqual(
       ["att-1-10", "att-1-12"].sort(),
@@ -91,7 +98,9 @@ describe("toFlow: a material attached to two expanded topics", () => {
     const sharedNodes = nodes.filter((n) => n.id === materialNodeId(12));
     expect(sharedNodes).toHaveLength(1);
 
-    const sharedEdges = edges.filter((e) => e.type === "attachment" && e.target === materialNodeId(12));
+    const sharedEdges = edges.filter(
+      (e) => e.data?.relation === "attachment" && e.target === materialNodeId(12),
+    );
     expect(sharedEdges).toHaveLength(2);
     expect(sharedEdges.map((e) => e.source).sort()).toEqual([topicNodeId(1), topicNodeId(2)].sort());
   });
@@ -139,6 +148,34 @@ describe("toFlow: deterministic ordering", () => {
       .map((n) => (n.data as { material: { title: string } }).material.title);
     const sortedTitles = [...materialTitlesInOrder].sort((x, y) => x.localeCompare(y));
     expect(materialTitlesInOrder).toEqual(sortedTitles);
+  });
+});
+
+describe("toFlow + styleEdge: the relation reaches the rendered edge", () => {
+  it("gives every edge a registered (i.e. unset) type and a relation-appropriate style", () => {
+    // The move of the discriminator from `edge.type` (which named a React
+    // Flow renderer that didn't exist -- error 011 on every render, and the
+    // default edge drawn anyway) into `edge.data.relation` is only safe if
+    // styling still lands, since styling is the ONLY thing that visually
+    // distinguishes the three relations. GraphView composes exactly these
+    // two functions, and can't be asserted on directly: React Flow needs
+    // measured node dimensions before it renders any edge at all, and
+    // JSDOM never supplies them.
+    const payload = fixturePayload();
+    const { edges } = toFlow(payload, new Set([1, 2]), null);
+    const styled = edges.map(styleEdge);
+
+    for (const edge of styled) {
+      expect(edge.type).toBeUndefined();
+    }
+
+    const byRelation = (relation: string) => styled.filter((e) => e.data?.relation === relation);
+    expect(byRelation("prerequisite")[0].style).toMatchObject({ stroke: "var(--bsa-edge-strong)" });
+    expect(byRelation("prerequisite")[0].markerEnd).toBeDefined();
+    for (const attachment of byRelation("attachment")) {
+      expect(attachment.style).toMatchObject({ stroke: "var(--bsa-edge-attach)" });
+      expect(attachment.markerEnd).toBeUndefined(); // no arrowhead: direction is layout-only
+    }
   });
 });
 

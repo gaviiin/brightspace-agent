@@ -281,6 +281,42 @@ describe("RateLimitedFetcher retry/backoff", () => {
     randomSpy.mockRestore();
   });
 
+  it("falls back to the backoff delay when Retry-After isn't a usable number", async () => {
+    // An HTTP-date is a legal Retry-After, and a proxy can put anything
+    // there. Number()-ing either gives NaN, and sleep(NaN) resolves on the
+    // next tick -- turning the backoff into a hot retry loop against a
+    // server that just asked us to slow down.
+    for (const header of ["Wed, 21 Oct 2015 07:28:00 GMT", "soon", "", "-5"]) {
+      const sleepImpl = vi.fn().mockResolvedValue(undefined);
+      const fetchImpl = vi
+        .fn()
+        .mockResolvedValueOnce(new Response(null, { status: 429, headers: { "Retry-After": header } }))
+        .mockResolvedValueOnce(new Response("ok", { status: 200 }));
+      const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
+      const fetcher = new RateLimitedFetcher({ fetchImpl, sleepImpl, baseBackoffMs: 1000 });
+
+      const response = await fetcher.fetch("https://x.example/y");
+
+      expect(response.status).toBe(200);
+      expect(sleepImpl).toHaveBeenCalledTimes(1);
+      expect(sleepImpl).toHaveBeenCalledWith(500); // 0.5 * 1000 * 2^0, not NaN
+      randomSpy.mockRestore();
+    }
+  });
+
+  it("clamps an absurd Retry-After to the 120s ceiling", async () => {
+    const sleepImpl = vi.fn().mockResolvedValue(undefined);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 429, headers: { "Retry-After": "86400" } }))
+      .mockResolvedValueOnce(new Response("ok", { status: 200 }));
+    const fetcher = new RateLimitedFetcher({ fetchImpl, sleepImpl });
+
+    await fetcher.fetch("https://x.example/y");
+
+    expect(sleepImpl).toHaveBeenCalledWith(120_000);
+  });
+
   it("throws SessionExpiredError on 401 without retrying", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 401 }));
     const sleepImpl = vi.fn().mockResolvedValue(undefined);
