@@ -10,7 +10,7 @@ import asyncio
 import json
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from brightspace_agent.agents.llm import LLMCallError, MockBackend
 from brightspace_agent.agents.schemas import ClassificationOut, TopicAssignment
@@ -309,7 +309,9 @@ def test_same_sha_reuses_cache_without_a_new_call(session_factory, backend, cour
         cache_rows = list(session.execute(select(LlmCache).where(LlmCache.stage == "classify")).scalars().all())
     assert len(cache_rows) == 1
     assert cache_rows[0].sha256 == "shared-sha"
-    assert cache_rows[0].prompt_version.startswith(f"{PROMPT_VERSION}:tax1")
+    # Keyed on the taxonomy's *content*, not its version number.
+    assert cache_rows[0].prompt_version.startswith(f"{PROMPT_VERSION}:")
+    assert "tax1" not in cache_rows[0].prompt_version
 
     # The same bytes appear again (re-synced, or attached under a second
     # module): identical content, so the cached classification is reused.
@@ -335,6 +337,63 @@ def test_rerun_is_a_no_op_with_no_duplicate_rows(session_factory, backend, cours
     assert counting.calls == 1  # worklist empty: not even a cache lookup is needed
     assert second.classified == 0
     assert len(_rows(session_factory, material_id=material_id)) == 2
+
+
+def test_unusable_cache_row_is_replaced_rather_than_wedging_the_material(session_factory, backend, course_id):
+    """A JSON-valid but schema-invalid row must be a miss, not a permanent
+    failure: validating only at the point of use would raise on every run,
+    and an insert-or-ignore write would never replace the bad row."""
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    material_id = _add_material(session_factory, course_id, title="Lecture 5", sha256="poison-sha")
+    counting = _CountingBackend(backend)
+    _run(session_factory, counting, course_id)
+    assert counting.calls == 1
+
+    with session_factory() as session:
+        session.execute(delete(MaterialTopic).where(MaterialTopic.material_id == material_id))
+        row = session.execute(select(LlmCache).where(LlmCache.stage == "classify")).scalar_one()
+        row.output_json = json.dumps({"assignments": "not a list at all"})
+        session.commit()
+
+    stats = _run(session_factory, counting, course_id)
+
+    assert counting.calls == 2  # re-asked the model instead of raising
+    assert stats.failed == 0
+    assert len(_rows(session_factory, material_id=material_id)) == 2
+    with session_factory() as session:
+        rows = list(session.execute(select(LlmCache).where(LlmCache.stage == "classify")).scalars().all())
+    assert len(rows) == 1
+    assert json.loads(rows[0].output_json)["assignments"]  # the poison was overwritten
+
+
+def test_more_than_three_assignments_keeps_the_top_three(session_factory, course_id):
+    _write_taxonomy(
+        session_factory, course_id, 1,
+        [*TAXONOMY_V1, ("complexity", "Complexity", "Asymptotics."), ("recursion", "Recursion", "Base cases.")],
+    )
+    material_id = _add_material(session_factory, course_id, title="Everything Lecture")
+    stub = _StubBackend(
+        ClassificationOut(
+            assignments=[
+                TopicAssignment(topic_slug="arrays-and-lists", confidence=0.5, rationale="d"),
+                TopicAssignment(topic_slug="sorting-algorithms", confidence=0.95, rationale="a"),
+                TopicAssignment(topic_slug="graph-algorithms", confidence=0.3, rationale="e"),
+                TopicAssignment(topic_slug="complexity", confidence=0.9, rationale="b"),
+                TopicAssignment(topic_slug="recursion", confidence=0.7, rationale="c"),
+            ]
+        )
+    )
+
+    stats = _run(session_factory, stub, course_id)
+
+    rows = _rows(session_factory, material_id=material_id)
+    assert len(rows) == 3
+    assert {_slug_of(session_factory, row.topic_id) for row in rows} == {
+        "sorting-algorithms",
+        "complexity",
+        "recursion",
+    }
+    assert stats.assignments == 3
 
 
 # --------------------------------------------------------------------------
@@ -371,6 +430,28 @@ def test_version_bump_reclassifies_and_keeps_old_rows(session_factory, backend, 
         "graphs",
     }
     assert stats.classified == 1
+
+
+def test_same_taxonomy_content_at_a_new_version_reuses_the_cache(session_factory, backend, course_id):
+    """A version number is not a reason to re-bill a course. Only the
+    taxonomy's content is."""
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    material_id = _add_material(session_factory, course_id, title="Lecture 5")
+    counting = _CountingBackend(backend)
+
+    _run(session_factory, counting, course_id)
+    assert counting.calls == 1
+
+    # Byte-identical taxonomy, written again at version 2 (as an older S2
+    # would have done on every sync).
+    _write_taxonomy(session_factory, course_id, 2, TAXONOMY_V1)
+
+    stats = _run(session_factory, counting, course_id)
+
+    assert counting.calls == 1  # no new LLM call
+    assert stats.cached_hits == 1
+    assert len(_rows(session_factory, material_id=material_id, version=2)) == 2
+    assert len(_rows(session_factory, material_id=material_id, version=1)) == 2
 
 
 # --------------------------------------------------------------------------

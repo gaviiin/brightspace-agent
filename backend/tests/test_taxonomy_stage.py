@@ -440,9 +440,13 @@ def test_more_than_thirty_topics_truncated_to_thirty(session_factory, blob_store
 # --------------------------------------------------------------------------
 
 
-def test_rerun_with_unchanged_inputs_reuses_cache_and_writes_a_new_version(
-    session_factory, blob_store, backend, course_id
-):
+def test_rerun_with_unchanged_inputs_is_a_no_op(session_factory, blob_store, backend, course_id):
+    """An unchanged course must cost nothing and change nothing.
+
+    A new version per run would be invisible in the UI but expensive
+    everywhere else: S3's worklist is "materials with no row at the current
+    version", so every bump re-classifies the entire course.
+    """
     _seed_course_content(session_factory, blob_store, course_id)
     counting = _CountingBackend(backend)
 
@@ -459,19 +463,114 @@ def test_rerun_with_unchanged_inputs_reuses_cache_and_writes_a_new_version(
 
     assert counting.calls == 1  # cache hit: no new LLM call
     assert second_stats.cached_hits == 1
-    assert second_stats.taxonomy_version == 2
-    assert _taxonomy_version(session_factory, course_id) == 2
+    assert second_stats.unchanged is True
+    assert second_stats.topics == 0  # counters report rows written
+    assert second_stats.taxonomy_version == 1
+    assert _taxonomy_version(session_factory, course_id) == 1  # not bumped
 
-    v1_topics = _topics(session_factory, course_id, 1)
-    v2_topics = _topics(session_factory, course_id, 2)
-    assert len(v1_topics) == 4  # history kept
-    assert [topic.slug for topic in v2_topics] == [topic.slug for topic in v1_topics]
+    assert len(_topics(session_factory, course_id, 1)) == 4  # v1 intact
+    assert _topics(session_factory, course_id, 2) == []  # and no v2 was minted
 
     with session_factory() as session:
         cache_rows_after = list(
             session.execute(select(LlmCache).where(LlmCache.stage == "taxonomy")).scalars().all()
         )
-    assert len(cache_rows_after) == 1  # the hit did not insert a duplicate
+        assert len(cache_rows_after) == 1  # the hit did not insert a duplicate
+        edges = list(session.execute(select(TopicEdge)).scalars().all())
+    assert len(edges) == 1  # no duplicate edge set either
+
+
+def test_changed_taxonomy_content_still_bumps_the_version(session_factory, blob_store, course_id):
+    _seed_course_content(session_factory, blob_store, course_id)
+    first = _StubBackend(
+        TaxonomyOut(
+            topics=[
+                TopicDef(slug="alpha", name="Alpha", description="a"),
+                TopicDef(slug="beta", name="Beta", description="b"),
+                TopicDef(slug="gamma", name="Gamma", description="c"),
+            ],
+            edges=[],
+        )
+    )
+    _run(session_factory, first, course_id, blob_store)
+    assert _taxonomy_version(session_factory, course_id) == 1
+
+    # New material -> different prompt -> cache miss -> a genuinely different
+    # proposal, which must land as a new version.
+    _add_summarized_material(
+        session_factory, blob_store, course_id,
+        title="Lecture 12: Hash Tables", body="Hashing and load factors.", key_terms=["hashing"],
+    )
+    second = _StubBackend(
+        TaxonomyOut(
+            topics=[
+                TopicDef(slug="alpha", name="Alpha", description="a"),
+                TopicDef(slug="beta", name="Beta", description="b"),
+                TopicDef(slug="hash-tables", name="Hash Tables", description="new unit"),
+            ],
+            edges=[],
+        )
+    )
+
+    stats = _run(session_factory, second, course_id, blob_store)
+
+    assert stats.unchanged is False
+    assert stats.topics == 3
+    assert stats.taxonomy_version == 2
+    assert _taxonomy_version(session_factory, course_id) == 2
+    assert [topic.slug for topic in _topics(session_factory, course_id, 1)] == ["alpha", "beta", "gamma"]
+    assert [topic.slug for topic in _topics(session_factory, course_id, 2)] == [
+        "alpha", "beta", "hash-tables",
+    ]
+
+
+def test_two_courses_with_identical_module_titles_do_not_share_a_taxonomy(
+    session_factory, blob_store, backend
+):
+    """Regression: the cache key used to be a digest of module titles and
+    material shas, so an "Organic Chemistry" course whose modules happened to
+    be named like a "Data Structures" course silently inherited its taxonomy,
+    permanently and without a warning."""
+    shared_modules = ["Unit One", "Unit Two", "Unit Three", "Unit Four"]
+    course_ids = []
+    for org_unit_id, name, code in [(11, "Data Structures", "CS2110"), (22, "Organic Chemistry", "CHEM241")]:
+        with session_factory() as session:
+            course = Course(d2l_org_unit_id=org_unit_id, tenant_origin="school.d2l.com", name=name, code=code)
+            session.add(course)
+            session.commit()
+            course_ids.append(course.id)
+        for index, title in enumerate(shared_modules):
+            _add_module(
+                session_factory, course_ids[-1],
+                d2l_module_id=1000 * org_unit_id + index, title=title, sort_order=index,
+            )
+
+    counting = _CountingBackend(backend)
+    for course in course_ids:
+        _run(session_factory, counting, course, blob_store)
+
+    assert counting.calls == 2  # each course asked for its own taxonomy
+    with session_factory() as session:
+        cache_rows = list(session.execute(select(LlmCache).where(LlmCache.stage == "taxonomy")).scalars().all())
+    assert len(cache_rows) == 2
+    assert "Organic Chemistry" in counting.prompts[1]  # the prompts genuinely differ
+    for course in course_ids:
+        assert _taxonomy_version(session_factory, course) == 1
+        assert len(_topics(session_factory, course, 1)) == 4
+
+
+def test_syllabus_source_change_is_a_cache_miss(session_factory, blob_store, backend, course_id):
+    """The summary fallback and the full sidecar are materially different
+    prompts; they must not share a cached answer."""
+    _seed_course_content(session_factory, blob_store, course_id)
+    counting = _CountingBackend(backend)
+
+    _run(session_factory, counting, course_id)  # no blob_store: summary fallback
+    _run(session_factory, counting, course_id, blob_store)  # sidecar text
+
+    assert counting.calls == 2
+    assert "SYLLABUS-FALLBACK-MARKER" in counting.prompts[0]
+    assert "Week 5 quicksort" in counting.prompts[1]
 
 
 def test_unparseable_cache_row_is_replaced_rather_than_wedging_the_stage(
@@ -490,7 +589,7 @@ def test_unparseable_cache_row_is_replaced_rather_than_wedging_the_stage(
 
     assert counting.calls == 2  # treated as a miss, not an unrecoverable error
     assert stats.cached_hits == 0
-    assert stats.topics == 4
+    assert stats.unchanged is True  # same proposal as v1, so still no new version
     with session_factory() as session:
         rows = list(session.execute(select(LlmCache).where(LlmCache.stage == "taxonomy")).scalars().all())
     assert len(rows) == 1  # the poisoned row was overwritten, not duplicated

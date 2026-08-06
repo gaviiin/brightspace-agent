@@ -10,10 +10,9 @@ to come out of it:
    compact line per summarized material, ordered so the model sees the
    course roughly in teaching order. The prompt is capped at
    `_PROMPT_MAX_CHARS`; summaries past the cap are dropped and logged.
-2. Cache: key on the *inputs* (syllabus sha, module titles, sorted material
-   shas), so an unchanged course never pays twice. A hit skips the LLM but
-   still writes a fresh taxonomy version -- the cache stores the model's
-   proposal, not the DB state.
+2. Cache: key on a hash of the assembled prompt itself (system + user +
+   model), so an unchanged course never pays twice -- and two courses can
+   never collide, however similar their module titles look.
 3. Validate in code, never by hoping the prompt held: slugs are normalized,
    duplicates dropped, edges pointing at unknown slugs or at themselves
    removed, and a proposal with fewer than `_MIN_TOPICS` topics fails the
@@ -22,6 +21,11 @@ to come out of it:
    `courses.taxonomy_version + 1`, then bump the course. Older versions are
    never deleted -- they are the history the taxonomy editor (Task 12) and
    any later remap depend on.
+
+Step 4 is skipped entirely when the validated proposal digests to the same
+taxonomy the course is already on: re-running the pipeline on an unchanged
+course must be a true no-op, because every new version would otherwise force
+S3 to re-classify (and re-bill) every material against an identical map.
 """
 
 from __future__ import annotations
@@ -45,7 +49,9 @@ from brightspace_agent.agents.promptfmt import (
     SECTION_MATERIAL_SUMMARIES,
     SECTION_MODULE_OUTLINE,
     SECTION_SYLLABUS,
+    render_topic_block,
     slugify,
+    taxonomy_digest,
 )
 from brightspace_agent.agents.schemas import TaxonomyOut, TopicDef, TopicEdgeDef
 from brightspace_agent.db.models import Course, LlmCache, Material, Module, Topic, TopicEdge
@@ -117,7 +123,8 @@ def _run_sync(
         if course is None:
             raise TaxonomyStageError(f"no course with id {course_id}")
         inputs = _gather_inputs(session, course, blob_store)
-        cache_key = _cache_key(inputs)
+        user_prompt = _build_user_prompt(inputs)
+        cache_key = _cache_key(user_prompt, model)
         cached_json = _read_cache(session, cache_key, model)
 
     proposal: TaxonomyOut | None = None
@@ -127,7 +134,6 @@ def _run_sync(
             stats.cached_hits += 1
 
     if proposal is None:
-        user_prompt = _build_user_prompt(inputs)
         logger.info(
             "taxonomy: calling %s for course %s (%d chars, %d summaries)",
             model, course_id, len(user_prompt), len(inputs.material_lines),
@@ -139,35 +145,34 @@ def _run_sync(
         stats.add_usage(usage)
 
     topics, edges = _validate(proposal, course_id)
+    proposed_digest = taxonomy_digest(
+        render_topic_block((topic.slug, topic.name, topic.description) for topic in topics)
+    )
 
     with session_factory() as session:
         course = session.get(Course, course_id)
         if course is None:  # deleted mid-run
             raise TaxonomyStageError(f"no course with id {course_id}")
+
+        if stats.cached_hits == 0:
+            _upsert_cache(session, cache_key, model, proposal)
+
+        # Same taxonomy as the course already has -> nothing to write. Without
+        # this, every sync would mint an identical version, and S3 would
+        # re-classify (and re-bill) the entire course against it.
+        if _current_digest(session, course_id, course.taxonomy_version) == proposed_digest:
+            session.commit()  # keep the cache row; touch nothing else
+            stats.unchanged = True
+            stats.taxonomy_version = course.taxonomy_version
+            logger.info(
+                "taxonomy: course %s proposal matches version %d; keeping it (no new version)",
+                course_id, course.taxonomy_version,
+            )
+            return stats
+
         version = course.taxonomy_version + 1
         _write_taxonomy(session, course_id, version, topics, edges)
         course.taxonomy_version = version
-        if stats.cached_hits == 0:
-            # `on_conflict_do_update`, not a plain insert: reaching here with a
-            # row already present means the stored proposal was unparseable
-            # (see `_parse_cached`), so the fresh one should replace it.
-            output_json = json.dumps(proposal.model_dump())
-            created_at = _now_iso()
-            session.execute(
-                sqlite_insert(LlmCache)
-                .values(
-                    sha256=cache_key,
-                    stage=_STAGE,
-                    prompt_version=PROMPT_VERSION,
-                    model=model,
-                    output_json=output_json,
-                    created_at=created_at,
-                )
-                .on_conflict_do_update(
-                    index_elements=["sha256", "stage", "prompt_version", "model"],
-                    set_={"output_json": output_json, "created_at": created_at},
-                )
-            )
         session.commit()
 
     stats.topics = len(topics)
@@ -190,33 +195,22 @@ class _TaxonomyInputs:
     course_name: str
     course_code: str | None
     syllabus_text: str
-    syllabus_sha: str | None
     module_lines: list[str] = field(default_factory=list)
-    module_titles: list[str] = field(default_factory=list)
     material_lines: list[str] = field(default_factory=list)
-    material_shas: list[str] = field(default_factory=list)
 
 
 def _gather_inputs(session: Session, course: Course, blob_store: BlobStore | None) -> _TaxonomyInputs:
-    module_lines, module_titles, module_rank = _render_module_outline(session, course.id)
-    syllabus_text, syllabus_sha = _syllabus_context(session, course.id, blob_store)
-    material_lines, material_shas = _material_summary_lines(session, course.id, module_rank)
-
+    module_lines, module_rank = _render_module_outline(session, course.id)
     return _TaxonomyInputs(
         course_name=course.name,
         course_code=course.code,
-        syllabus_text=syllabus_text,
-        syllabus_sha=syllabus_sha,
+        syllabus_text=_syllabus_text(session, course.id, blob_store),
         module_lines=module_lines,
-        module_titles=module_titles,
-        material_lines=material_lines,
-        material_shas=material_shas,
+        material_lines=_material_summary_lines(session, course.id, module_rank),
     )
 
 
-def _render_module_outline(
-    session: Session, course_id: int
-) -> tuple[list[str], list[str], dict[int, int]]:
+def _render_module_outline(session: Session, course_id: int) -> tuple[list[str], dict[int, int]]:
     """The module tree as an indented outline, depth-first in sort order.
 
     Also returns each module's position in that walk, so materials can be
@@ -232,32 +226,32 @@ def _render_module_outline(
         children.setdefault(module.parent_id, []).append(module)
 
     lines: list[str] = []
-    titles: list[str] = []
     rank: dict[int, int] = {}
 
     def walk(parent_id: int | None, depth: int) -> None:
         for module in children.get(parent_id, []):
-            rank[module.id] = len(titles)
-            titles.append(module.title)
+            rank[module.id] = len(rank)
             lines.append(f"{'  ' * depth}- {module.title}")
             walk(module.id, depth + 1)
 
     walk(None, 0)
     # Orphaned subtrees (parent row missing) would otherwise vanish silently.
-    seen = set(rank)
     for module in modules:
-        if module.id not in seen:
-            rank[module.id] = len(titles)
-            titles.append(module.title)
+        if module.id not in rank:
+            rank[module.id] = len(rank)
             lines.append(f"- {module.title}")
 
-    return lines, titles, rank
+    return lines, rank
 
 
-def _syllabus_context(
-    session: Session, course_id: int, blob_store: BlobStore | None
-) -> tuple[str, str | None]:
-    """The syllabus material's extracted text, or its summary as a fallback."""
+def _syllabus_text(session: Session, course_id: int, blob_store: BlobStore | None) -> str:
+    """The syllabus material's extracted text, or its summary as a fallback.
+
+    Which of the two was used matters to the cache: the key hashes the
+    assembled prompt, so a run that could only reach the summary and a later
+    run that reads the full sidecar are correctly treated as different
+    questions rather than sharing an answer.
+    """
     syllabi = list(
         session.execute(
             select(Material)
@@ -266,7 +260,7 @@ def _syllabus_context(
         ).scalars().all()
     )
     if not syllabi:
-        return "", None
+        return ""
 
     if blob_store is not None:
         for material in syllabi:
@@ -274,21 +268,21 @@ def _syllabus_context(
                 continue
             text = blob_store.read_text(material.sha256)
             if text and text.strip():
-                return text[:_SYLLABUS_MAX_CHARS], material.sha256
+                return text[:_SYLLABUS_MAX_CHARS]
 
     for material in syllabi:
         if material.summary:
             logger.info(
                 "taxonomy: no syllabus sidecar text for course %s; using its summary instead", course_id
             )
-            return material.summary[:_SYLLABUS_MAX_CHARS], material.sha256
+            return material.summary[:_SYLLABUS_MAX_CHARS]
 
-    return "", syllabi[0].sha256
+    return ""
 
 
 def _material_summary_lines(
     session: Session, course_id: int, module_rank: dict[int, int]
-) -> tuple[list[str], list[str]]:
+) -> list[str]:
     materials = list(
         session.execute(
             select(Material).where(
@@ -306,18 +300,15 @@ def _material_summary_lines(
     materials.sort(key=lambda m: (module_rank.get(m.module_id or -1, len(module_rank)), m.id))
 
     lines: list[str] = []
-    shas: list[str] = []
     for material in materials:
         summary_lines = [line.strip() for line in (material.summary or "").splitlines() if line.strip()]
         summary_head = " ".join(summary_lines[:_SUMMARY_LINES])
         key_terms = ", ".join(_key_terms(material))
         module_note = ""
         if material.module_id in module_titles:
-            module_note = f' (module: {module_titles[material.module_id]})'
+            module_note = f" (module: {module_titles[material.module_id]})"
         lines.append(f'- [{material.kind}] "{material.title}"{module_note} :: {summary_head} :: {key_terms}')
-        if material.sha256:
-            shas.append(material.sha256)
-    return lines, shas
+    return lines
 
 
 def _key_terms(material: Material) -> list[str]:
@@ -371,13 +362,25 @@ def _build_user_prompt(inputs: _TaxonomyInputs) -> str:
     return f"{header}\n" + "\n".join(kept) + "\n"
 
 
-def _cache_key(inputs: _TaxonomyInputs) -> str:
-    payload = {
-        "syllabus_sha": inputs.syllabus_sha,
-        "module_titles": inputs.module_titles,
-        "material_shas": sorted(inputs.material_shas),
-    }
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+def _cache_key(user_prompt: str, model: str) -> str:
+    """sha256 over exactly what the model is asked, and which model is asked.
+
+    Hashing a summary of the inputs (course-independent things like module
+    titles and material shas) let two different courses collide: identical
+    module titles in "Data Structures" and "Organic Chemistry" produced the
+    same key, and the second course silently inherited the first one's
+    taxonomy forever. Hashing the assembled prompt makes that impossible by
+    construction -- the prompt already contains the course name and code, the
+    syllabus text *as actually resolved* (sidecar or summary fallback), the
+    outline, and the summaries -- and it picks up prompt-template edits for
+    free alongside PROMPT_VERSION.
+    """
+    canonical = json.dumps(
+        {"system": _SYSTEM_PROMPT, "user": user_prompt, "model": model},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -391,6 +394,46 @@ def _read_cache(session: Session, cache_key: str, model: str) -> str | None:
         )
     ).scalar_one_or_none()
     return row.output_json if row is not None else None
+
+
+def _upsert_cache(session: Session, cache_key: str, model: str, proposal: TaxonomyOut) -> None:
+    # `on_conflict_do_update`, not a plain insert: reaching here with a row
+    # already present means the stored proposal was unparseable (see
+    # `_parse_cached`), so the fresh one should replace it.
+    output_json = json.dumps(proposal.model_dump())
+    created_at = _now_iso()
+    session.execute(
+        sqlite_insert(LlmCache)
+        .values(
+            sha256=cache_key,
+            stage=_STAGE,
+            prompt_version=PROMPT_VERSION,
+            model=model,
+            output_json=output_json,
+            created_at=created_at,
+        )
+        .on_conflict_do_update(
+            index_elements=["sha256", "stage", "prompt_version", "model"],
+            set_={"output_json": output_json, "created_at": created_at},
+        )
+    )
+
+
+def _current_digest(session: Session, course_id: int, version: int) -> str | None:
+    """The content digest of the taxonomy the course is on right now, or None
+    if it has no topics yet."""
+    topics = list(
+        session.execute(
+            select(Topic)
+            .where(Topic.course_id == course_id, Topic.taxonomy_version == version)
+            .order_by(Topic.order_index, Topic.id)
+        ).scalars().all()
+    )
+    if not topics:
+        return None
+    return taxonomy_digest(
+        render_topic_block((topic.slug, topic.name, topic.description) for topic in topics)
+    )
 
 
 def _parse_cached(output_json: str) -> TaxonomyOut | None:

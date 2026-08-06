@@ -17,10 +17,13 @@ class StageStats:
     extracted: int = 0
     summarized: int = 0
 
-    # S2 taxonomy
+    # S2 taxonomy. `topics`/`edges` count rows *written*, so they are 0 on an
+    # unchanged run; `unchanged` says the proposal matched the taxonomy the
+    # course already has, so no new version was created.
     topics: int = 0
     edges: int = 0
     taxonomy_version: int = 0
+    unchanged: bool = False
 
     # S3 classify
     classified: int = 0  # materials that got at least one assignment

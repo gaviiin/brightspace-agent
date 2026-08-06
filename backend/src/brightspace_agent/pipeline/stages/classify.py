@@ -15,17 +15,17 @@ Two things worth knowing:
   moves on -- the material keeps `status='summarized'` so the next run
   retries it, and nothing is cached. One bad document must not abort a
   course.
-- **The cache key carries the taxonomy.** It is
-  `(material.sha256, 'classify', "s3.vN:tax<version>:<taxonomy digest>", model)`:
-  the same document has to be re-classified when the taxonomy changes, and
-  the digest additionally keeps two courses that happen to share a file (and
-  a version number) from reading each other's answers.
+- **The cache key carries the taxonomy's content**, not its version number:
+  `(material.sha256, 'classify', "s3.vN:<taxonomy digest>", model)`. Changing
+  the taxonomy re-classifies everything, as it must; renumbering it does not.
+  Since `material.sha256` is content-addressed and therefore shared across
+  courses, the digest is also what stops two courses that happen to hold the
+  same file from reading each other's answers.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 from collections.abc import Callable
@@ -39,7 +39,13 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from brightspace_agent.agents.llm import LLMBackend, Tier
-from brightspace_agent.agents.promptfmt import SECTION_COURSE_TOPICS, SECTION_MATERIAL, slugify
+from brightspace_agent.agents.promptfmt import (
+    SECTION_COURSE_TOPICS,
+    SECTION_MATERIAL,
+    render_topic_block,
+    slugify,
+    taxonomy_digest,
+)
 from brightspace_agent.agents.schemas import ClassificationOut
 from brightspace_agent.db.models import Course, LlmCache, Material, MaterialTopic, Topic
 from brightspace_agent.pipeline.stats import StageStats
@@ -49,7 +55,7 @@ logger = logging.getLogger(__name__)
 PROMPT_VERSION = "s3.v1"
 _STAGE = "classify"
 _TIER: Tier = "fast"
-_TAXONOMY_DIGEST_CHARS = 12
+_MAX_ASSIGNMENTS = 3  # classify.md asks for 1-3; this is what enforces it
 
 _SYSTEM_PROMPT = (
     resources.files("brightspace_agent.agents.prompts").joinpath("classify.md").read_text(encoding="utf-8")
@@ -130,16 +136,16 @@ def _load_taxonomy_context(
         if not topics:
             return None
 
-        block = "\n".join(
-            f"{index}. {topic.slug} — {topic.name} — {topic.description or topic.name}"
-            for index, topic in enumerate(topics, start=1)
+        block = render_topic_block(
+            (topic.slug, topic.name, topic.description) for topic in topics
         )
-        digest = hashlib.sha256(block.encode("utf-8")).hexdigest()[:_TAXONOMY_DIGEST_CHARS]
         return _TaxonomyContext(
             version=version,
             block=block,
             topic_ids={topic.slug: topic.id for topic in topics},
-            cache_prompt_version=f"{PROMPT_VERSION}:tax{version}:{digest}",
+            # Content, not version number: a re-proposed but identical
+            # taxonomy must not re-bill a 200-material course.
+            cache_prompt_version=f"{PROMPT_VERSION}:{taxonomy_digest(block)}",
         )
 
 
@@ -192,22 +198,22 @@ def _classify_one(
 
             model = backend.model_for_tier(_TIER)
             sha256 = material.sha256
-            payload = _read_cache(session, sha256, context, model) if sha256 else None
-            from_cache = payload is not None
+            classification = _read_cache(session, sha256, context, model) if sha256 else None
+            from_cache = classification is not None
 
-            if payload is None:
+            if classification is None:
                 user_prompt = _build_user_prompt(material, context)
                 parsed, usage = backend.structured_call(
                     ClassificationOut, system=_SYSTEM_PROMPT, user=user_prompt, tier=_TIER
                 )
-                payload = parsed.model_dump()
+                classification = parsed
                 stats.add_usage(usage)
                 if sha256:
-                    _write_cache(session, sha256, context, model, payload)
+                    _write_cache(session, sha256, context, model, classification)
             else:
                 stats.cached_hits += 1
 
-            assignments = _validate(payload, context, material_id)
+            assignments = _validate(classification, context, material_id)
             for topic_id, confidence, rationale in assignments:
                 session.add(
                     MaterialTopic(
@@ -286,7 +292,16 @@ def _key_terms(material: Material) -> list[str]:
 # --------------------------------------------------------------------------
 
 
-def _read_cache(session: Session, sha256: str, context: _TaxonomyContext, model: str) -> dict | None:
+def _read_cache(
+    session: Session, sha256: str, context: _TaxonomyContext, model: str
+) -> ClassificationOut | None:
+    """The cached classification, or None if there isn't a usable one.
+
+    Validation happens *here*, not at the point of use: a row that is valid
+    JSON but no longer matches the schema would otherwise raise on every run
+    forever, and (because the write is an upsert) never get replaced. Any
+    unusable row is a miss, and the fresh answer overwrites it.
+    """
     row = session.execute(
         select(LlmCache).where(
             LlmCache.sha256 == sha256,
@@ -298,17 +313,23 @@ def _read_cache(session: Session, sha256: str, context: _TaxonomyContext, model:
     if row is None:
         return None
     try:
-        return json.loads(row.output_json)
-    except json.JSONDecodeError as exc:
-        logger.warning("classify: ignoring unparseable cache row for %s (%s)", sha256[:12], exc)
+        return ClassificationOut.model_validate(json.loads(row.output_json))
+    except (json.JSONDecodeError, ValidationError) as exc:
+        logger.warning(
+            "classify: ignoring unusable cache row for %s (%s); re-asking the model",
+            sha256[:12], exc,
+        )
         return None
 
 
 def _write_cache(
-    session: Session, sha256: str, context: _TaxonomyContext, model: str, payload: dict
+    session: Session, sha256: str, context: _TaxonomyContext, model: str, payload: ClassificationOut
 ) -> None:
-    # Two workers can hit the same sha in one run (the same file attached
-    # under two topics); whoever loses the race just keeps the existing row.
+    # Upsert, for two reasons: two workers can hit the same sha in one run
+    # (the same file attached under two topics), and a row rejected by
+    # `_read_cache` has to be replaceable rather than permanent.
+    output_json = json.dumps(payload.model_dump())
+    created_at = _now_iso()
     session.execute(
         sqlite_insert(LlmCache)
         .values(
@@ -316,10 +337,13 @@ def _write_cache(
             stage=_STAGE,
             prompt_version=context.cache_prompt_version,
             model=model,
-            output_json=json.dumps(payload),
-            created_at=_now_iso(),
+            output_json=output_json,
+            created_at=created_at,
         )
-        .on_conflict_do_nothing()
+        .on_conflict_do_update(
+            index_elements=["sha256", "stage", "prompt_version", "model"],
+            set_={"output_json": output_json, "created_at": created_at},
+        )
     )
 
 
@@ -329,22 +353,18 @@ def _write_cache(
 
 
 def _validate(
-    payload: dict, context: _TaxonomyContext, material_id: int
+    classification: ClassificationOut, context: _TaxonomyContext, material_id: int
 ) -> list[tuple[int, float, str]]:
     """(topic_id, confidence, rationale) for the assignments worth keeping.
 
     Unknown slugs are dropped (a hallucinated topic is worse than none),
-    confidences are clamped into [0, 1], and a topic named twice keeps its
-    highest-confidence row -- `material_topics` is unique per
-    (material, topic, version).
+    confidences are clamped into [0, 1], a topic named twice keeps its
+    highest-confidence row (`material_topics` is unique per material/topic/
+    version), and at most `_MAX_ASSIGNMENTS` survive -- the prompt asks for
+    1-3, and a material filed under eight topics is filed under none.
     """
-    try:
-        parsed = ClassificationOut.model_validate(payload)
-    except ValidationError as exc:
-        raise ValueError(f"classification output failed validation: {exc}") from exc
-
     best: dict[int, tuple[float, str]] = {}
-    for assignment in parsed.assignments:
+    for assignment in classification.assignments:
         slug = slugify(assignment.topic_slug)
         topic_id = context.topic_ids.get(slug)
         if topic_id is None:
@@ -359,4 +379,14 @@ def _validate(
         if existing is None or confidence > existing[0]:
             best[topic_id] = (confidence, rationale)
 
-    return [(topic_id, confidence, rationale) for topic_id, (confidence, rationale) in best.items()]
+    kept = sorted(
+        ((topic_id, confidence, rationale) for topic_id, (confidence, rationale) in best.items()),
+        key=lambda row: (-row[1], row[0]),  # confidence desc, then id for determinism
+    )
+    if len(kept) > _MAX_ASSIGNMENTS:
+        logger.warning(
+            "classify: material %s was assigned %d topics; keeping the %d most confident",
+            material_id, len(kept), _MAX_ASSIGNMENTS,
+        )
+        kept = kept[:_MAX_ASSIGNMENTS]
+    return kept

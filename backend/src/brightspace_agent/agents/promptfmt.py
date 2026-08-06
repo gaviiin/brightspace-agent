@@ -17,8 +17,10 @@ prompt dump.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
+from collections.abc import Iterable
 
 # Section markers -- taxonomy (S2)
 SECTION_COURSE = "=== COURSE ==="
@@ -33,6 +35,28 @@ SECTION_MATERIAL = "=== MATERIAL ==="
 _SECTION_RE = re.compile(r"^===\s.*\s===$")
 _NON_ASCII_SLUG_CHARS = re.compile(r"[^a-zA-Z0-9]+")
 _WHITESPACE = re.compile(r"\s+")
+
+TAXONOMY_DIGEST_CHARS = 12
+
+
+def render_topic_block(topics: Iterable[tuple[str, str, str | None]]) -> str:
+    """The numbered `N. slug — name — description` list of a taxonomy.
+
+    Written once and used three ways, which is exactly why it lives here:
+    S3 puts it in every classify prompt, S3's cache key is its digest, and
+    S2 digests the same rendering of a *proposed* taxonomy to decide whether
+    anything actually changed. Those three have to agree character for
+    character or the cache silently misbehaves.
+    """
+    return "\n".join(
+        f"{index}. {slug} — {name} — {description or name}"
+        for index, (slug, name, description) in enumerate(topics, start=1)
+    )
+
+
+def taxonomy_digest(block: str) -> str:
+    """A short content fingerprint of a rendered taxonomy block."""
+    return hashlib.sha256(block.encode("utf-8")).hexdigest()[:TAXONOMY_DIGEST_CHARS]
 
 
 def slugify(value: str) -> str:

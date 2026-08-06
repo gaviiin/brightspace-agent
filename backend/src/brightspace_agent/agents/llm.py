@@ -282,7 +282,8 @@ def _mock_classification(user: str) -> ClassificationOut:
                 confidence=confidence,
                 rationale=f"Mock rationale: the summary's terms line up with {slug}.",
             )
-            for slug, confidence in zip(slugs[:2], confidences)
+            # strict=False: a one-topic taxonomy yields one assignment.
+            for slug, confidence in zip(slugs[:2], confidences, strict=False)
         ]
     )
 
