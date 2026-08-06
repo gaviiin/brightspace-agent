@@ -1,0 +1,25 @@
+@import "tailwindcss";
+@import "@xyflow/react/dist/style.css";
+
+/* Edge stroke colors used by graph/edges.ts -- kept as CSS variables (not
+   Tailwind classes) because React Flow edges are plain SVG, styled via the
+   `style` prop rather than className. */
+:root {
+  --bsa-edge-strong: #52525b; /* prerequisite */
+  --bsa-edge-soft: #a1a1aa; /* related */
+  --bsa-edge-attach: #d4d4d8; /* attachment */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bsa-edge-strong: #a1a1aa;
+    --bsa-edge-soft: #71717a;
+    --bsa-edge-attach: #52525b;
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
