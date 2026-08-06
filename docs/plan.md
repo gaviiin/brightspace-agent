@@ -17,7 +17,7 @@ Gavin (a student) wants an agentic app that organizes all Brightspace (D2L) cour
 ### User decisions (locked)
 - Audience: personal + shareable with classmates (unpacked extension, `uv run` backend)
 - Backend: **Python**; Frontend: **React + TS**; Extension: TS
-- Agent runtime: **Claude Agent SDK for Python** (`claude-agent-sdk`), user-supplied API key; sonnet for taxonomy/judging, haiku for summarize/classify fan-out; structured outputs (Pydantic) at every stage boundary
+- Agent runtime: **LangGraph** (`langgraph` + `langchain-anthropic`) — user choice Aug 2026: the most widespread/transferable agent framework, model-agnostic, best for learning. Claude models via user-supplied API key; sonnet for taxonomy/judging, haiku for summarize/classify fan-out; structured outputs via `.with_structured_output(PydanticModel)` at every stage boundary; optional LangSmith tracing (env vars) for observability
 - Milestones: **M1 ingest + topic graph → M2 lecture media/transcripts → M3 web enrichment**
 - Recordings platform unknown/mixed → platform-agnostic capture design
 
@@ -31,7 +31,7 @@ Chrome (user logged into Brightspace normally)
 Local Python backend (FastAPI, 127.0.0.1:8730)
   ├─ Ingest API → SQLite + content-addressed blob store (~/.brightspace-agent/)
   ├─ Pipeline (asyncio): S1 summarize → S2 taxonomy → S3 classify → S4 graph build → S5 enrich
-  │    (Claude Agent SDK; llm_cache keyed on sha256+prompt_version = idempotent re-runs)
+  │    (LangGraph StateGraph; llm_cache keyed on sha256+prompt_version = idempotent re-runs)
   └─ Serves React frontend (built) + /api/* + SSE events
 ```
 
@@ -63,8 +63,9 @@ backend/src/brightspace_agent/
   db/{models,session,migrate}.py db/schema.sql
   api/{ingest,courses,graph,materials,taxonomy,pipeline,events}.py
   ingest/{store,extract,diff}.py   # blob store (sha256), pdf/pptx/docx/html/vtt→text, ToC-vs-DB diff
+  pipeline/graph.py                # LangGraph StateGraph wiring (nodes = stages, Send API fan-out)
   pipeline/runner.py pipeline/stages/{summarize,taxonomy,classify,assemble,enrich}.py
-  agents/{client,schemas}.py agents/prompts/*.md   # SDK wrapper: tiering, structured output, retry, usage
+  agents/{llm,schemas}.py agents/prompts/*.md   # tiered ChatAnthropic factories, structured-output helper, retry, usage/cost tracking
   media/{ytdlp,whisper,capture}.py # M2
   graph/build.py                   # deterministic S4 assembly → graph JSON
 backend/tests/                     # + fixtures/d2l/, fixtures/llm/, fake_d2l.py
@@ -75,7 +76,7 @@ frontend/src/
   api/{client,types}.ts state/uiStore.ts
 ```
 
-Deps (backend): fastapi uvicorn sqlalchemy pydantic-settings claude-agent-sdk pymupdf python-pptx python-docx beautifulsoup4 httpx sse-starlette.
+Deps (backend): fastapi uvicorn sqlalchemy pydantic-settings langgraph langchain-anthropic langchain-core pymupdf python-pptx python-docx beautifulsoup4 httpx sse-starlette.
 
 ## Data Model
 
@@ -92,9 +93,9 @@ Incremental re-sync: diff incoming ToC vs `materials` by `d2l_topic_id` + LastMo
 - Endpoints: `POST /api/ingest/handshake` {tenantOrigin, apiVersions, whoami, enrollments} → {knownCourses}; `POST /api/ingest/toc` {orgUnitId, raw ToC JSON, extras} → {syncRunId, needed:[{d2lTopicId,url,title}]}; `POST /api/ingest/file?syncRunId=&d2lTopicId=` raw streamed body + metadata headers (memory-flat for big files); `POST /api/ingest/complete`; `POST /api/ingest/zip` (manual Classic-Content zip fallback — keeps app usable with zero API access).
 - Extension drives the fetch loop (owns session + rate-limit headers); backend owns decisions (diff, storage, pipeline). Cookie auth first; JWT capture only if 401.
 
-## Pipeline (asyncio, no Celery)
+## Pipeline (LangGraph, no Celery)
 
-Background task per course; fan-out via `asyncio.gather` + `Semaphore(4)`. Resume = re-run: every stage's worklist is a DB query for rows below target state; llm_cache prevents double-pay.
+Stages wired as a **LangGraph StateGraph** (`pipeline/graph.py`): one node per stage, per-document fan-out via the Send API (map-reduce pattern) bounded to ~4 concurrent LLM calls; run as a background asyncio task per course. Resume = re-run: every stage's worklist is a DB query for rows below target state — the DB is the source of truth (LangGraph checkpointing not required for M1); llm_cache prevents double-pay. Optional LangSmith tracing via `LANGSMITH_API_KEY`/`LANGSMITH_TRACING` env vars to watch every node execute.
 
 - **S1 summarize**: extract text, haiku per doc (no tools, ~12k chars in) → `DocSummary{summary, doc_kind_guess, key_terms[]}`
 - **S2 taxonomy**: one sonnet call (syllabus + module tree + all summaries) → `Taxonomy{topics[{slug,name,description,module_hints[]}], edges[]}` (~8–20 topics); writes at taxonomy_version+1
@@ -121,7 +122,7 @@ Routes: `/` (courses + sync status + pairing), `/courses/:id` (workspace), `/set
 4. Extension d2l-client (M): version discovery, whoami, enrollments, ToC walk, streaming fetch, adaptive rate limiter
 5. Extension sync loop + popup (M): course picker, progress, 401-pause/resume
 6. **First real sync (S) — earliest de-risk checkpoint**; save scrubbed responses as fixtures; fix tenant surprises
-7. Extract + agents client + S1 (M): extractors, SDK wrapper (+`BSA_MOCK_LLM` mode), summarize
+7. Extract + agents/llm.py + S1 (M): extractors, tiered-model + structured-output layer (+`BSA_MOCK_LLM` mode), summarize node
 8. S2 + S3 + S4 (L): taxonomy, classify, assemble, llm_cache, orphans
 9. Runner + SSE + graph API + dry-run cost (M)
 10. Graph UI (L): GraphView, transform, dagre, expand/collapse, node/edge components
@@ -131,13 +132,15 @@ Routes: `/` (courses + sync status + pairing), `/courses/:id` (workspace), `/set
 
 **M2 — media + transcripts**: extension capture.ts grabs LTI launch URLs + player network requests (VTT/manifest) during sync; media/ytdlp.py (browser cookies, Panopto/Kaltura); media/whisper.py (mlx-whisper large-v3-turbo fallback); transcripts become kind=transcript materials flowing through S1–S4 unchanged.
 
+**M4 / backlog — MCP server**: expose the organized course graph as an MCP server (`backend/src/brightspace_agent/mcp_server.py`, stdio transport) so Claude Desktop/Code and other MCP clients can query topics/materials — makes the app a first-class agent-ecosystem citizen.
+
 **M3 — enrichment: the link-research agent team** (`pipeline/stages/enrich.py`)
 
 Finding genuinely good links per topic is a search-quality problem, not a single-prompt problem. Per topic, a 5-stage team (orchestrated deterministically in the runner via asyncio, same resume/cache semantics as S1–S4):
 
 1. **Query planner** (sonnet, no tools): reads topic name/description + summaries of the topic's attached materials + course level/code → emits `SearchPlan{intents[]}` — diverse search intents typed by need: *alternative explanation*, *video lecture*, *worked practice problems with solutions*, *interactive visualization/simulation*, *other universities' lecture notes*, *past exams*. Grounding queries in the actual course materials (terminology, notation, textbook used) is what makes results level-appropriate rather than generic.
-2. **Finder fan-out** (haiku/sonnet workers, tools=[WebSearch,WebFetch], ~8-turn cap each): one finder per intent, run in parallel, each blind to the others (multi-modal sweep — one search angle won't find everything). Source-quality heuristics in the prompt: prefer .edu/OCW/established channels (MIT OCW, 3Blue1Brown-class creators, university course pages, official docs), explicitly avoid SEO content farms, listicles, and course-seller spam. Each returns `Candidate{url, type, claimed_coverage, why}`.
-3. **Verification** (haiku per candidate, tools=[WebFetch]): actually fetch each candidate URL and check — is it live, is it actually about the topic (not clickbait/snippet mismatch), is it accessible (not paywalled/login-walled), does the depth match the course level? Verifier returns `Verification{ok, evidence_quote, level_fit, accessibility}`. **Never trust search snippets** — this stage is what separates genuinely good links from plausible-looking ones.
+2. **Finder fan-out** (haiku/sonnet LangGraph ReAct workers with Anthropic server-side `web_search`/`web_fetch` tools via langchain-anthropic — no extra search-API key needed; Tavily optional alternative; ~8 tool-call cap each): one finder per intent, run in parallel, each blind to the others (multi-modal sweep — one search angle won't find everything). Source-quality heuristics in the prompt: prefer .edu/OCW/established channels (MIT OCW, 3Blue1Brown-class creators, university course pages, official docs), explicitly avoid SEO content farms, listicles, and course-seller spam. Each returns `Candidate{url, type, claimed_coverage, why}`.
+3. **Verification** (haiku per candidate with `web_fetch`): actually fetch each candidate URL and check — is it live, is it actually about the topic (not clickbait/snippet mismatch), is it accessible (not paywalled/login-walled), does the depth match the course level? Verifier returns `Verification{ok, evidence_quote, level_fit, accessibility}`. **Never trust search snippets** — this stage is what separates genuinely good links from plausible-looking ones.
 4. **Judge/ranker** (sonnet, one call per topic, sees verified content excerpts): rubric scoring — topical relevance, source authority, recency, level match, pedagogical value — plus a **format-diversity constraint** (never 5 videos; aim for a mix across intents). Keeps top 3–5 with a one-line rationale each (rationale doubles as UI copy).
 5. **Cross-topic dedup + feedback** (deterministic): same URL surviving for multiple topics → attach to best-fit topic, mark `shared`. User keep/dismiss actions update a per-domain reputation table that biases future judge calls (dismissed-domain penalty, kept-domain boost) — the team gets better as Gavin uses it.
 
@@ -172,3 +175,5 @@ Note: session-cookie API access is unofficial (works because the Brightspace web
 - https://arxiv.org/abs/2403.12173 (TnT-LLM taxonomy→classify pattern)
 - https://www.anthropic.com/engineering/multi-agent-research-system (enrichment orchestrator-worker pattern)
 - https://reactflow.dev/learn/layouting/layouting (dagre integration)
+- https://langchain-ai.github.io/langgraph/ (StateGraph, Send API map-reduce, create_react_agent)
+- https://docs.langchain.com/oss/python/integrations/chat/anthropic (ChatAnthropic, server-side web_search/web_fetch tools)
