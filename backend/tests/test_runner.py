@@ -15,9 +15,10 @@ from sqlalchemy import select
 
 from brightspace_agent.agents.llm import MockBackend
 from brightspace_agent.config import Settings
-from brightspace_agent.db.models import Course, Material, PipelineRun
+from brightspace_agent.db.models import Course, Material, MaterialTopic, PipelineRun, Topic
 from brightspace_agent.db.session import init_db
 from brightspace_agent.ingest.store import BlobStore
+from brightspace_agent.pipeline import runner as runner_module
 from brightspace_agent.pipeline.runner import PipelineRunner, RunActiveError
 
 
@@ -77,6 +78,31 @@ def _seed_summarizable_course(session_factory, blob_store, course_id, count: int
             )
         )
     return ids
+
+
+def _write_taxonomy(session_factory, course_id, version, topics) -> dict[str, int]:
+    with session_factory() as session:
+        ids: dict[str, int] = {}
+        for order_index, (slug, name, description) in enumerate(topics):
+            topic = Topic(
+                course_id=course_id, taxonomy_version=version, slug=slug, name=name,
+                description=description, order_index=order_index, created_by="agent",
+            )
+            session.add(topic)
+            session.flush()
+            ids[slug] = topic.id
+        course = session.get(Course, course_id)
+        course.taxonomy_version = version
+        session.commit()
+        return ids
+
+
+def _mark_summarized(session_factory, material_id, *, summary="A pre-existing summary.") -> None:
+    with session_factory() as session:
+        material = session.get(Material, material_id)
+        material.status = "summarized"
+        material.summary = summary
+        session.commit()
 
 
 def _make_runner(session_factory, blob_store, backend, *, max_cost_usd_per_run: float = 5.0) -> PipelineRunner:
@@ -269,3 +295,122 @@ def test_cost_cap_aborts_summarize_and_skips_classify_but_still_assembles(sessio
     with session_factory() as session:
         course = session.get(Course, course_id)
         assert course.taxonomy_version == 0  # taxonomy never ran
+
+
+# --------------------------------------------------------------------------
+# (5) `stages` partial-run filtering
+# --------------------------------------------------------------------------
+
+
+def test_stages_filter_skips_unrequested_stages_entirely(session_factory, blob_store, course_id):
+    """A course already summarized + taxonomied, run with
+    stages=['classify', 'assemble']. summarize/taxonomy must not just be
+    no-ops -- they must not run at all: no pipeline_runs rows for them, and
+    (the real proof) a material that summarize *would* touch if it ran is
+    left completely untouched."""
+    already_summarized_ids = _seed_summarizable_course(session_factory, blob_store, course_id, count=2)
+    for material_id in already_summarized_ids:
+        _mark_summarized(session_factory, material_id)
+    _write_taxonomy(
+        session_factory, course_id, 1,
+        [("intro", "Intro", "d"), ("loops", "Loops", "d"), ("arrays", "Arrays", "d")],
+    )
+    # summarize would extract + summarize this one if it ran; it must not.
+    untouched_id = _add_fetched_pdf(
+        session_factory, blob_store, course_id, title="New Lecture", text="Should stay completely untouched."
+    )
+
+    async def scenario():
+        runner = _make_runner(session_factory, blob_store, MockBackend())
+        runner.start(course_id, stages=["classify", "assemble"])
+        await runner.wait_idle(course_id)
+
+    asyncio.run(scenario())
+
+    rows = _pipeline_runs(session_factory, course_id)
+    # No rows at all for the skipped stages -- this implementation's chosen
+    # semantics (a skipped node never calls hooks.on_start/on_finish).
+    assert [row.stage for row in rows] == ["classify", "assemble"]
+    assert all(row.status == "complete" for row in rows)
+
+    with session_factory() as session:
+        untouched = session.get(Material, untouched_id)
+        assert untouched.status == "fetched"  # summarize never ran
+        course = session.get(Course, course_id)
+        assert course.taxonomy_version == 1  # taxonomy never bumped it
+
+    with session_factory() as session:
+        assignments = session.execute(select(MaterialTopic)).scalars().all()
+    assert len(assignments) > 0  # classify genuinely ran
+
+
+# --------------------------------------------------------------------------
+# (6) orphaned 'running' rows are reconciled, not left stuck forever
+# --------------------------------------------------------------------------
+
+
+def test_on_start_failure_does_not_leave_a_row_stuck_running(session_factory, blob_store, course_id, monkeypatch):
+    """If `hooks.on_start` raises *after* it has already created and
+    committed the pipeline_runs row (e.g. the event-bus publish call at the
+    end of `on_start` blows up), that row must not be left at 'running'
+    forever -- the per-run reconciliation in `_execute`'s `finally` block
+    must catch it."""
+    _seed_summarizable_course(session_factory, blob_store, course_id, count=2)
+
+    real_on_start = runner_module._RunHooks.on_start
+
+    def flaky_on_start(self, stage):
+        real_on_start(self, stage)  # the row is genuinely created + committed
+        if stage == "summarize":
+            raise RuntimeError("simulated failure right after on_start committed its row")
+
+    monkeypatch.setattr(runner_module._RunHooks, "on_start", flaky_on_start)
+
+    async def scenario():
+        runner = _make_runner(session_factory, blob_store, MockBackend())
+        runner.start(course_id)
+        await runner.wait_idle(course_id)
+
+    asyncio.run(scenario())
+
+    rows = _pipeline_runs(session_factory, course_id)
+    assert rows  # the summarize row was created before the simulated failure
+    assert all(row.status != "running" for row in rows)  # nothing left stuck
+
+    summarize_row = next(row for row in rows if row.stage == "summarize")
+    assert summarize_row.status == "failed"
+    assert summarize_row.error == "orphaned"
+    assert summarize_row.finished_at is not None
+
+    # And the run itself still ended cleanly (no other stage started after
+    # the crash -- after_summarize never got a chance to route anywhere).
+    assert [row.stage for row in rows] == ["summarize"]
+
+
+def test_startup_sweep_marks_stale_running_rows_as_orphaned_by_restart(session_factory, blob_store, course_id):
+    """A 'running' row with no live task behind it can only be left over
+    from a previous process that never finished it. PipelineRunner's
+    constructor must sweep these on startup rather than leaving them
+    claiming to be running forever."""
+    with session_factory() as session:
+        stale = PipelineRun(
+            course_id=course_id, stage="summarize", status="running",
+            started_at="2020-01-01T00:00:00+00:00",
+        )
+        session.add(stale)
+        session.commit()
+        stale_id = stale.id
+
+    runner = _make_runner(session_factory, blob_store, MockBackend())
+
+    with session_factory() as session:
+        row = session.get(PipelineRun, stale_id)
+        assert row.status == "failed"
+        assert row.error == "orphaned-by-restart"
+        assert row.finished_at is not None
+
+    # And it shows up through status() immediately, without needing a new
+    # run for this course first.
+    status = runner.status(course_id)
+    assert status["active"] is False
+    assert any(s["stage"] == "summarize" and s["status"] == "failed" for s in status["stages"])

@@ -17,6 +17,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from brightspace_agent.agents.llm import LLMBackend
@@ -158,6 +159,61 @@ class _RunHooks:
             }
         )
 
+    def reconcile_orphaned_rows(self) -> None:
+        """Called from `PipelineRunner._execute`'s `finally` block, on
+        *every* exit from that block -- normal completion, an exception
+        that escaped a node (e.g. `on_start`/`on_finish` themselves raising,
+        rather than the stage call they bracket), or the task being
+        cancelled. `finally` runs even then, which is the whole point: it's
+        the one place guaranteed to run regardless of *how* the run ended.
+
+        Any row this instance created (tracked in `_row_id_by_stage` as
+        soon as `on_start` commits it -- before anything that could still
+        fail, like the event-bus publish) that's still `status='running'`
+        at this point means `on_finish` was never reached for it. Left
+        alone, that row would claim to be running forever, with no
+        automatic recovery short of the next-process startup sweep (see
+        `PipelineRunner.__init__`) -- which wouldn't help a still-running
+        server at all. Marked 'failed'/'orphaned' instead.
+        """
+        if not self._row_id_by_stage:
+            return
+        try:
+            with self._session_factory() as session:
+                now = _now_iso()
+                orphaned_stages: list[str] = []
+                for stage, row_id in self._row_id_by_stage.items():
+                    row = session.get(PipelineRun, row_id)
+                    if row is not None and row.status == "running":
+                        row.status = "failed"
+                        row.finished_at = now
+                        row.error = "orphaned"
+                        orphaned_stages.append(stage)
+                if orphaned_stages:
+                    session.commit()
+        except Exception:
+            logger.exception(
+                "failed to reconcile orphaned pipeline_runs rows for course %s (run %s)",
+                self._course_id, self._run_token,
+            )
+            return
+
+        for stage in orphaned_stages:
+            logger.warning(
+                "pipeline_runs row for course %s stage %r was left 'running' (run %s); marked orphaned",
+                self._course_id, stage, self._run_token,
+            )
+            self._event_bus.publish(
+                {
+                    "type": "pipeline",
+                    "courseId": self._course_id,
+                    "runToken": self._run_token,
+                    "stage": stage,
+                    "status": "failed",
+                    "stats": {},
+                }
+            )
+
 
 # --------------------------------------------------------------------------
 # PipelineRunner
@@ -191,6 +247,37 @@ class PipelineRunner:
         self._tasks: dict[int, asyncio.Task] = {}  # course_id -> most recent run's task
         self._last_run_rows: dict[int, list[int]] = {}  # course_id -> pipeline_runs.id for the latest run
         self._run_tokens = itertools.count(1)
+
+        self._reconcile_orphaned_rows_from_previous_process()
+
+    def _reconcile_orphaned_rows_from_previous_process(self) -> None:
+        """A `pipeline_runs` row can only be `status='running'` while a live
+        task is driving it. At construction time, before `start()` has ever
+        been called, `self._active` is empty and no such task exists in
+        this process -- so any row already `'running'` in the DB can only
+        be left over from an *earlier* process that exited without
+        finishing it (a crash, `kill -9`, an unclean shutdown). There is no
+        task left to eventually reconcile it (the per-run reconciliation in
+        `_execute`'s `finally` only covers runs *this* process started), so
+        it's swept here instead, once, at startup.
+        """
+        with self._session_factory() as session:
+            stale_rows = list(
+                session.execute(select(PipelineRun).where(PipelineRun.status == "running")).scalars().all()
+            )
+            if not stale_rows:
+                return
+            now = _now_iso()
+            for row in stale_rows:
+                row.status = "failed"
+                row.finished_at = now
+                row.error = "orphaned-by-restart"
+                self._last_run_rows.setdefault(row.course_id, []).append(row.id)
+            session.commit()
+        logger.warning(
+            "reconciled %d orphaned 'running' pipeline_runs row(s) left over from a previous process",
+            len(stale_rows),
+        )
 
     def start(self, course_id: int, stages: list[str] | None = None) -> int:
         """Launch a background run for `course_id`. Returns a run token.
@@ -232,6 +319,13 @@ class PipelineRunner:
         except Exception:
             logger.exception("pipeline run crashed for course %s (run %s)", course_id, run_token)
         finally:
+            # Runs on every exit from the try above -- normal completion, a
+            # caught Exception, or an uncaught BaseException (e.g. this
+            # task being cancelled) propagating straight through. That's
+            # deliberate: it's the one place guaranteed to run regardless
+            # of how the run ended, so it's where a row left 'running' by
+            # a hook failure or cancellation gets reconciled.
+            hooks.reconcile_orphaned_rows()
             self._active.pop(course_id, None)
             self.event_bus.publish(
                 {

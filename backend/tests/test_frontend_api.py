@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
@@ -257,6 +258,30 @@ def test_pipeline_run_while_active_is_409(client, db_session_factory):
 def test_pipeline_run_unknown_course_404(client):
     resp = client.post("/api/courses/999999/pipeline/run", json={}, headers=CSRF_HEADERS)
     assert resp.status_code == 404
+
+
+def _wait_for_pipeline_idle(client, course_id, *, timeout_s=5.0):
+    deadline = time.monotonic() + timeout_s
+    status = None
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/courses/{course_id}/pipeline/status").json()
+        if not status["active"]:
+            return status
+        time.sleep(0.02)
+    raise AssertionError(f"pipeline still active after {timeout_s}s: {status}")
+
+
+def test_pipeline_run_with_stages_filter_only_runs_requested_stages(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+
+    resp = client.post(
+        f"/api/courses/{course_id}/pipeline/run", json={"stages": ["assemble"]}, headers=CSRF_HEADERS,
+    )
+    assert resp.status_code == 200
+
+    status = _wait_for_pipeline_idle(client, course_id)
+    assert [s["stage"] for s in status["stages"]] == ["assemble"]
+    assert status["stages"][0]["status"] == "complete"
 
 
 def test_pipeline_status_shape(client, db_session_factory):
