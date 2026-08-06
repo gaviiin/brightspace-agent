@@ -120,7 +120,10 @@ export class RateLimitedFetcher {
     this.maxAttempts = options.maxAttempts ?? 3;
     this.minRemainingThreshold = options.minRemainingThreshold ?? 20;
     this.baseBackoffMs = options.baseBackoffMs ?? 1000;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    // Bound to the global scope: we call this as `this.fetchImpl(...)`, which
+    // would otherwise pass the fetcher instance as `this` and make the native
+    // fetch throw "Illegal invocation".
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.sleepImpl = options.sleepImpl ?? defaultSleep;
   }
 

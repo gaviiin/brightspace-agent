@@ -447,4 +447,31 @@ describe("RateLimitedFetcher rate-limit cooldown", () => {
 
     expect(sleepImpl).not.toHaveBeenCalled();
   });
+
+  // Regression: the default fetchImpl is invoked as `this.fetchImpl(...)`, so
+  // an unbound global fetch receives the fetcher instance as `this` and the
+  // browser's native implementation throws "Illegal invocation". Every other
+  // test injects a plain mock, which is indifferent to `this` — only a
+  // this-sensitive stub reproduces what Chrome does.
+  it("calls the default global fetch bound to the global scope", async () => {
+    const original = globalThis.fetch;
+    const calls: string[] = [];
+    globalThis.fetch = function (this: unknown, input: string | URL | Request) {
+      if (this !== globalThis && this !== undefined) {
+        throw new TypeError("Failed to execute 'fetch': Illegal invocation");
+      }
+      calls.push(String(input));
+      return Promise.resolve(new Response("ok", { status: 200 }));
+    } as unknown as typeof fetch;
+
+    try {
+      const fetcher = new RateLimitedFetcher();
+      const response = await fetcher.fetch("https://x.example/whoami");
+
+      expect(response.status).toBe(200);
+      expect(calls).toEqual(["https://x.example/whoami"]);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
 });
