@@ -91,19 +91,13 @@ export class BackendClient {
     if (contentType) headers["Content-Type"] = contentType;
     if (meta.d2lUpdated) headers["X-D2L-Updated"] = meta.d2lUpdated;
 
-    const init: RequestInit & { duplex?: "half" } = { method: "POST", headers };
-    if (res.body) {
-      // Chrome requires `duplex: 'half'` on any fetch() carrying a
-      // streamed (ReadableStream) request body.
-      init.body = res.body;
-      init.duplex = "half";
-    } else {
-      // No stream to pipe (e.g. an empty/204 source response) -- fall back
-      // to buffering whatever's left via blob.
-      init.body = await res.blob();
-    }
-
-    const response = await fetch(url, init);
+    // Buffered, not streamed: Chrome only accepts a ReadableStream request
+    // body over HTTP/2, and the local backend serves plain HTTP/1.1, where
+    // the same request dies as "TypeError: Failed to fetch" before it leaves
+    // the browser. One course material at a time is a bounded amount of
+    // memory (documents, not media -- lecture video downloads happen
+    // backend-side), and the backend still spools its side to disk.
+    const response = await fetch(url, { method: "POST", headers, body: await res.blob() });
     return this.parseJsonOrThrow<UploadFileResult>(response);
   }
 

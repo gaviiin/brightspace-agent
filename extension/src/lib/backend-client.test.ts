@@ -19,7 +19,7 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("BackendClient.uploadFile", () => {
-  it("posts to /api/ingest/file with query params, headers, duplex:'half', and the source response's body", async () => {
+  it("posts to /api/ingest/file with query params, headers, and the source response's bytes", async () => {
     const sourceResponse = new Response("filebytes", { headers: { "Content-Type": "application/pdf" } });
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ materialId: 5, sha256: "abc123", deduped: false }));
     vi.stubGlobal("fetch", fetchMock);
@@ -41,8 +41,12 @@ describe("BackendClient.uploadFile", () => {
     expect(init.headers["X-Title"]).toBe(encodeURIComponent("Café Notes"));
     expect(init.headers["X-D2L-Updated"]).toBe("2026-01-01T00:00:00Z");
     expect(init.headers["Content-Type"]).toBe("application/pdf");
-    expect(init.duplex).toBe("half");
-    expect(init.body).toBe(sourceResponse.body);
+    // Buffered, never streamed: Chrome rejects a ReadableStream request body
+    // over HTTP/1.1 (which the local backend speaks) with "Failed to fetch"
+    // before the request leaves the browser.
+    expect(init.duplex).toBeUndefined();
+    expect(init.body).toBeInstanceOf(Blob);
+    expect(await (init.body as Blob).text()).toBe("filebytes");
   });
 
   it("omits X-D2L-Updated when not provided", async () => {
@@ -57,7 +61,7 @@ describe("BackendClient.uploadFile", () => {
     expect(init.headers["X-D2L-Updated"]).toBeUndefined();
   });
 
-  it("falls back to buffering via blob when the source response has no body", async () => {
+  it("sends an empty body when the source response has none", async () => {
     const sourceResponse = new Response(null, { status: 204 });
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ materialId: 1, sha256: "x", deduped: true }));
     vi.stubGlobal("fetch", fetchMock);
