@@ -68,6 +68,12 @@ class EventBus:
     def unsubscribe(self, queue: asyncio.Queue) -> None:
         self._subscribers.discard(queue)
 
+    def subscriber_count(self) -> int:
+        """Read-only visibility into how many subscribers are live -- used
+        by tests to confirm a client disconnect actually unsubscribed
+        (api/events.py's generator unsubscribes in a `finally`)."""
+        return len(self._subscribers)
+
     def publish(self, event: dict) -> None:
         if not self._subscribers:
             return  # nobody listening -- and so no loop needs to be bound yet

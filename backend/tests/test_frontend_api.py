@@ -390,6 +390,7 @@ def test_sse_events_stream_shows_a_triggered_run(app):
 
                 read_task = asyncio.create_task(read_stream())
                 await asyncio.sleep(0.3)  # let the SSE subscription land before triggering
+                assert app.state.event_bus.subscriber_count() == 1
 
                 run_resp = await http_client.post(
                     f"/api/courses/{course_id}/pipeline/run", json={}, headers=CSRF_HEADERS,
@@ -397,12 +398,22 @@ def test_sse_events_stream_shows_a_triggered_run(app):
                 assert run_resp.status_code == 200
 
                 await asyncio.wait_for(read_task, timeout=10)
-                return events
+                # `read_stream` returned, closing the `async with
+                # http_client.stream(...)` block -- the client disconnect
+                # this produces should reach the server-side generator's
+                # `finally: event_bus.unsubscribe(queue)` (api/events.py).
+                # Give the server a moment to notice before checking.
+                for _ in range(50):
+                    if app.state.event_bus.subscriber_count() == 0:
+                        break
+                    await asyncio.sleep(0.05)
+                subscriber_count_after_disconnect = app.state.event_bus.subscriber_count()
+                return events, subscriber_count_after_disconnect
         finally:
             server.should_exit = True
             await server_task
 
-    events = asyncio.run(scenario())
+    events, subscriber_count_after_disconnect = asyncio.run(scenario())
 
     assert events, "expected at least one event on the SSE stream"
     for event in events:
@@ -412,3 +423,4 @@ def test_sse_events_stream_shows_a_triggered_run(app):
 
     assert events[0]["status"] == "run-started"
     assert events[-1]["status"] == "run-finished"
+    assert subscriber_count_after_disconnect == 0  # the disconnect unsubscribed cleanly
