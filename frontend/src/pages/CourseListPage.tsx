@@ -12,7 +12,16 @@ export function CourseListPage() {
 
   return (
     <div className="mx-auto max-w-4xl p-6">
-      <h1 className="mb-4 text-xl font-semibold text-neutral-900 dark:text-neutral-100">Courses</h1>
+      <div className="mb-4 flex items-baseline gap-3">
+        <h1 className="text-xl font-semibold text-neutral-900 dark:text-neutral-100">Courses</h1>
+        <div className="flex-1" />
+        <Link
+          to="/settings"
+          className="text-sm text-neutral-500 hover:text-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200"
+        >
+          Settings
+        </Link>
+      </div>
 
       {isLoading && <p className="text-neutral-500 dark:text-neutral-400">Loading courses…</p>}
       {isError && (
