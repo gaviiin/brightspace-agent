@@ -44,6 +44,20 @@ from brightspace_agent.pipeline.stages.taxonomy import run_taxonomy_stage
 
 logger = logging.getLogger(__name__)
 
+# summarize/classify normally fan out across several materials at once (see
+# their own `concurrency` defaults). These graph nodes instead always drive
+# them at concurrency=1: "check the running total, then call the LLM" (the
+# cost-cap check) has to happen strictly one material at a time, or several
+# concurrent workers can all pass the check before any of them has recorded
+# its spend -- letting up to `concurrency` calls slip past the cap before it
+# takes effect. This is a background job for a single local user, so
+# trading fan-out throughput for an exact, race-free cap (and a
+# deterministic "aborts after exactly one over-budget call" outcome) is the
+# right side of that trade-off, whether or not a real cap ends up binding on
+# a given run. Direct callers of run_summarize_stage/run_classify_stage are
+# unaffected -- this concurrency choice is local to the graph nodes below.
+_CAPPED_STAGE_CONCURRENCY = 1
+
 
 class PipelineState(TypedDict):
     course_id: int
@@ -137,6 +151,7 @@ def build_pipeline_graph(deps: PipelineDeps):
                 deps.blob_store,
                 deps.backend,
                 state["course_id"],
+                concurrency=_CAPPED_STAGE_CONCURRENCY,
                 cost_cap_usd=hooks.remaining_budget(),
             )
         except Exception as exc:  # noqa: BLE001 -- turned into graph state, not raised
@@ -179,6 +194,7 @@ def build_pipeline_graph(deps: PipelineDeps):
                 deps.session_factory,
                 deps.backend,
                 state["course_id"],
+                concurrency=_CAPPED_STAGE_CONCURRENCY,
                 cost_cap_usd=hooks.remaining_budget(),
             )
         except Exception as exc:  # noqa: BLE001
