@@ -25,4 +25,17 @@ make ext        # builds the extension to extension/dist/
 Load the extension: open `chrome://extensions`, enable Developer mode,
 "Load unpacked", select `extension/dist/`.
 
-Other targets: `make test` (backend tests), `make e2e` (placeholder).
+Other targets: `make test` (backend + extension + frontend unit tests).
+
+## Offline E2E
+
+No real Brightspace tenant needed -- `make e2e` drives a fake D2L tenant
+(`backend/tests/fake_d2l.py`) and the real backend end to end (sync ->
+pipeline -> graph, twice, to prove incremental sync and the no-op re-run),
+entirely offline (`BSA_MOCK_LLM=1`).
+
+```sh
+pnpm --dir frontend exec playwright install chromium   # one-time
+make e2e                                                # backend + fake D2L only
+make e2e-ui                                             # + a Playwright smoke test against the real frontend
+```

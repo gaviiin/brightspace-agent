@@ -1,4 +1,4 @@
-.PHONY: install backend frontend ext test e2e
+.PHONY: install backend frontend ext test e2e e2e-ui
 
 install:
 	cd backend && uv sync
@@ -20,3 +20,6 @@ test:
 
 e2e:
 	cd backend && uv run python ../scripts/e2e.py
+
+e2e-ui:
+	bash scripts/e2e-ui.sh
