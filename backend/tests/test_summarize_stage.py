@@ -262,6 +262,63 @@ def test_rerun_reuses_cache_for_duplicate_content_no_new_rows_summaries_unchange
     assert material_e.summary  # genuinely new content -> its own (mock) summary
 
 
+@pytest.mark.parametrize(
+    "poison",
+    [
+        pytest.param("{not json at all", id="unparseable"),
+        pytest.param('{"summary": "no key_terms or doc_kind_guess here"}', id="off-schema"),
+        pytest.param('{"summary": 42, "key_terms": "not-a-list", "doc_kind_guess": null}', id="wrong-types"),
+    ],
+)
+def test_poisoned_cache_row_is_treated_as_a_miss_and_replaced(
+    session_factory, blob_store, backend, course_id, poison
+):
+    """One bad cache row must not wedge the stage forever.
+
+    The cached row used to be `json.loads`d and key-accessed directly, so a
+    truncated write, a hand-edited row, or a row left over from an older
+    output shape raised inside the worker -- and an exception in
+    `_summarize_one` fails the WHOLE stage, on every run, for as long as
+    the row exists. Worse, the write was `on_conflict_do_nothing`, so the
+    bad row could never be replaced. S3's classify stage already validated
+    at the point of read; this mirrors it.
+    """
+    counting = _CountingBackend(backend)
+    body = "Lecture on red-black trees and rotation invariants."
+    sha, size = blob_store.put_bytes(body.encode("utf-8"))
+    blob_store.write_text(sha, body)
+    material_id = _add_material(
+        session_factory, course_id,
+        kind="document", title="Lecture 7", mime="text/plain",
+        sha256=sha, size_bytes=size, status="extracted",
+    )
+
+    _run_stage(session_factory, blob_store, counting, course_id)
+    assert counting.calls == 1
+    good_summary = _get_material(session_factory, material_id).summary
+
+    # Poison the cache row, and reset the material so pass 2 selects it again.
+    with session_factory() as session:
+        row = session.execute(select(LlmCache).where(LlmCache.stage == "summarize")).scalar_one()
+        row.output_json = poison
+        material = session.get(Material, material_id)
+        material.status = "extracted"
+        material.summary = None
+        session.commit()
+
+    stats = _run_stage(session_factory, blob_store, counting, course_id)
+
+    assert stats.failed == 0  # the stage didn't blow up on the bad row
+    assert stats.cached_hits == 0  # it was a miss, not a hit
+    assert counting.calls == 2  # the model was re-asked
+    assert _get_material(session_factory, material_id).summary == good_summary
+
+    with session_factory() as session:
+        rows = list(session.execute(select(LlmCache).where(LlmCache.stage == "summarize")).scalars().all())
+    assert len(rows) == 1  # replaced in place, not duplicated
+    assert json.loads(rows[0].output_json)["key_terms"]  # and it's usable again
+
+
 # --------------------------------------------------------------------------
 # Concurrency
 # --------------------------------------------------------------------------

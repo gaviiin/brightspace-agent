@@ -9,8 +9,10 @@ Two passes (`run_summarize_stage`):
    result means `status='failed'`. Materials with no sha256 (links,
    un-uploaded stubs) are skipped entirely -- they're not this stage's job.
 2. Summarize: `status='extracted'` + `summary IS NULL` -> check `llm_cache`
-   by (sha256, stage, prompt_version, model); a hit reuses the cached
-   `DocSummary` JSON with no LLM call, a miss calls the backend and writes
+   by (sha256, stage, prompt_version, model); a hit whose JSON still
+   validates as a `DocSummary` is reused with no LLM call, anything else
+   (unparseable or off-schema) counts as a miss and gets overwritten by the
+   fresh answer -- see `_read_cache`. A miss calls the backend and writes
    the cache row -> `status='summarized'`. Extras materials (announcements/
    assignments from the /toc extras path) already land at
    `status='extracted'` with a sidecar written, so they flow into this pass
@@ -33,6 +35,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from importlib import resources
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, sessionmaker
@@ -221,19 +224,11 @@ def _summarize_one(
 
         model = backend.model_for_tier(_TIER)
 
-        cached = session.execute(
-            select(LlmCache).where(
-                LlmCache.sha256 == sha256,
-                LlmCache.stage == _STAGE,
-                LlmCache.prompt_version == PROMPT_VERSION,
-                LlmCache.model == model,
-            )
-        ).scalar_one_or_none()
+        cached = _read_cache(session, sha256, model)
 
         if cached is not None:
-            doc_summary_data = json.loads(cached.output_json)
             usage: UsageInfo = {"model": model, "input_tokens": 0, "output_tokens": 0, "est_cost_usd": 0.0}
-            _apply_summary(material, doc_summary_data, model, usage)
+            _apply_summary(material, cached.model_dump(), model, usage)
             stats.cached_hits += 1
             stats.summarized += 1
             session.commit()
@@ -279,14 +274,20 @@ def _summarize_one(
         doc_summary_data = parsed.model_dump()
         _apply_summary(material, doc_summary_data, model, usage)
 
-        # Cache-race guard: two workers summarizing materials with identical
-        # bytes both miss the cache above and both call the LLM: the second
-        # write here reaches a sha256/stage/prompt_version/model that the
-        # first has already inserted. An upsert (rather than a plain insert)
-        # treats that as a harmless duplicate instead of raising
-        # IntegrityError and crashing the whole stage over a healthy
-        # material -- the first writer's cached row wins, which is fine,
-        # since both were computed from byte-identical input.
+        # Upsert, for two reasons (same pair as classify.py's `_write_cache`):
+        #
+        # 1. Cache race: two workers summarizing materials with identical
+        #    bytes both miss the cache above and both call the LLM, so the
+        #    second write here reaches a sha256/stage/prompt_version/model
+        #    the first has already inserted. Without an upsert that's an
+        #    IntegrityError crashing the whole stage over a healthy
+        #    material. Both answers were computed from byte-identical input,
+        #    so either winning is fine.
+        # 2. A row `_read_cache` rejected as unusable has to be replaceable.
+        #    `do_nothing` would leave the bad row there forever, and the
+        #    stage would pay for a fresh call on every single run.
+        output_json = json.dumps(doc_summary_data)
+        created_at = _now_iso()
         session.execute(
             sqlite_insert(LlmCache)
             .values(
@@ -294,10 +295,13 @@ def _summarize_one(
                 stage=_STAGE,
                 prompt_version=PROMPT_VERSION,
                 model=model,
-                output_json=json.dumps(doc_summary_data),
-                created_at=_now_iso(),
+                output_json=output_json,
+                created_at=created_at,
             )
-            .on_conflict_do_nothing(index_elements=["sha256", "stage", "prompt_version", "model"])
+            .on_conflict_do_update(
+                index_elements=["sha256", "stage", "prompt_version", "model"],
+                set_={"output_json": output_json, "created_at": created_at},
+            )
         )
         stats.summarized += 1
         with cost_lock:
@@ -306,6 +310,37 @@ def _summarize_one(
 
     if progress:
         progress(f"summarize:{material_id}")
+
+
+def _read_cache(session: Session, sha256: str, model: str) -> DocSummary | None:
+    """The cached summary, or None if there isn't a usable one.
+
+    Validation happens *here*, not at the point of use: a row that is
+    truncated JSON, or valid JSON that no longer matches `DocSummary` (an
+    older prompt version's shape, a hand-edited row, a half-written file),
+    would otherwise raise inside the worker on every run forever -- and
+    since one poisoned row fails the whole stage, one bad material would
+    wedge the entire course's pipeline. Any unusable row is treated as a
+    miss, and the fresh answer overwrites it (the write below is an
+    upsert). Mirrors classify.py's `_read_cache`.
+    """
+    row = session.execute(
+        select(LlmCache).where(
+            LlmCache.sha256 == sha256,
+            LlmCache.stage == _STAGE,
+            LlmCache.prompt_version == PROMPT_VERSION,
+            LlmCache.model == model,
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    try:
+        return DocSummary.model_validate(json.loads(row.output_json))
+    except (json.JSONDecodeError, ValidationError) as exc:
+        logger.warning(
+            "summarize: ignoring unusable cache row for %s (%s); re-asking the model", sha256[:12], exc
+        )
+        return None
 
 
 def _build_user_prompt(material: Material, text: str) -> str:
@@ -318,6 +353,9 @@ def _build_user_prompt(material: Material, text: str) -> str:
 
 
 def _apply_summary(material: Material, doc_summary_data: dict, model: str, usage: UsageInfo) -> None:
+    """`doc_summary_data` is always a `DocSummary.model_dump()` -- either
+    from a fresh call or from a cache row `_read_cache` already validated --
+    so the direct key access below cannot KeyError on a malformed row."""
     material.summary = doc_summary_data["summary"]
     material.summary_meta_json = json.dumps(
         {
