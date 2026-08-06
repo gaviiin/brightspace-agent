@@ -597,6 +597,45 @@ def test_toc_extras_upsert_on_repeat_call(client, auth_headers, db_session_facto
         assert materials[0].title == "Updated"
 
 
+def test_toc_extras_status_rule_preserves_progress_unless_content_changes(
+    client, auth_headers, db_session_factory
+):
+    """Mirrors test_file_upload_status_rule_preserves_progress_unless_bytes_change:
+    every /toc call re-sends whatever extras are currently posted (that's
+    the extension's real behavior, not a special "re-sync" case), so an
+    unchanged announcement/assignment must not be knocked back to
+    'extracted' -- otherwise every ordinary re-sync would silently discard
+    pipeline progress on any course with news/dropbox extras."""
+    course_id = handshake(client, auth_headers)
+    extras = {"news": [{"id": 1, "title": "Midterm moved", "html": "<p>Midterm moved to Friday</p>"}], "dropbox": None}
+    post_toc(client, auth_headers, load_toc(), extras=extras)
+
+    with db_session_factory() as session:
+        material = session.execute(
+            select(Material).where(Material.course_id == course_id, Material.source_url == "d2l:news:1")
+        ).scalar_one()
+        material_id = material.id
+        material.status = "summarized"
+        material.summary = "a summary"
+        session.commit()
+
+    # Identical extras re-posted (the ordinary case, on every re-sync):
+    # status/summary untouched.
+    post_toc(client, auth_headers, load_toc(), extras=extras)
+    with db_session_factory() as session:
+        material = session.get(Material, material_id)
+        assert material.status == "summarized"
+        assert material.summary == "a summary"
+
+    # Content actually changed: status resets, summary cleared.
+    extras["news"][0]["html"] = "<p>Midterm moved to Monday instead</p>"
+    post_toc(client, auth_headers, load_toc(), extras=extras)
+    with db_session_factory() as session:
+        material = session.get(Material, material_id)
+        assert material.status == "extracted"
+        assert material.summary is None
+
+
 # --------------------------------------------------------------------------
 # 10. incremental-sync contract (end-to-end)
 # --------------------------------------------------------------------------

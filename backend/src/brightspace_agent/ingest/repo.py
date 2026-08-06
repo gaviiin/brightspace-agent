@@ -207,6 +207,8 @@ def upsert_text_material(
     material = session.execute(
         select(Material).where(Material.course_id == course_id, Material.source_url == source_url)
     ).scalar_one_or_none()
+    sha_unchanged = material is not None and material.sha256 == sha256
+
     if material is None:
         material = Material(course_id=course_id, d2l_topic_id=None, source_url=source_url, title=title, kind=kind)
         session.add(material)
@@ -217,7 +219,21 @@ def upsert_text_material(
     material.mime = mime
     material.size_bytes = size
     material.fetched_at = now_iso()
-    material.status = "extracted"
+
+    if not sha_unchanged:
+        # Bytes actually changed (or this is a brand new material): reset
+        # pipeline progress, matching upsert_file_material's rule. Without
+        # this, every /toc call that carries extras (news/dropbox) -- which
+        # is every sync, since the extension always resends whatever's
+        # currently posted -- would unconditionally knock an
+        # already-summarized announcement/assignment back to 'extracted'
+        # even though its content hasn't changed at all, silently dropping
+        # it out of the taxonomy prompt's material list and out of
+        # classify's worklist (both keyed on status=='summarized').
+        material.status = "extracted"
+        material.summary = None
+        material.error = None
+
     session.flush()
     return material
 

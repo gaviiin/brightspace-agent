@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import io
 import json
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -78,13 +79,25 @@ DROPBOX: list[dict[str, Any]] = [
 
 
 # --------------------------------------------------------------------------
-# Real-format asset generation (module import time): a handful of small,
-# deterministic binaries the /file endpoint serves, picked per ToC entry by
-# that entry's own URL extension -- so the bytes served for a given topic
-# are always in the format ingest/extract.py will actually try to parse.
+# Real-format asset generation (module import time): a handful of small
+# binaries the /file endpoint serves, picked per ToC entry by that entry's
+# own URL extension -- so the bytes served for a given topic are always in
+# the format ingest/extract.py will actually try to parse.
+#
+# `@lru_cache`d, and load-bearing, not just an optimization: PyMuPDF's
+# `tobytes()`/python-pptx's `save()` are NOT byte-deterministic across two
+# separate calls even with identical inserted text (PDF/OOXML containers
+# embed a generation timestamp/id) -- without memoizing per title, two
+# fetches of the *same* topic's file (e.g. an E2E run's second /toc
+# re-fetching a topic whose D2L LastModifiedDate is null, which is always
+# "needed" -- see ingest/diff.py's compute_needed) would hash to two
+# different sha256s and look like a genuine content change, defeating both
+# the incremental-sync dedupe and the "identical re-run is a pipeline
+# no-op" invariant `make e2e` checks.
 # --------------------------------------------------------------------------
 
 
+@lru_cache(maxsize=None)
 def make_pdf_bytes(title: str) -> bytes:
     import fitz  # PyMuPDF
 
@@ -98,6 +111,7 @@ def make_pdf_bytes(title: str) -> bytes:
         doc.close()
 
 
+@lru_cache(maxsize=None)
 def make_pptx_bytes(title: str) -> bytes:
     from pptx import Presentation
 
@@ -111,6 +125,7 @@ def make_pptx_bytes(title: str) -> bytes:
     return buf.getvalue()
 
 
+@lru_cache(maxsize=None)
 def make_vtt_bytes(title: str) -> bytes:
     text = (
         "WEBVTT\n\n"
@@ -124,6 +139,7 @@ def make_vtt_bytes(title: str) -> bytes:
     return text.encode("utf-8")
 
 
+@lru_cache(maxsize=None)
 def make_html_bytes(title: str) -> bytes:
     html = f"<html><body><h1>{title}</h1><p>Fake D2L fixture HTML content.</p></body></html>"
     return html.encode("utf-8")

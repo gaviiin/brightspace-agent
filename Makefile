@@ -19,4 +19,4 @@ test:
 	cd frontend && pnpm test
 
 e2e:
-	echo "TODO"
+	cd backend && uv run python ../scripts/e2e.py
