@@ -1,0 +1,40 @@
+"""`StageStats`: the counters every pipeline stage returns.
+
+One dataclass shared by every stage rather than one per stage, so the runner
+(Task 9) can sum, log, and stream progress without knowing which stage it is
+looking at. Each stage fills only the counters that apply to it; the rest
+stay at zero.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class StageStats:
+    # S1 summarize
+    extracted: int = 0
+    summarized: int = 0
+
+    # S2 taxonomy
+    topics: int = 0
+    edges: int = 0
+    taxonomy_version: int = 0
+
+    # S3 classify
+    classified: int = 0  # materials that got at least one assignment
+    assignments: int = 0  # material_topics rows written
+    unassigned: int = 0  # materials the model (validly) placed nowhere
+
+    # Every stage
+    cached_hits: int = 0
+    failed: int = 0
+    usage_total: dict[str, float] = field(
+        default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "est_cost_usd": 0.0}
+    )
+
+    def add_usage(self, usage: dict) -> None:
+        self.usage_total["input_tokens"] += usage["input_tokens"]
+        self.usage_total["output_tokens"] += usage["output_tokens"]
+        self.usage_total["est_cost_usd"] += usage["est_cost_usd"]

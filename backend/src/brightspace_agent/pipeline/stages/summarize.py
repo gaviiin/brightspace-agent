@@ -29,7 +29,6 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import resources
 
@@ -41,6 +40,7 @@ from brightspace_agent.agents.schemas import DocSummary
 from brightspace_agent.db.models import LlmCache, Material
 from brightspace_agent.ingest.extract import extract_text
 from brightspace_agent.ingest.store import BlobStore
+from brightspace_agent.pipeline.stats import StageStats
 
 logger = logging.getLogger(__name__)
 
@@ -58,22 +58,6 @@ ProgressCallback = Callable[[str], None]
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-@dataclass
-class StageStats:
-    extracted: int = 0
-    summarized: int = 0
-    cached_hits: int = 0
-    failed: int = 0
-    usage_total: dict[str, float] = field(
-        default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "est_cost_usd": 0.0}
-    )
-
-    def add_usage(self, usage: UsageInfo) -> None:
-        self.usage_total["input_tokens"] += usage["input_tokens"]
-        self.usage_total["output_tokens"] += usage["output_tokens"]
-        self.usage_total["est_cost_usd"] += usage["est_cost_usd"]
 
 
 async def run_summarize_stage(

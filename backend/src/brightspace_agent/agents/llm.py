@@ -20,7 +20,20 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
 
-from brightspace_agent.agents.schemas import DocSummary
+from brightspace_agent.agents.promptfmt import (
+    SECTION_COURSE_TOPICS,
+    SECTION_MODULE_OUTLINE,
+    section_body,
+    slugify,
+)
+from brightspace_agent.agents.schemas import (
+    ClassificationOut,
+    DocSummary,
+    TaxonomyOut,
+    TopicAssignment,
+    TopicDef,
+    TopicEdgeDef,
+)
 from brightspace_agent.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -183,6 +196,99 @@ def _mock_doc_summary(user: str) -> DocSummary:
 
 
 register_mock_builder(DocSummary, _mock_doc_summary)
+
+
+_FALLBACK_TOPIC_SLUGS = ["core-concepts", "data-structures", "algorithms", "applications"]
+_MOCK_TOPIC_COUNT = 4
+_MOCK_UNKNOWN_SLUG = "mock-unknown-topic"
+_OUTLINE_ITEM_RE = re.compile(r"^\s*-\s+(?P<title>.+?)\s*$")
+
+
+def _mock_taxonomy(user: str) -> TaxonomyOut:
+    """A deterministic 4-topic taxonomy derived from the module outline in
+    the prompt, so offline runs still produce a topic map that looks like the
+    course they were given.
+
+    Two edges are always proposed: a valid prerequisite between the first two
+    topics, and one pointing at a slug that isn't in the taxonomy -- the
+    stage's post-validation is supposed to drop the second, and the mock
+    exercising that path offline is worth more than a tidier fake.
+    """
+    outline = section_body(user, SECTION_MODULE_OUTLINE)
+    titles: list[str] = []
+    for line in outline.splitlines():
+        match = _OUTLINE_ITEM_RE.match(line)
+        if match:
+            titles.append(match.group("title"))
+
+    topics: list[TopicDef] = []
+    used: set[str] = set()
+    for title in titles:
+        slug = slugify(title)
+        if not slug or slug in used:
+            continue
+        used.add(slug)
+        topics.append(
+            TopicDef(
+                slug=slug,
+                name=title,
+                description=f"Mock topic covering {title} as taught in this course.",
+                module_hints=[title],
+            )
+        )
+        if len(topics) == _MOCK_TOPIC_COUNT:
+            break
+
+    for slug in _FALLBACK_TOPIC_SLUGS:
+        if len(topics) >= _MOCK_TOPIC_COUNT:
+            break
+        if slug in used:
+            continue
+        used.add(slug)
+        topics.append(
+            TopicDef(
+                slug=slug,
+                name=slug.replace("-", " ").title(),
+                description=f"Mock fallback topic ({slug}) for a course with no usable module outline.",
+            )
+        )
+
+    edges = [
+        TopicEdgeDef(from_slug=topics[0].slug, to_slug=topics[1].slug, relation="prerequisite"),
+        TopicEdgeDef(from_slug=topics[0].slug, to_slug=_MOCK_UNKNOWN_SLUG, relation="related"),
+    ]
+    return TaxonomyOut(topics=topics, edges=edges)
+
+
+# "3. graph-algorithms — Graph Algorithms — ..." -> "graph-algorithms"
+_NUMBERED_SLUG_RE = re.compile(r"^\s*\d+\.\s+(?P<slug>\S+)")
+
+
+def _mock_classification(user: str) -> ClassificationOut:
+    """Assign the first two topics of whatever taxonomy the prompt carries:
+    one confident, one weak -- a deterministic multi-label answer that also
+    produces a low-confidence row for the review-flagging path."""
+    slugs: list[str] = []
+    for line in section_body(user, SECTION_COURSE_TOPICS).splitlines():
+        match = _NUMBERED_SLUG_RE.match(line)
+        if match:
+            slugs.append(match.group("slug"))
+
+    confidences = [0.9, 0.4]
+    return ClassificationOut(
+        assignments=[
+            TopicAssignment(
+                topic_slug=slug,
+                confidence=confidence,
+                rationale=f"Mock rationale: the summary's terms line up with {slug}.",
+            )
+            for slug, confidence in zip(slugs[:2], confidences)
+        ]
+    )
+
+
+register_mock_builder(TaxonomyOut, _mock_taxonomy)
+register_mock_builder(ClassificationOut, _mock_classification)
 
 
 class MockBackend:
