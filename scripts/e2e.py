@@ -333,7 +333,7 @@ async def _start_pipeline(backend: httpx.AsyncClient, course_id: int) -> int:
 
 
 async def _wait_pipeline_idle(backend: httpx.AsyncClient, course_id: int, *, timeout: float = 60.0) -> dict:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while True:
         resp = await backend.get(f"/api/courses/{course_id}/pipeline/status")

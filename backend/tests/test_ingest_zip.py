@@ -10,13 +10,12 @@ import hashlib
 import io
 import tomllib
 import zipfile
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from brightspace_agent.db.models import Course, Material, Module, SyncRun
+from brightspace_agent.db.models import Material, Module, SyncRun
 
 ORG_UNIT_ID = 555
 

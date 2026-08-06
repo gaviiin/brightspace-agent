@@ -241,8 +241,9 @@ def _classify_one(
                 # worklist, as later workers make the same check) is left
                 # exactly as it is -- still `status='summarized'` -- so a
                 # later run retries it. `cost_lock` only guards the read
-                # here, not the LLM call below -- see the module-level note
-                # on why that's optimistic rather than exact.
+                # here, not the LLM call below -- see run_classify_stage's
+                # docstring above for why that's optimistic rather than
+                # exact.
                 if cost_cap_usd is not None:
                     with cost_lock:
                         cap_reached = stats.usage_total["est_cost_usd"] >= cost_cap_usd
