@@ -18,6 +18,18 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8730
 
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / "brightspace.db"
+
+    @property
+    def blobs_dir(self) -> Path:
+        return self.data_dir / "blobs"
+
+    @property
+    def text_dir(self) -> Path:
+        return self.data_dir / "text"
+
 
 def ensure_data_dir(settings: Settings) -> dict:
     """Ensure the data dir and config.toml exist; return the parsed config.
