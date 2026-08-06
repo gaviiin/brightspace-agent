@@ -33,10 +33,26 @@ export interface HandshakeResponse {
   knownCourses: KnownCourse[];
 }
 
+/** One announcement, already reshaped from D2L's PascalCase news item into
+ * the backend's `NewsExtra` contract (see api/ingest.py). */
+export interface NewsExtra {
+  id: number;
+  title: string;
+  html: string;
+}
+
+/** One assignment folder, already reshaped from D2L's PascalCase dropbox
+ * folder into the backend's `DropboxExtra` contract. */
+export interface DropboxExtra {
+  id: number;
+  name: string;
+  instructionsText: string | null;
+}
+
 export interface TocPayload {
   orgUnitId: number;
   toc: unknown;
-  extras: { news?: unknown[]; dropbox?: unknown[] } | null;
+  extras: { news?: NewsExtra[]; dropbox?: DropboxExtra[] } | null;
 }
 
 export interface NeededItem {
@@ -79,4 +95,30 @@ export interface D2LEnrollmentItem {
 export interface D2LPagedResultSet<T> {
   PagingInfo: { Bookmark: string; HasMoreItems: boolean };
   Items: T[];
+}
+
+/** A rich-text field as Valence returns it (news bodies, dropbox custom
+ * instructions): both a plain-text and an HTML rendering, either of which
+ * a tenant may omit. */
+export interface D2LRichText {
+  Text?: string | null;
+  Html?: string | null;
+}
+
+/** `GET /d2l/api/le/{le}/{orgUnitId}/news/` — PascalCase, with the body
+ * nested under `Body`. Every field is optional here on purpose: this is
+ * the untrusted wire shape, and d2l-client.ts reshapes it defensively into
+ * the backend's `NewsExtra`. */
+export interface D2LNewsItem {
+  Id?: number | null;
+  Title?: string | null;
+  Body?: D2LRichText | null;
+}
+
+/** `GET /d2l/api/le/{le}/{orgUnitId}/dropbox/folders/` — PascalCase, with
+ * the instructions nested under `CustomInstructions`. */
+export interface D2LDropboxFolder {
+  Id?: number | null;
+  Name?: string | null;
+  CustomInstructions?: D2LRichText | null;
 }

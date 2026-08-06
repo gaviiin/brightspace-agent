@@ -301,13 +301,26 @@ def upsert_file_material(
 # --------------------------------------------------------------------------
 
 
-def create_sync_run(session: Session, course_id: int, not_needed: int, *, source: str = "extension") -> SyncRun:
+def create_sync_run(
+    session: Session,
+    course_id: int,
+    not_needed: int,
+    *,
+    source: str = "extension",
+    extras_skipped: int = 0,
+) -> SyncRun:
+    """`extras_skipped`: how many news/dropbox extras items /toc had to
+    discard as unusable (see api/ingest.py's `_parse_extra`). Recorded so a
+    systematically wrong extras shape shows up in the sync run's stats
+    instead of vanishing into a log line."""
     sync_run = SyncRun(
         course_id=course_id,
         source=source,
         started_at=now_iso(),
         status="running",
-        stats_json=json.dumps({"files": 0, "bytes": 0, "notNeeded": not_needed}),
+        stats_json=json.dumps(
+            {"files": 0, "bytes": 0, "notNeeded": not_needed, "extrasSkipped": extras_skipped}
+        ),
     )
     session.add(sync_run)
     session.flush()

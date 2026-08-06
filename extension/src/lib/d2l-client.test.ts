@@ -151,6 +151,77 @@ describe("D2LClient.fetchTopicFile", () => {
 });
 
 describe("D2LClient.news / D2LClient.dropboxFolders", () => {
+  it("news() reshapes D2L's PascalCase items into the backend's extras contract", async () => {
+    // The real Valence shape: PascalCase, body nested under Body as a
+    // {Text, Html} pair. The backend's /toc contract is {id, title, html},
+    // so this mapping is what stands between a real tenant and a 422 that
+    // fails the whole course sync.
+    const fetchImpl = vi.fn().mockResolvedValue(
+      jsonResponse([
+        {
+          Id: 42,
+          Title: "Midterm date announced",
+          Body: { Text: "Week 6.", Html: "<p>Week 6.</p>" },
+          IsGlobal: false,
+        },
+      ]),
+    );
+    const fetcher = new RateLimitedFetcher({ fetchImpl, sleepImpl: instantSleep });
+    const client = new D2LClient("https://tenant.example", fetcher);
+
+    await expect(client.news("1.79", 111)).resolves.toEqual([
+      { id: 42, title: "Midterm date announced", html: "<p>Week 6.</p>" },
+    ]);
+  });
+
+  it("news() defends against missing Body/Title and drops items with no numeric Id", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      jsonResponse([
+        { Id: 1 }, // no Body, no Title at all
+        { Id: 2, Title: "Text only", Body: { Text: "plain" } }, // no Html rendering
+        { Title: "No id" }, // unusable: nothing to key d2l:news:{id} on
+        null, // not even an object
+      ]),
+    );
+    const fetcher = new RateLimitedFetcher({ fetchImpl, sleepImpl: instantSleep });
+    const client = new D2LClient("https://tenant.example", fetcher);
+
+    await expect(client.news("1.79", 111)).resolves.toEqual([
+      { id: 1, title: "", html: "" },
+      { id: 2, title: "Text only", html: "" },
+    ]);
+  });
+
+  it("dropboxFolders() reshapes CustomInstructions.Text into instructionsText", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      jsonResponse([
+        {
+          Id: 7,
+          Name: "Homework 1",
+          CustomInstructions: { Text: "Submit a PDF.", Html: "<p>Submit a PDF.</p>" },
+          IsHidden: false,
+        },
+        { Id: 8, Name: "Homework 2" }, // no instructions at all
+      ]),
+    );
+    const fetcher = new RateLimitedFetcher({ fetchImpl, sleepImpl: instantSleep });
+    const client = new D2LClient("https://tenant.example", fetcher);
+
+    await expect(client.dropboxFolders("1.79", 111)).resolves.toEqual([
+      { id: 7, name: "Homework 1", instructionsText: "Submit a PDF." },
+      { id: 8, name: "Homework 2", instructionsText: null },
+    ]);
+  });
+
+  it("returns [] when the tenant answers with something that isn't an array", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ Errors: ["nope"] }));
+    const fetcher = new RateLimitedFetcher({ fetchImpl, sleepImpl: instantSleep });
+    const client = new D2LClient("https://tenant.example", fetcher);
+
+    await expect(client.news("1.79", 111)).resolves.toEqual([]);
+    await expect(client.dropboxFolders("1.79", 111)).resolves.toEqual([]);
+  });
+
   it("news() returns [] on a 500 response instead of throwing", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response("boom", { status: 500 }));
     const fetcher = new RateLimitedFetcher({ fetchImpl, sleepImpl: instantSleep });

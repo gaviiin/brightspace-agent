@@ -3,7 +3,15 @@
 // service worker and under vitest in Node. Every `/d2l/api/` path must live
 // in this file; nothing downstream should hand-build one.
 
-import type { D2LEnrollmentItem, D2LPagedResultSet, D2LVersionInfo } from "./types";
+import type {
+  D2LDropboxFolder,
+  D2LEnrollmentItem,
+  D2LNewsItem,
+  D2LPagedResultSet,
+  D2LVersionInfo,
+  DropboxExtra,
+  NewsExtra,
+} from "./types";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -175,6 +183,53 @@ function isCourseEnrollment(item: D2LEnrollmentItem): boolean {
   return COURSE_TYPE_PATTERN.test(Code) || COURSE_TYPE_PATTERN.test(Name);
 }
 
+// ---------------------------------------------------------------------------
+// Extras reshaping — D2L PascalCase -> the backend's camelCase contract
+//
+// This mapping is the ONLY place the two shapes meet. Valence returns
+// `{Id, Title, Body: {Text, Html}}` / `{Id, Name, CustomInstructions:
+// {Text, Html}}`; the backend's /toc `extras` contract (see api/ingest.py's
+// NewsExtra/DropboxExtra) is `{id, title, html}` / `{id, name,
+// instructionsText}`. Forwarding the raw Valence objects would have every
+// item rejected server-side.
+//
+// Everything is optional-chained and defaulted because these responses come
+// from a tenant we don't control: a missing `Body`, a null `Title`, or a
+// non-object array entry must not throw here. An item with no usable
+// numeric `Id` is dropped outright -- the backend keys extras materials on
+// `d2l:news:{id}` / `d2l:dropbox:{id}`, so there is nothing to store it as.
+// (The backend skips unusable items too; this is the first of two layers,
+// not the only one.)
+// ---------------------------------------------------------------------------
+
+function asRecord<T>(value: unknown): T | null {
+  return typeof value === "object" && value !== null ? (value as T) : null;
+}
+
+function toNewsExtras(items: unknown[]): NewsExtra[] {
+  const extras: NewsExtra[] = [];
+  for (const raw of items) {
+    const item = asRecord<D2LNewsItem>(raw);
+    if (typeof item?.Id !== "number") continue;
+    extras.push({ id: item.Id, title: item.Title ?? "", html: item.Body?.Html ?? "" });
+  }
+  return extras;
+}
+
+function toDropboxExtras(items: unknown[]): DropboxExtra[] {
+  const extras: DropboxExtra[] = [];
+  for (const raw of items) {
+    const item = asRecord<D2LDropboxFolder>(raw);
+    if (typeof item?.Id !== "number") continue;
+    extras.push({
+      id: item.Id,
+      name: item.Name ?? "",
+      instructionsText: item.CustomInstructions?.Text ?? null,
+    });
+  }
+  return extras;
+}
+
 export class D2LClient {
   constructor(
     private readonly origin: string,
@@ -238,22 +293,28 @@ export class D2LClient {
   }
 
   /** Extras are optional: any failure (bad status or network error) is
-   * swallowed and reported as an empty list rather than aborting the sync. */
-  async news(le: string, orgUnitId: number): Promise<unknown[]> {
+   * swallowed and reported as an empty list rather than aborting the sync.
+   * The returned items are already in the backend's `extras.news` shape --
+   * see toNewsExtras above for why the reshaping belongs here. */
+  async news(le: string, orgUnitId: number): Promise<NewsExtra[]> {
     try {
       const response = await this.get(`/d2l/api/le/${le}/${orgUnitId}/news/`);
       if (!response.ok) return [];
-      return (await response.json()) as unknown[];
+      const payload = await response.json();
+      return Array.isArray(payload) ? toNewsExtras(payload) : [];
     } catch {
       return [];
     }
   }
 
-  async dropboxFolders(le: string, orgUnitId: number): Promise<unknown[]> {
+  /** Same contract as `news()`: fail-soft, and already reshaped into the
+   * backend's `extras.dropbox` items. */
+  async dropboxFolders(le: string, orgUnitId: number): Promise<DropboxExtra[]> {
     try {
       const response = await this.get(`/d2l/api/le/${le}/${orgUnitId}/dropbox/folders/`);
       if (!response.ok) return [];
-      return (await response.json()) as unknown[];
+      const payload = await response.json();
+      return Array.isArray(payload) ? toDropboxExtras(payload) : [];
     } catch {
       return [];
     }

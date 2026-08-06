@@ -636,6 +636,52 @@ def test_toc_extras_status_rule_preserves_progress_unless_content_changes(
         assert material.summary is None
 
 
+def test_toc_malformed_extras_items_are_skipped_not_422(client, auth_headers, db_session_factory):
+    """Extras are a best-effort side channel; the ToC is the request.
+
+    Regression for the extras wire-shape mismatch: `extras` used to be typed
+    `list[NewsExtra]`, so ONE item pydantic couldn't parse -- e.g. a raw
+    PascalCase Valence object, which is exactly what a real tenant returns
+    -- rejected the whole /toc body. No sync run, no module tree, no file
+    diff: the course's entire sync failed on an announcement. Bad items are
+    now skipped per item and counted, and everything else still lands.
+    """
+    course_id = handshake(client, auth_headers)
+    resp = post_toc(
+        client, auth_headers, load_toc(),
+        extras={
+            "news": [
+                {"Id": 9, "Title": "Raw Valence shape", "Body": {"Html": "<p>nope</p>"}},  # unmapped
+                {"id": 1, "title": "Midterm moved", "html": "<p>Midterm moved to Friday</p>"},  # good
+                {"id": "not-an-int", "title": "x", "html": "y"},  # wrong types
+                "not even an object",
+            ],
+            "dropbox": [
+                {"id": 2, "name": "Homework 1", "instructionsText": "Submit as a single PDF."},  # good
+                {"name": "missing its id"},
+            ],
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # The ToC half of the request was processed normally.
+    assert {item["d2lTopicId"] for item in body["needed"]} == ALL_FILE_TOPIC_IDS
+
+    with db_session_factory() as session:
+        source_urls = set(
+            session.execute(
+                select(Material.source_url).where(
+                    Material.course_id == course_id, Material.source_url.like("d2l:%")
+                )
+            ).scalars().all()
+        )
+        assert source_urls == {"d2l:news:1", "d2l:dropbox:2"}
+
+        sync_run = session.get(SyncRun, body["syncRunId"])
+        assert json.loads(sync_run.stats_json)["extrasSkipped"] == 4
+
+
 # --------------------------------------------------------------------------
 # 10. incremental-sync contract (end-to-end)
 # --------------------------------------------------------------------------

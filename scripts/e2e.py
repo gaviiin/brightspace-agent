@@ -202,7 +202,13 @@ class D2LSyncDriver:
             json={
                 "orgUnitId": org_unit_id,
                 "toc": toc,
-                "extras": {"news": news_resp.json(), "dropbox": dropbox_resp.json()},
+                # Reshaped exactly as d2l-client.ts does: the fake tenant
+                # serves real PascalCase Valence objects, and the backend's
+                # extras contract is camelCase (see _to_news_extras).
+                "extras": {
+                    "news": _to_news_extras(news_resp.json()),
+                    "dropbox": _to_dropbox_extras(dropbox_resp.json()),
+                },
             },
         )
         toc_backend_resp.raise_for_status()
@@ -244,6 +250,46 @@ class D2LSyncDriver:
         complete_resp.raise_for_status()
 
         return {"syncRunId": sync_run_id, "needed": needed, "errors": errors, "complete": complete_resp.json()}
+
+
+def _rich_text(value: Any, field: str) -> str | None:
+    """`Body`/`CustomInstructions` are `{Text, Html}` objects in Valence,
+    and either half may be missing."""
+    return value.get(field) if isinstance(value, dict) else None
+
+
+def _to_news_extras(items: Any) -> list[dict]:
+    """Mirrors d2l-client.ts's toNewsExtras: D2L's PascalCase news items ->
+    the backend's `extras.news` contract. An item with no numeric `Id` is
+    dropped (there is no `d2l:news:{id}` to key it on)."""
+    extras: list[dict] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("Id"), int):
+            continue
+        extras.append(
+            {
+                "id": item["Id"],
+                "title": item.get("Title") or "",
+                "html": _rich_text(item.get("Body"), "Html") or "",
+            }
+        )
+    return extras
+
+
+def _to_dropbox_extras(items: Any) -> list[dict]:
+    """Mirrors d2l-client.ts's toDropboxExtras."""
+    extras: list[dict] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("Id"), int):
+            continue
+        extras.append(
+            {
+                "id": item["Id"],
+                "name": item.get("Name") or "",
+                "instructionsText": _rich_text(item.get("CustomInstructions"), "Text"),
+            }
+        )
+    return extras
 
 
 def _is_course_enrollment(item: dict) -> bool:

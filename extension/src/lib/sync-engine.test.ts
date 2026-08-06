@@ -4,7 +4,14 @@ import { BackendError } from "./backend-client";
 import { SessionExpiredError } from "./d2l-client";
 import { discover, resume, syncCourse } from "./sync-engine";
 import type { BackendClientLike, D2LClientLike, SyncDeps, SyncState } from "./sync-engine";
-import type { D2LEnrollmentItem, HandshakePayload, KnownCourse, NeededItem } from "./types";
+import type {
+  D2LEnrollmentItem,
+  DropboxExtra,
+  HandshakePayload,
+  KnownCourse,
+  NeededItem,
+  NewsExtra,
+} from "./types";
 
 // ---------------------------------------------------------------------------
 // Test helpers — plain fakes, no chrome.*, no real D2LClient/BackendClient
@@ -255,9 +262,14 @@ describe("syncCourse", () => {
     expect(backend.uploadFile).toHaveBeenCalledTimes(1);
   });
 
-  it("includes news/dropbox extras from the d2l client in the toc payload", async () => {
-    const newsItems = [{ id: 1, title: "n", html: "<p>hi</p>" }];
-    const dropboxItems = [{ id: 2, name: "d1" }];
+  it("includes news/dropbox extras from the d2l client in the toc payload, verbatim", async () => {
+    // These are already in the BACKEND's contract shape: d2l-client.ts owns
+    // the D2L-PascalCase -> camelCase reshaping (toNewsExtras /
+    // toDropboxExtras), and this engine forwards what it's handed without
+    // touching it. Anything else here would re-introduce the wire-shape
+    // mismatch this test used to hide.
+    const newsItems: NewsExtra[] = [{ id: 1, title: "n", html: "<p>hi</p>" }];
+    const dropboxItems: DropboxExtra[] = [{ id: 2, name: "d1", instructionsText: null }];
     const d2l = makeFakeD2L({
       courseToc: vi.fn().mockResolvedValue({ Modules: [] }),
       news: vi.fn().mockResolvedValue(newsItems),

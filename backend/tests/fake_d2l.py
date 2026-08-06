@@ -66,15 +66,51 @@ ENROLLMENTS: list[dict[str, Any]] = [
 ]
 _ENROLLMENT_PAGE_SIZE = 1
 
-# News/dropbox items are already shaped the way the backend's /toc `extras`
-# contract expects (see api/ingest.py's NewsExtra/DropboxExtra) -- the
-# extension's sync-engine.ts forwards whatever d2l.news()/dropboxFolders()
-# return verbatim, with no reshaping of its own (see sync-engine.test.ts).
+# News/dropbox items in the REAL Valence shape: PascalCase, with the body
+# nested under `Body`/`CustomInstructions` as a {Text, Html} pair. They are
+# deliberately NOT pre-shaped to the backend's /toc `extras` contract (see
+# api/ingest.py's NewsExtra/DropboxExtra) -- the reshaping is the
+# extension's job (d2l-client.ts's toNewsExtras/toDropboxExtras), and a
+# fixture that hands out already-correct objects would make three layers of
+# tests agree on a shape D2L never actually sends.
+#
+# The second news item exercises the defensive half of that mapping: a
+# tenant that publishes an announcement with no HTML rendering at all.
 NEWS: list[dict[str, Any]] = [
-    {"id": 1, "title": "Midterm date announced", "html": "<p>The midterm will be held in week 6.</p>"}
+    {
+        "Id": 1,
+        "Title": "Midterm date announced",
+        "Body": {
+            "Text": "The midterm will be held in week 6.",
+            "Html": "<p>The midterm will be held in week 6.</p>",
+        },
+        "StartDate": "2026-01-05T12:00:00.000Z",
+        "EndDate": None,
+        "IsGlobal": False,
+        "IsPublished": True,
+    },
+    {
+        "Id": 2,
+        "Title": "Office hours moved",
+        "Body": {"Text": "Office hours are now on Thursdays.", "Html": None},
+        "StartDate": "2026-01-06T12:00:00.000Z",
+        "EndDate": None,
+        "IsGlobal": False,
+        "IsPublished": True,
+    },
 ]
 DROPBOX: list[dict[str, Any]] = [
-    {"id": 1, "name": "Homework 1", "instructionsText": "Submit your solution as a single PDF."}
+    {
+        "Id": 1,
+        "Name": "Homework 1",
+        "CustomInstructions": {
+            "Text": "Submit your solution as a single PDF.",
+            "Html": "<p>Submit your solution as a single PDF.</p>",
+        },
+        "Availability": None,
+        "GroupTypeId": None,
+        "IsHidden": False,
+    }
 ]
 
 

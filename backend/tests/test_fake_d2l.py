@@ -168,18 +168,29 @@ def test_file_endpoint_serves_vtt_and_html_for_those_extensions(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_news_and_dropbox_match_the_backend_extras_shape(client):
+def test_news_and_dropbox_serve_the_real_valence_shape_not_the_backend_contract(client):
+    """Regression guard for the extras wire-shape mismatch: this fixture
+    used to serve `{id, title, html}` / `{id, name, instructionsText}` --
+    the BACKEND's contract -- which made the extension look correct while
+    forwarding raw Valence objects that the backend would reject outright.
+    D2L sends PascalCase with the body nested; the reshaping is
+    d2l-client.ts's job (toNewsExtras/toDropboxExtras)."""
     news_resp = client.get(f"/d2l/api/le/{fake_d2l.LE_VERSION}/{ORG_UNIT_ID}/news/")
     assert news_resp.status_code == 200
     assert news_resp.json() == fake_d2l.NEWS
     for item in news_resp.json():
-        assert set(item) == {"id", "title", "html"}
+        assert {"Id", "Title", "Body"} <= set(item)
+        assert set(item["Body"]) >= {"Text", "Html"}
+        # The backend-contract keys must NOT be present -- that was the bug.
+        assert not {"id", "title", "html"} & set(item)
 
     dropbox_resp = client.get(f"/d2l/api/le/{fake_d2l.LE_VERSION}/{ORG_UNIT_ID}/dropbox/folders/")
     assert dropbox_resp.status_code == 200
     assert dropbox_resp.json() == fake_d2l.DROPBOX
     for item in dropbox_resp.json():
-        assert set(item) == {"id", "name", "instructionsText"}
+        assert {"Id", "Name", "CustomInstructions"} <= set(item)
+        assert set(item["CustomInstructions"]) >= {"Text", "Html"}
+        assert not {"id", "name", "instructionsText"} & set(item)
 
 
 # --------------------------------------------------------------------------

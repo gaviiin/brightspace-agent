@@ -19,11 +19,11 @@ import tempfile
 import zipfile
 from email.header import decode_header
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic.alias_generators import to_camel
 from sqlalchemy.orm import Session
 
@@ -40,6 +40,9 @@ router = APIRouter(prefix="/api/ingest", dependencies=[Depends(require_pairing_t
 
 class CamelModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+
+_ExtraT = TypeVar("_ExtraT", bound=CamelModel)
 
 
 # --------------------------------------------------------------------------
@@ -109,8 +112,21 @@ class DropboxExtra(CamelModel):
 
 
 class Extras(CamelModel):
-    news: list[NewsExtra] | None = None
-    dropbox: list[DropboxExtra] | None = None
+    """Announcements/assignment folders the extension folds into /toc.
+
+    Typed `list[Any]`, not `list[NewsExtra]`/`list[DropboxExtra]`, on
+    purpose: extras are a best-effort side channel scraped from a tenant we
+    don't control, while the ToC itself is the whole point of the request.
+    Declaring the item models here would make pydantic reject the ENTIRE
+    request -- ToC, module tree, file diff and all -- over one announcement
+    with a field D2L happened to render differently, failing the course's
+    whole sync. Items are validated one at a time in `ingest_toc` instead:
+    an unusable one is skipped and counted (`extrasSkipped` in the sync
+    run's stats), and everything else still lands.
+    """
+
+    news: list[Any] | None = None
+    dropbox: list[Any] | None = None
 
 
 class TocRequest(CamelModel):
@@ -138,6 +154,22 @@ class NeededItemOut(CamelModel):
 class TocResponse(CamelModel):
     sync_run_id: int
     needed: list[NeededItemOut]
+
+
+def _parse_extra(model: type[_ExtraT], raw: Any, kind: str) -> _ExtraT | None:
+    """One extras item, or None if it isn't usable.
+
+    Item-level, so a single malformed announcement costs exactly that
+    announcement rather than 422-ing the whole /toc request (and with it
+    the course's entire sync). Counted by the caller and surfaced as
+    `extrasSkipped` in the sync run's stats, so a systematically wrong
+    shape is visible rather than silent.
+    """
+    try:
+        return model.model_validate(raw)
+    except ValidationError as exc:
+        logger.warning("toc: skipping unusable %s extra (%s)", kind, exc)
+        return None
 
 
 @router.post("/toc", response_model=TocResponse)
@@ -171,21 +203,30 @@ def ingest_toc(
     needed_entries = compute_needed(session, course.id, entries)
     not_needed_count = file_topic_count - len(needed_entries)
 
+    extras_skipped = 0
     if payload.extras is not None:
-        for news in payload.extras.news or []:
+        for raw_news in payload.extras.news or []:
+            news = _parse_extra(NewsExtra, raw_news, "news")
+            if news is None:
+                extras_skipped += 1
+                continue
             repo.upsert_text_material(
                 session, blob_store, course.id,
                 source_url=f"d2l:news:{news.id}", title=news.title,
                 kind="announcement", body=news.html, mime="text/html",
             )
-        for dropbox in payload.extras.dropbox or []:
+        for raw_dropbox in payload.extras.dropbox or []:
+            dropbox = _parse_extra(DropboxExtra, raw_dropbox, "dropbox")
+            if dropbox is None:
+                extras_skipped += 1
+                continue
             repo.upsert_text_material(
                 session, blob_store, course.id,
                 source_url=f"d2l:dropbox:{dropbox.id}", title=dropbox.name,
                 kind="assignment", body=dropbox.instructions_text or "", mime="text/plain",
             )
 
-    sync_run = repo.create_sync_run(session, course.id, not_needed_count)
+    sync_run = repo.create_sync_run(session, course.id, not_needed_count, extras_skipped=extras_skipped)
     session.commit()
 
     return TocResponse(

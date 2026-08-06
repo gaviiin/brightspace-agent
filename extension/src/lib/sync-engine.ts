@@ -14,11 +14,13 @@ import { SessionExpiredError } from "./d2l-client";
 import type {
   CompletePayload,
   D2LEnrollmentItem,
+  DropboxExtra,
   EnrollmentIn,
   HandshakePayload,
   HandshakeResponse,
   KnownCourse,
   NeededItem,
+  NewsExtra,
   TocPayload,
   TocResponse,
 } from "./types";
@@ -33,8 +35,10 @@ export interface D2LClientLike {
   whoami(lp: string): Promise<unknown>;
   myEnrollments(lp: string): Promise<D2LEnrollmentItem[]>;
   courseToc(le: string, orgUnitId: number): Promise<unknown>;
-  news(le: string, orgUnitId: number): Promise<unknown[]>;
-  dropboxFolders(le: string, orgUnitId: number): Promise<unknown[]>;
+  /** Already reshaped into the backend's extras contract by d2l-client.ts
+   * -- this engine forwards them verbatim and does no mapping of its own. */
+  news(le: string, orgUnitId: number): Promise<NewsExtra[]>;
+  dropboxFolders(le: string, orgUnitId: number): Promise<DropboxExtra[]>;
   fetchTopicFile(le: string, orgUnitId: number, topicId: number): Promise<Response>;
 }
 
