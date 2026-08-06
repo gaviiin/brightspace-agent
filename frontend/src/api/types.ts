@@ -38,10 +38,12 @@ export interface GraphMaterial {
   maxConfidence: number | null;
 }
 
+export type TopicEdgeRelation = "prerequisite" | "related";
+
 export interface GraphEdge {
   fromTopicId: number;
   toTopicId: number;
-  relation: "prerequisite" | "related";
+  relation: TopicEdgeRelation;
 }
 
 export interface GraphAttachment {
@@ -102,6 +104,34 @@ export interface CourseSummary {
   lastSyncedAt: string | null;
   materialCounts: MaterialCounts;
   pipeline: PipelineSummary | null;
+}
+
+// ---------------------------------------------------------------------------
+// PUT /api/courses/{id}/taxonomy  (api/taxonomy.py, pipeline/taxonomy_apply.py)
+// ---------------------------------------------------------------------------
+
+export interface TaxonomyEditTopic {
+  id: number | null;
+  name: string;
+  description: string;
+  mergedFromTopicIds: number[];
+}
+
+export interface TaxonomyEditEdge {
+  fromIndex: number;
+  toIndex: number;
+  relation: TopicEdgeRelation;
+}
+
+export interface TaxonomyEditRequest {
+  topics: TaxonomyEditTopic[];
+  edges: TaxonomyEditEdge[];
+}
+
+export interface TaxonomyApplyResponse {
+  taxonomyVersion: number;
+  reclassify: boolean;
+  runToken: number | null;
 }
 
 // ---------------------------------------------------------------------------

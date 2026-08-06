@@ -11,10 +11,11 @@ import {
   pipelineStatus,
   runPipeline,
 } from "../api/client";
-import type { BsaEvent, DryRunResponse } from "../api/types";
+import type { BsaEvent, DryRunResponse, TaxonomyApplyResponse } from "../api/types";
 import { GraphView } from "../graph/GraphView";
 import { DetailPanel } from "../panels/DetailPanel";
 import { OutlinePanel } from "../panels/OutlinePanel";
+import { TaxonomyEditor } from "../panels/TaxonomyEditor";
 import { useUiStore } from "../state/uiStore";
 
 export function CourseWorkspacePage() {
@@ -29,6 +30,8 @@ export function CourseWorkspacePage() {
   const setSelection = useUiStore((state) => state.setSelection);
 
   const [confirmDryRun, setConfirmDryRun] = useState(false);
+  const [taxonomyEditorOpen, setTaxonomyEditorOpen] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
 
   const courseQuery = useQuery({
     queryKey: ["course", courseId],
@@ -118,6 +121,28 @@ export function CourseWorkspacePage() {
     return () => source.close();
   }, [courseId, courseIdValid, queryClient]);
 
+  // Auto-dismiss the taxonomy-save toast after a few seconds.
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 4000);
+    return () => clearTimeout(timer);
+  }, [toast]);
+
+  // Task 12: a patch is applied immediately (its version doesn't change),
+  // so the graph is stale until refetched here; a structural save started a
+  // pipeline run (`reclassify: true`) whose progress/completion the
+  // existing SSE effect above already handles -- refetching again here
+  // would just race it.
+  function handleTaxonomySaved(result: TaxonomyApplyResponse) {
+    setTaxonomyEditorOpen(false);
+    if (result.reclassify) {
+      setToast("Re-classifying…");
+    } else {
+      setToast("Taxonomy updated.");
+      queryClient.invalidateQueries({ queryKey: ["graph", courseId] });
+    }
+  }
+
   const course = courseQuery.data;
   const active = statusQuery.data?.active ?? false;
   const runPipelineDisabled =
@@ -150,6 +175,14 @@ export function CourseWorkspacePage() {
         >
           Settings
         </Link>
+        <button
+          type="button"
+          disabled={!graphQuery.data}
+          onClick={() => setTaxonomyEditorOpen(true)}
+          className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800"
+        >
+          Edit topics
+        </button>
         <button
           type="button"
           disabled={runPipelineDisabled}
@@ -200,6 +233,21 @@ export function CourseWorkspacePage() {
           onCancel={() => setConfirmDryRun(false)}
           onConfirm={() => runMutation.mutate()}
         />
+      )}
+
+      {taxonomyEditorOpen && graphQuery.data && (
+        <TaxonomyEditor
+          courseId={courseId}
+          payload={graphQuery.data}
+          onClose={() => setTaxonomyEditorOpen(false)}
+          onSaved={handleTaxonomySaved}
+        />
+      )}
+
+      {toast && (
+        <div className="fixed bottom-4 right-4 z-50 rounded-md bg-neutral-900 px-3 py-2 text-sm text-white shadow-lg dark:bg-neutral-100 dark:text-neutral-900">
+          {toast}
+        </div>
       )}
     </div>
   );

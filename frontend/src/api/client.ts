@@ -11,6 +11,8 @@ import type {
   PipelineRunResponse,
   PipelineStatusResponse,
   SettingsResponse,
+  TaxonomyApplyResponse,
+  TaxonomyEditRequest,
 } from "./types";
 
 // Mutating endpoints under /api/ (besides /api/ingest/*, which the
@@ -58,6 +60,18 @@ export function getGraph(courseId: number): Promise<GraphPayload> {
 
 export function getMaterial(materialId: number): Promise<MaterialDetail> {
   return request<MaterialDetail>(`/api/materials/${materialId}`);
+}
+
+/** Saves a taxonomy edit (Task 12). The response says whether the backend
+ * took the patch path (`reclassify: false`, applied immediately) or the
+ * structural path (`reclassify: true`, `runToken` set -- the existing SSE/
+ * refetch machinery picks up the resulting graph change). */
+export function putTaxonomy(courseId: number, body: TaxonomyEditRequest): Promise<TaxonomyApplyResponse> {
+  return request<TaxonomyApplyResponse>(`/api/courses/${courseId}/taxonomy`, {
+    method: "PUT",
+    headers: { ...CSRF_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 /** The extracted-text sidecar's URL (plain text, not JSON -- MaterialReader
