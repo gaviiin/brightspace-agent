@@ -16,6 +16,7 @@ from brightspace_agent.api.graph import router as graph_router
 from brightspace_agent.api.ingest import router as ingest_router
 from brightspace_agent.api.materials import router as materials_router
 from brightspace_agent.api.pipeline import router as pipeline_router
+from brightspace_agent.api.settings import router as settings_router
 from brightspace_agent.config import Settings, ensure_data_dir
 from brightspace_agent.db.session import init_db
 from brightspace_agent.ingest.store import BlobStore
@@ -56,6 +57,7 @@ def create_app() -> FastAPI:
     app.state.blob_store = blob_store
     app.state.event_bus = event_bus
     app.state.runner = runner
+    app.state.settings = settings
 
     app.add_middleware(
         CORSMiddleware,
@@ -90,6 +92,7 @@ def create_app() -> FastAPI:
     app.include_router(materials_router)
     app.include_router(pipeline_router)
     app.include_router(events_router)
+    app.include_router(settings_router)
 
     if FRONTEND_DIST.exists():
 

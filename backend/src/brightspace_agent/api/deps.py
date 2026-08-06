@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from fastapi import HTTPException, Request
 from sqlalchemy.orm import Session
 
+from brightspace_agent.config import Settings
 from brightspace_agent.ingest.store import BlobStore
 from brightspace_agent.pipeline.runner import EventBus, PipelineRunner
 
@@ -45,3 +46,7 @@ def get_runner(request: Request) -> PipelineRunner:
 
 def get_event_bus(request: Request) -> EventBus:
     return request.app.state.event_bus
+
+
+def get_settings(request: Request) -> Settings:
+    return request.app.state.settings
