@@ -170,7 +170,8 @@ class PipelineRunner:
     ) -> None:
         self._session_factory = session_factory
         self._settings = settings
-        self.backend = backend  # read by the dry-run endpoint for model_for_tier()
+        self.backend = backend  # read by tests/callers that want to observe LLM traffic
+        self.settings = settings  # read by the dry-run endpoint (configured model names)
         self.event_bus = event_bus if event_bus is not None else EventBus()
 
         deps = PipelineDeps(

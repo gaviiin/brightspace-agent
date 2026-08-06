@@ -1,8 +1,8 @@
 """Shared FastAPI dependencies: pairing-token auth and app-state accessors.
 
 `create_app()` (main.py) stashes the pairing token, SQLAlchemy session
-factory, and blob store on `app.state` once at startup; these dependencies
-just read them back out per-request.
+factory, blob store, event bus, and pipeline runner on `app.state` once at
+startup; these dependencies just read them back out per-request.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from fastapi import HTTPException, Request
 from sqlalchemy.orm import Session
 
 from brightspace_agent.ingest.store import BlobStore
+from brightspace_agent.pipeline.runner import EventBus, PipelineRunner
 
 
 def require_pairing_token(request: Request) -> None:
@@ -36,3 +37,11 @@ def get_session(request: Request) -> Iterator[Session]:
 
 def get_blob_store(request: Request) -> BlobStore:
     return request.app.state.blob_store
+
+
+def get_runner(request: Request) -> PipelineRunner:
+    return request.app.state.runner
+
+
+def get_event_bus(request: Request) -> EventBus:
+    return request.app.state.event_bus

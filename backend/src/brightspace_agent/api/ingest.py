@@ -340,7 +340,9 @@ class CompleteResponse(CamelModel):
 
 
 @router.post("/complete", response_model=CompleteResponse)
-def complete_sync(payload: CompleteRequest, session: Session = Depends(get_session)) -> CompleteResponse:
+def complete_sync(
+    payload: CompleteRequest, request: Request, session: Session = Depends(get_session)
+) -> CompleteResponse:
     sync_run = session.get(SyncRun, payload.sync_run_id)
     if sync_run is None:
         raise HTTPException(status_code=404, detail="unknown sync run")
@@ -348,5 +350,16 @@ def complete_sync(payload: CompleteRequest, session: Session = Depends(get_sessi
     errors = [error.model_dump(by_alias=True) for error in payload.errors]
     stats = repo.finalize_sync_run(session, sync_run, errors)
     session.commit()
+
+    # Task 9 hook: the frontend's SSE feed learns about sync completion the
+    # same way it learns about pipeline progress -- one shared bus.
+    request.app.state.event_bus.publish(
+        {
+            "type": "sync",
+            "courseId": sync_run.course_id,
+            "syncRunId": sync_run.id,
+            "status": sync_run.status,
+        }
+    )
 
     return CompleteResponse(status=sync_run.status, stats=stats)
