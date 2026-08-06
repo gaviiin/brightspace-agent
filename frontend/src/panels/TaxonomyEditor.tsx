@@ -22,6 +22,14 @@ import {
 interface TaxonomyEditorProps {
   courseId: number;
   payload: GraphPayload;
+  /** Mirrors the workspace's "Run pipeline" button's own active-run guard
+   * (see CourseWorkspacePage's `statusQuery`): a structural save starts a
+   * pipeline run, and the backend's `PipelineRunner` only ever allows one
+   * per course, so a structural Save is disabled while one is already
+   * active -- matching the server-side check-before-write guard in
+   * taxonomy_apply.py, rather than letting the student hit a 409. A patch
+   * never touches the runner, so it stays enabled regardless. */
+  pipelineActive: boolean;
   onClose: () => void;
   /** Called once the PUT succeeds. The caller decides what happens next
    * (patch -> refetch the graph immediately; structural -> a toast, with
@@ -40,7 +48,7 @@ const RELATIONS: TopicEdgeRelation[] = ["prerequisite", "related"];
  * per taxonomyDraft's own contract) and never writes back into the
  * react-query cache directly; only a successful PUT does that, via
  * `onSaved`. */
-export function TaxonomyEditor({ courseId, payload, onClose, onSaved }: TaxonomyEditorProps) {
+export function TaxonomyEditor({ courseId, payload, pipelineActive, onClose, onSaved }: TaxonomyEditorProps) {
   const [draft, setDraft] = useState<Draft>(() => initDraft(payload));
   const [newEdgeFrom, setNewEdgeFrom] = useState("");
   const [newEdgeTo, setNewEdgeTo] = useState("");
@@ -51,6 +59,7 @@ export function TaxonomyEditor({ courseId, payload, onClose, onSaved }: Taxonomy
     () => (structural ? estimateReclassifyCount(draft, payload) : 0),
     [structural, draft, payload],
   );
+  const blockedByActiveRun = structural && pipelineActive;
 
   const saveMutation = useMutation({
     mutationFn: () => putTaxonomy(courseId, toRequest(draft)),
@@ -252,6 +261,12 @@ export function TaxonomyEditor({ courseId, payload, onClose, onSaved }: Taxonomy
               Couldn't save: {(saveMutation.error as Error).message}
             </p>
           )}
+          {blockedByActiveRun && !saveMutation.isError && (
+            <p className="text-sm text-amber-600 dark:text-amber-400">
+              A pipeline run is already active for this course — wait for it to finish before saving
+              structural changes.
+            </p>
+          )}
         </div>
 
         <footer className="flex shrink-0 items-center justify-end gap-2 border-t border-neutral-200 px-4 py-3 dark:border-neutral-800">
@@ -264,7 +279,7 @@ export function TaxonomyEditor({ courseId, payload, onClose, onSaved }: Taxonomy
           </button>
           <button
             type="button"
-            disabled={saveMutation.isPending || draft.topics.length === 0}
+            disabled={saveMutation.isPending || draft.topics.length === 0 || blockedByActiveRun}
             onClick={() => saveMutation.mutate()}
             className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
           >

@@ -16,7 +16,11 @@ taxonomy version:
   changed) and nothing else happens: no new version, no re-classification.
 
 - **Structural**: anything else -- an added or deleted topic, a merge, or
-  even just a different edge set with identical topic wording. This mints
+  even just a different edge set with identical topic wording. First,
+  `runner.is_active(course_id)` is checked -- if a run is already in
+  progress for this course, `RunActiveError` is raised and NOTHING is
+  written (see `apply_taxonomy_edit`'s own docstring for why this has to
+  happen before, not after, the write). Otherwise this mints
   taxonomy_version + 1: one new `Topic` row per request entry (see
   `_assign_slug_and_owner` for the slug/created_by rules), fresh `TopicEdge`
   rows from the request's `edges`, and a *carry-over* pass that re-inserts
@@ -42,6 +46,7 @@ from sqlalchemy.orm import Session
 
 from brightspace_agent.agents.promptfmt import slugify
 from brightspace_agent.db.models import Course, MaterialTopic, Topic, TopicEdge
+from brightspace_agent.pipeline.runner import RunActiveError
 
 
 class TaxonomyValidationError(ValueError):
@@ -85,10 +90,16 @@ class TaxonomyApplyResult:
 
 
 class _RunnerLike(Protocol):
-    """What this module needs from `PipelineRunner`: just `start()`. Kept as
-    a local Protocol (rather than importing `PipelineRunner` itself) so a
+    """What this module needs from `PipelineRunner`: `is_active()` (checked
+    before the structural path writes anything) and `start()`. Kept as a
+    local Protocol (rather than importing `PipelineRunner` itself) so a
     test can inject a bare fake with no LangGraph/asyncio machinery at all
-    -- see pipeline/graph.py's `StageHooks` for the same pattern."""
+    -- see pipeline/graph.py's `StageHooks` for the same pattern. Only
+    `RunActiveError` itself is imported for real, so the API layer's
+    existing `except RunActiveError` -> 409 mapping keeps working
+    regardless of which path (early check or `start()`) raises it."""
+
+    def is_active(self, course_id: int) -> bool: ...
 
     def start(self, course_id: int, stages: list[str] | None = None) -> int: ...
 
@@ -109,10 +120,21 @@ def apply_taxonomy_edit(
 
     `session` is committed by this function (once, at the end of whichever
     path is taken) -- the caller doesn't need to. On the structural path,
-    `runner.start()` is called *after* that commit, so a `RunActiveError` it
-    raises (a run already active for this course) propagates to the caller
-    with the taxonomy edit already durable; the API layer maps that to a
-    409, matching `POST .../pipeline/run`'s existing contract.
+    `runner.is_active(course.id)` is checked *before* any write: writing the
+    version bump/topics/edges/carry-over and only then discovering `start()`
+    can't actually launch a run would leave the taxonomy durably changed
+    with the promised re-classification never started (and no automatic way
+    back short of another edit). Checking first means a conflict here raises
+    `RunActiveError` -- caught by the API layer as a 409 -- with nothing
+    written at all.
+
+    This check-then-write is race-free without any lock: nothing between
+    the `is_active()` check and `runner.start()` below performs an `await`
+    or any I/O that yields control back to the event loop (SQLAlchemy's
+    sync engine blocks the calling coroutine rather than suspending it), so
+    on a single-threaded asyncio loop no other task -- in particular, no
+    concurrent request that could itself call `runner.start()` for this
+    course -- can run in between and invalidate the check.
     """
     current_version = course.taxonomy_version
     current_topics = _current_topics(session, course.id, current_version)
@@ -124,6 +146,9 @@ def apply_taxonomy_edit(
         _apply_patch(topics, current_topics)
         session.commit()
         return TaxonomyApplyResult(taxonomy_version=current_version, reclassify=False)
+
+    if runner.is_active(course.id):
+        raise RunActiveError(course.id)
 
     new_version = current_version + 1
     _apply_structural(session, course, current_version, new_version, topics, edges, current_topics)
@@ -169,6 +194,9 @@ def _current_edges(session: Session, course_id: int, current_topic_ids: set[int]
 
 
 def _validate(topics: list[TopicEditIn], edges: list[EdgeEditIn], current_topic_ids: set[int]) -> None:
+    if not topics:
+        raise TaxonomyValidationError("a taxonomy must have at least one topic")
+
     seen_ids: set[int] = set()
 
     for topic in topics:
@@ -190,6 +218,7 @@ def _validate(topics: list[TopicEditIn], edges: list[EdgeEditIn], current_topic_
             seen_ids.add(merged_id)
 
     topic_count = len(topics)
+    seen_edges: set[tuple[int, int, str]] = set()
     for edge in edges:
         if not (0 <= edge.from_index < topic_count) or not (0 <= edge.to_index < topic_count):
             raise TaxonomyValidationError(
@@ -199,6 +228,20 @@ def _validate(topics: list[TopicEditIn], edges: list[EdgeEditIn], current_topic_
             raise TaxonomyValidationError("self-loop edges are not allowed")
         if edge.relation not in ("prerequisite", "related"):
             raise TaxonomyValidationError(f"unknown edge relation {edge.relation!r}")
+        # Caught here, not left to surface as an unhandled IntegrityError:
+        # a repeated (from, to, relation) triple would otherwise reach
+        # TopicEdge's UniqueConstraint(from_topic_id, to_topic_id, relation)
+        # at flush time in `_apply_structural`. Keyed on (index, index,
+        # relation) rather than resolved topic ids -- equivalent given the
+        # id-uniqueness checks above (each index names a distinct topic),
+        # and available without waiting for `_apply_structural` to assign
+        # new topics their ids.
+        key = (edge.from_index, edge.to_index, edge.relation)
+        if key in seen_edges:
+            raise TaxonomyValidationError(
+                f"duplicate edge (fromIndex={edge.from_index}, toIndex={edge.to_index}, relation={edge.relation!r})"
+            )
+        seen_edges.add(key)
 
 
 # --------------------------------------------------------------------------
@@ -302,7 +345,12 @@ def _assign_slug_and_owner(
     """Slug: keep the old topic's slug when `id` is set and the name is
     unchanged; otherwise slugify the new name (deduped against slugs already
     claimed in this version). created_by: 'user' for a new topic, a rename,
-    or a merge target; 'agent' for anything carried forward untouched."""
+    or a merge target; anything carried forward untouched keeps the OLD
+    row's own `created_by` verbatim -- not hardcoded to 'agent' -- so a
+    topic a student already renamed in an earlier edit doesn't lose that
+    provenance just because a *later*, unrelated structural edit re-mints
+    every row (this module always writes a fresh Topic row per version;
+    "carried forward" only means untouched by THIS request)."""
     renamed = current is not None and current.name != name
     is_merge_target = bool(topic.merged_from_topic_ids)
 
@@ -311,7 +359,10 @@ def _assign_slug_and_owner(
     else:
         slug = _dedupe_slug(slugify(name) or f"topic-{index + 1}", used_slugs)
 
-    created_by = "user" if (current is None or renamed or is_merge_target) else "agent"
+    if current is None or renamed or is_merge_target:
+        created_by = "user"
+    else:
+        created_by = current.created_by
     return slug, created_by
 
 

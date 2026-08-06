@@ -217,6 +217,26 @@ def test_second_start_while_active_raises_then_allows_a_new_run_after_completion
     assert first_token != second_token
 
 
+def test_is_active_reflects_the_same_state_start_guards_on(session_factory, blob_store, course_id):
+    """`is_active()` (Task 12: checked by taxonomy_apply.py's structural
+    path before writing anything) must agree with what `start()` itself
+    guards on -- same underlying `_active` state, checked without the
+    side effect of raising."""
+    _seed_summarizable_course(session_factory, blob_store, course_id)
+
+    async def scenario():
+        runner = _make_runner(session_factory, blob_store, MockBackend())
+        assert runner.is_active(course_id) is False
+
+        runner.start(course_id)
+        assert runner.is_active(course_id) is True  # no await yet -- still active
+
+        await runner.wait_idle(course_id)
+        assert runner.is_active(course_id) is False
+
+    asyncio.run(scenario())
+
+
 # --------------------------------------------------------------------------
 # (3) event bus sequence
 # --------------------------------------------------------------------------

@@ -239,6 +239,7 @@ export function CourseWorkspacePage() {
         <TaxonomyEditor
           courseId={courseId}
           payload={graphQuery.data}
+          pipelineActive={active}
           onClose={() => setTaxonomyEditorOpen(false)}
           onSaved={handleTaxonomySaved}
         />

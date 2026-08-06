@@ -260,6 +260,23 @@ describe("addEdge / removeEdge", () => {
     expect(next.edges).toHaveLength(1); // unchanged
   });
 
+  it("refuses an exact duplicate of an existing edge (no-op)", () => {
+    const draft = initDraft(fixturePayload()); // already has intro -> advanced, prerequisite
+    const introKey = keyFor(draft, 1);
+    const advancedKey = keyFor(draft, 2);
+    const next = addEdge(draft, introKey, advancedKey, "prerequisite");
+    expect(next.edges).toHaveLength(1); // unchanged -- would collide with the DB's UniqueConstraint
+    expect(next).toBe(draft);
+  });
+
+  it("allows the same two topics with a DIFFERENT relation (not a duplicate)", () => {
+    const draft = initDraft(fixturePayload()); // intro -> advanced, prerequisite
+    const introKey = keyFor(draft, 1);
+    const advancedKey = keyFor(draft, 2);
+    const next = addEdge(draft, introKey, advancedKey, "related");
+    expect(next.edges).toHaveLength(2);
+  });
+
   it("removeEdge drops exactly the targeted edge", () => {
     let draft = initDraft(fixturePayload());
     const introKey = keyFor(draft, 1);

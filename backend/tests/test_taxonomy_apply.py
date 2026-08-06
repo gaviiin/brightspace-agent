@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from brightspace_agent.db.models import Course, Material, MaterialTopic, Topic, TopicEdge
 from brightspace_agent.db.session import init_db
+from brightspace_agent.pipeline.runner import RunActiveError
 from brightspace_agent.pipeline.taxonomy_apply import (
     EdgeEditIn,
     TaxonomyValidationError,
@@ -36,11 +37,17 @@ def course_id(session_factory):
 
 class _FakeRunner:
     """Stands in for `PipelineRunner`: records `start()` calls instead of
-    actually running anything."""
+    actually running anything, and lets a test force `is_active()` to
+    simulate a run already in progress for the course (Task 12's
+    check-before-write guard on the structural path)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, active: bool = False) -> None:
         self.calls: list[tuple[int, list[str] | None]] = []
         self._next_token = 100
+        self.active = active
+
+    def is_active(self, course_id: int) -> bool:
+        return self.active
 
     def start(self, course_id: int, stages: list[str] | None = None) -> int:
         self.calls.append((course_id, list(stages) if stages is not None else None))
@@ -437,6 +444,37 @@ def test_self_loop_edge_is_rejected(session_factory, runner, course_id):
     assert runner.calls == []
 
 
+def test_duplicate_edge_is_rejected(session_factory, runner, course_id):
+    """Regression: an unvalidated repeated (fromIndex, toIndex, relation)
+    triple used to reach TopicEdge's UniqueConstraint at flush time as an
+    unhandled IntegrityError instead of a clean 422."""
+    ids = _seed_v1(session_factory, course_id, [("a", "A", "da"), ("b", "B", "db")])
+    topics = [
+        TopicEditIn(id=ids["a"], name="A", description="da"),
+        TopicEditIn(id=ids["b"], name="B", description="db"),
+    ]
+    edges = [
+        EdgeEditIn(from_index=0, to_index=1, relation="related"),
+        EdgeEditIn(from_index=0, to_index=1, relation="related"),  # exact duplicate
+    ]
+
+    with pytest.raises(TaxonomyValidationError):
+        _apply(session_factory, runner, course_id, topics, edges)
+
+    assert _course(session_factory, course_id).taxonomy_version == 1
+    assert runner.calls == []
+
+
+def test_empty_topics_list_is_rejected(session_factory, runner, course_id):
+    _seed_v1(session_factory, course_id, [("a", "A", "da")])
+
+    with pytest.raises(TaxonomyValidationError):
+        _apply(session_factory, runner, course_id, topics=[])
+
+    assert _course(session_factory, course_id).taxonomy_version == 1
+    assert runner.calls == []
+
+
 # --------------------------------------------------------------------------
 # (7) Slug behavior: renamed topic gets a new slug (structural only -- a
 #     pure rename patches in place and never touches the slug); collisions
@@ -485,3 +523,81 @@ def test_slug_collision_dedupes_with_numeric_suffix(session_factory, runner, cou
     assert len(slugs) == len(set(slugs))  # all unique
     assert "advanced" in slugs
     assert "advanced-2" in slugs
+
+
+# --------------------------------------------------------------------------
+# (8) created_by provenance: a topic carried forward untouched by THIS
+# request keeps its OWN prior created_by, not a hardcoded 'agent' -- a
+# topic a student already renamed in an earlier edit must not lose that
+# 'user' provenance just because a later, unrelated structural edit
+# re-mints every row.
+# --------------------------------------------------------------------------
+
+
+def test_carried_unmodified_topic_keeps_its_prior_created_by(session_factory, runner, course_id):
+    ids = _seed_v1(session_factory, course_id, [("a", "A", "da"), ("b", "B", "db")])
+    with session_factory() as session:
+        session.get(Topic, ids["a"]).created_by = "user"  # e.g. from an earlier patch-rename
+        session.commit()
+
+    # Force structural via an unrelated add; "A" itself is untouched (same
+    # id, same name/description, no merge).
+    topics = [
+        TopicEditIn(id=ids["a"], name="A", description="da"),
+        TopicEditIn(id=ids["b"], name="B", description="db"),
+        TopicEditIn(id=None, name="C", description="dc"),
+    ]
+
+    result = _apply(session_factory, runner, course_id, topics)
+    assert result.taxonomy_version == 2
+
+    v2 = {t.name: t for t in _topics_at(session_factory, course_id, 2)}
+    assert v2["A"].created_by == "user"  # carried through, not reset to 'agent'
+    assert v2["B"].created_by == "agent"  # was 'agent' before, stays 'agent'
+    assert v2["C"].created_by == "user"  # brand new
+
+
+# --------------------------------------------------------------------------
+# (9) Active-run guard: the structural path must check BEFORE writing
+# anything, not discover the conflict only when runner.start() itself
+# raises -- otherwise the taxonomy bump/carry-over would already be
+# durably committed with the promised re-classification never started.
+# --------------------------------------------------------------------------
+
+
+def test_structural_edit_while_a_run_is_active_writes_nothing_and_409s(session_factory, course_id):
+    ids = _seed_v1(session_factory, course_id, [("a", "A", "da"), ("b", "B", "db")])
+    material_id = _add_material(session_factory, course_id)
+    _add_assignment(session_factory, material_id, ids["a"], 1)
+    active_runner = _FakeRunner(active=True)
+
+    topics = [
+        TopicEditIn(id=ids["a"], name="A", description="da"),
+        TopicEditIn(id=ids["b"], name="B", description="db"),
+        TopicEditIn(id=None, name="C", description="dc"),  # forces structural
+    ]
+
+    with pytest.raises(RunActiveError):
+        _apply(session_factory, active_runner, course_id, topics)
+
+    # Nothing written: no version bump, no v2 topic rows, no carried
+    # assignments, and start() was never even reached.
+    assert _course(session_factory, course_id).taxonomy_version == 1
+    assert _topics_at(session_factory, course_id, 2) == []
+    assert _material_topics_at(session_factory, 2) == []
+    assert active_runner.calls == []
+
+
+def test_patch_edit_while_a_run_is_active_still_succeeds(session_factory, course_id):
+    """The active-run guard only applies to the structural path -- a patch
+    never calls the runner at all, so it must not be blocked by one."""
+    ids = _seed_v1(session_factory, course_id, [("a", "A", "da")])
+    active_runner = _FakeRunner(active=True)
+
+    topics = [TopicEditIn(id=ids["a"], name="Introduction", description="da")]
+
+    result = _apply(session_factory, active_runner, course_id, topics)
+
+    assert result.taxonomy_version == 1
+    assert result.reclassify is False
+    assert active_runner.calls == []

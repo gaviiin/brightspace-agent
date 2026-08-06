@@ -279,6 +279,15 @@ class PipelineRunner:
             len(stale_rows),
         )
 
+    def is_active(self, course_id: int) -> bool:
+        """True if a run is currently active for `course_id`. Lets a caller
+        that's about to do something expensive/durable on the strength of
+        "then I'll start a run" (see pipeline/taxonomy_apply.py's structural
+        path) check first, instead of discovering the conflict only when
+        `start()` itself raises `RunActiveError` -- by then, whatever the
+        caller already committed stays committed regardless."""
+        return course_id in self._active
+
     def start(self, course_id: int, stages: list[str] | None = None) -> int:
         """Launch a background run for `course_id`. Returns a run token.
         Raises `RunActiveError` if a run is already active for this course."""

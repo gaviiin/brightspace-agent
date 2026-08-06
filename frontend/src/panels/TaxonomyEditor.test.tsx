@@ -33,6 +33,29 @@ function renderWithQueryClient(ui: ReactNode) {
   return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
 }
 
+interface RenderEditorOptions {
+  courseId?: number;
+  payload?: GraphPayload;
+  pipelineActive?: boolean;
+  onClose?: () => void;
+  onSaved?: (result: TaxonomyApplyResponse) => void;
+}
+
+/** Defaults every prop except the ones a test cares about -- in particular
+ * `pipelineActive: false`, so only the active-run tests below need to
+ * think about it at all. */
+function renderEditor(options: RenderEditorOptions = {}) {
+  const props = {
+    courseId: options.courseId ?? 1,
+    payload: options.payload ?? fixturePayload(),
+    pipelineActive: options.pipelineActive ?? false,
+    onClose: options.onClose ?? vi.fn(),
+    onSaved: options.onSaved ?? vi.fn(),
+  };
+  renderWithQueryClient(<TaxonomyEditor {...props} />);
+  return props;
+}
+
 beforeEach(() => {
   mockedPutTaxonomy.mockReset();
   vi.spyOn(window, "confirm").mockReturnValue(true);
@@ -42,11 +65,7 @@ afterEach(cleanup);
 
 describe("TaxonomyEditor", () => {
   it("renders one row per topic and the existing edge, with a plain 'Save' label (no edits yet)", () => {
-    const onClose = vi.fn();
-    const onSaved = vi.fn();
-    renderWithQueryClient(
-      <TaxonomyEditor courseId={1} payload={fixturePayload()} onClose={onClose} onSaved={onSaved} />,
-    );
+    renderEditor();
 
     expect(screen.getByDisplayValue("Intro")).toBeTruthy();
     expect(screen.getByDisplayValue("Advanced")).toBeTruthy();
@@ -55,9 +74,7 @@ describe("TaxonomyEditor", () => {
   });
 
   it("renaming a topic keeps the Save label plain (patch-only edit)", () => {
-    renderWithQueryClient(
-      <TaxonomyEditor courseId={1} payload={fixturePayload()} onClose={vi.fn()} onSaved={vi.fn()} />,
-    );
+    renderEditor();
 
     fireEvent.change(screen.getByDisplayValue("Intro"), { target: { value: "Introduction" } });
 
@@ -66,9 +83,7 @@ describe("TaxonomyEditor", () => {
   });
 
   it("adding a topic switches the Save button to 'Save & re-classify'", () => {
-    renderWithQueryClient(
-      <TaxonomyEditor courseId={1} payload={fixturePayload()} onClose={vi.fn()} onSaved={vi.fn()} />,
-    );
+    renderEditor();
 
     fireEvent.click(screen.getByText("+ Add topic"));
 
@@ -77,9 +92,7 @@ describe("TaxonomyEditor", () => {
 
   it("deleting a topic with zero materials needs no confirmation", () => {
     const confirmSpy = vi.spyOn(window, "confirm");
-    renderWithQueryClient(
-      <TaxonomyEditor courseId={1} payload={fixturePayload()} onClose={vi.fn()} onSaved={vi.fn()} />,
-    );
+    renderEditor();
 
     // "Advanced" has materialCount: 0 -- its Delete button is the second one.
     fireEvent.click(screen.getAllByText("Delete")[1]);
@@ -90,9 +103,7 @@ describe("TaxonomyEditor", () => {
 
   it("deleting a topic with materials confirms first, and backs out on cancel", () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
-    renderWithQueryClient(
-      <TaxonomyEditor courseId={1} payload={fixturePayload()} onClose={vi.fn()} onSaved={vi.fn()} />,
-    );
+    renderEditor();
 
     // "Intro" has materialCount: 2.
     fireEvent.click(screen.getAllByText("Delete")[0]);
@@ -103,9 +114,7 @@ describe("TaxonomyEditor", () => {
 
   it("Cancel and the header Close button both call onClose without saving", () => {
     const onClose = vi.fn();
-    renderWithQueryClient(
-      <TaxonomyEditor courseId={1} payload={fixturePayload()} onClose={onClose} onSaved={vi.fn()} />,
-    );
+    renderEditor({ onClose });
 
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(onClose).toHaveBeenCalledTimes(1);
@@ -119,9 +128,7 @@ describe("TaxonomyEditor", () => {
     const response: TaxonomyApplyResponse = { taxonomyVersion: 1, reclassify: false, runToken: null };
     mockedPutTaxonomy.mockResolvedValue(response);
     const onSaved = vi.fn();
-    renderWithQueryClient(
-      <TaxonomyEditor courseId={7} payload={fixturePayload()} onClose={vi.fn()} onSaved={onSaved} />,
-    );
+    renderEditor({ courseId: 7, onSaved });
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -135,5 +142,37 @@ describe("TaxonomyEditor", () => {
       }),
     );
     await vi.waitFor(() => expect(onSaved).toHaveBeenCalledWith(response));
+  });
+});
+
+describe("TaxonomyEditor: active-run guard (Task 12 fix)", () => {
+  it("a structural edit's Save is disabled while a pipeline run is active, with a hint", () => {
+    renderEditor({ pipelineActive: true });
+
+    fireEvent.click(screen.getByText("+ Add topic")); // forces structural
+
+    const saveButton = screen.getByRole("button", { name: /Save & re-classify/ });
+    expect(saveButton.hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText(/pipeline run is already active/i)).toBeTruthy();
+  });
+
+  it("a patch-only edit's Save stays enabled even while a pipeline run is active", () => {
+    renderEditor({ pipelineActive: true });
+
+    fireEvent.change(screen.getByDisplayValue("Intro"), { target: { value: "Introduction" } });
+
+    const saveButton = screen.getByRole("button", { name: "Save" });
+    expect(saveButton.hasAttribute("disabled")).toBe(false);
+    expect(screen.queryByText(/pipeline run is already active/i)).toBeNull();
+  });
+
+  it("a structural edit's Save re-enables once pipelineActive goes false, with no hint shown up front", () => {
+    renderEditor({ pipelineActive: false });
+
+    fireEvent.click(screen.getByText("+ Add topic"));
+
+    const saveButton = screen.getByRole("button", { name: /Save & re-classify/ });
+    expect(saveButton.hasAttribute("disabled")).toBe(false);
+    expect(screen.queryByText(/pipeline run is already active/i)).toBeNull();
   });
 });
