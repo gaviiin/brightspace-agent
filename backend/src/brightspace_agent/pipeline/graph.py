@@ -44,19 +44,29 @@ from brightspace_agent.pipeline.stages.taxonomy import run_taxonomy_stage
 
 logger = logging.getLogger(__name__)
 
-# summarize/classify normally fan out across several materials at once (see
-# their own `concurrency` defaults). These graph nodes instead always drive
-# them at concurrency=1: "check the running total, then call the LLM" (the
-# cost-cap check) has to happen strictly one material at a time, or several
-# concurrent workers can all pass the check before any of them has recorded
-# its spend -- letting up to `concurrency` calls slip past the cap before it
-# takes effect. This is a background job for a single local user, so
-# trading fan-out throughput for an exact, race-free cap (and a
-# deterministic "aborts after exactly one over-budget call" outcome) is the
-# right side of that trade-off, whether or not a real cap ends up binding on
-# a given run. Direct callers of run_summarize_stage/run_classify_stage are
-# unaffected -- this concurrency choice is local to the graph nodes below.
-_CAPPED_STAGE_CONCURRENCY = 1
+# summarize/classify fan out across `_CAPPED_STAGE_CONCURRENCY` materials at
+# once. Task 9 originally pinned this to 1 for an exact, race-free cost cap
+# ("check the running total, then call the LLM" has to happen strictly one
+# material at a time, or several concurrent workers can all pass the check
+# before any of them has recorded its spend) -- at the cost of ~4x slower
+# summarize/classify stages on a large course, since every LLM call became
+# fully sequential regardless of the cap actually binding on a given run.
+#
+# Task 13 restores real fan-out and switches the cap to optimistic: each
+# stage's per-item worker still checks the running total before its one paid
+# call (now behind a `threading.Lock` shared across that stage run's workers
+# -- see pipeline/stages/summarize.py's/classify.py's `cost_lock` param --
+# so the check-then-record pair is internally consistent, no lost updates),
+# but the check and the record are no longer one atomic unit spanning the
+# LLM call itself. Up to `_CAPPED_STAGE_CONCURRENCY` workers can therefore
+# all see "still under the cap" and start a paid call before any of them has
+# recorded its spend -- overshoot is bounded by
+# `_CAPPED_STAGE_CONCURRENCY x one call's cost`. See
+# Settings.max_cost_usd_per_run's docstring for why that bound is an
+# acceptable trade-off for a background job with a single local user.
+# Direct callers of run_summarize_stage/run_classify_stage are unaffected --
+# this concurrency choice is local to the graph nodes below.
+_CAPPED_STAGE_CONCURRENCY = 4
 
 
 class PipelineState(TypedDict):

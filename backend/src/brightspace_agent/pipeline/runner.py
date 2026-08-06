@@ -261,19 +261,24 @@ class PipelineRunner:
         `_execute`'s `finally` only covers runs *this* process started), so
         it's swept here instead, once, at startup.
         """
-        with self._session_factory() as session:
-            stale_rows = list(
-                session.execute(select(PipelineRun).where(PipelineRun.status == "running")).scalars().all()
-            )
-            if not stale_rows:
-                return
-            now = _now_iso()
-            for row in stale_rows:
-                row.status = "failed"
-                row.finished_at = now
-                row.error = "orphaned-by-restart"
-                self._last_run_rows.setdefault(row.course_id, []).append(row.id)
-            session.commit()
+        try:
+            with self._session_factory() as session:
+                stale_rows = list(
+                    session.execute(select(PipelineRun).where(PipelineRun.status == "running")).scalars().all()
+                )
+                if not stale_rows:
+                    return
+                now = _now_iso()
+                for row in stale_rows:
+                    row.status = "failed"
+                    row.finished_at = now
+                    row.error = "orphaned-by-restart"
+                    self._last_run_rows.setdefault(row.course_id, []).append(row.id)
+                session.commit()
+        except Exception:  # noqa: BLE001 -- a DB hiccup here must degrade, not crash boot (matches
+            # reconcile_orphaned_rows's own try/except, its per-run sibling)
+            logger.exception("failed to reconcile orphaned pipeline_runs rows from a previous process at startup")
+            return
         logger.warning(
             "reconciled %d orphaned 'running' pipeline_runs row(s) left over from a previous process",
             len(stale_rows),

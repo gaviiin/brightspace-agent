@@ -291,7 +291,18 @@ def test_events_sequence_covers_run_and_every_stage_in_order(session_factory, bl
 
 
 def test_cost_cap_aborts_summarize_and_skips_classify_but_still_assembles(session_factory, blob_store, course_id):
-    _seed_summarizable_course(session_factory, blob_store, course_id, count=3)
+    # Overshoot-tolerant on purpose (Task 13 restored real fan-out --
+    # summarize/classify now run at concurrency=4, not 1 -- so the cost cap
+    # is optimistic, not exact: see pipeline/graph.py's
+    # _CAPPED_STAGE_CONCURRENCY docstring). `count` is well past that
+    # concurrency so that even in the worst-case race -- all 4 concurrent
+    # workers passing the "are we under the cap yet?" check before any of
+    # them has recorded its $10 spend against the $5 cap -- there are still
+    # materials left in the worklist that a *later* batch (after a slot
+    # frees up and spend has been recorded) must correctly see as
+    # over-budget and leave untouched.
+    worklist_size = 10
+    _seed_summarizable_course(session_factory, blob_store, course_id, count=worklist_size)
 
     async def scenario():
         costly_backend = _FixedCostBackend(MockBackend(), est_cost_usd=10.0)
@@ -302,7 +313,8 @@ def test_cost_cap_aborts_summarize_and_skips_classify_but_still_assembles(sessio
 
     costly_backend = asyncio.run(scenario())
 
-    assert costly_backend.calls == 1  # cap (5) < per-call cost (10): only the first call happens
+    assert costly_backend.calls >= 1  # the cap (5) is reached; progress was still made
+    assert costly_backend.calls < worklist_size  # and at least one call was blocked, not the whole worklist
 
     rows = _pipeline_runs(session_factory, course_id)
     by_stage = {row.stage: row for row in rows}
@@ -434,3 +446,18 @@ def test_startup_sweep_marks_stale_running_rows_as_orphaned_by_restart(session_f
     status = runner.status(course_id)
     assert status["active"] is False
     assert any(s["stage"] == "summarize" and s["status"] == "failed" for s in status["stages"])
+
+
+def test_startup_sweep_db_failure_degrades_instead_of_crashing_construction(blob_store):
+    """A DB hiccup during the startup sweep (e.g. a locked/corrupt file)
+    must not take the whole app down before it can even start -- matches
+    the per-run reconcile_orphaned_rows's own try/except (see the Task 13
+    brief's ledgered minor)."""
+
+    def broken_session_factory():
+        raise RuntimeError("simulated DB failure")
+
+    settings = Settings(max_cost_usd_per_run=5.0)
+    runner = PipelineRunner(broken_session_factory, blob_store, MockBackend(), settings)
+
+    assert runner.is_active(1) is False

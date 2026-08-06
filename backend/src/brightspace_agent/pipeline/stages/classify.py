@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -96,8 +97,20 @@ async def run_classify_stage(
     `status='summarized'`, so a later run retries it) and `stats.aborted` is
     set. Cache hits never count against it. `None` (the default) means
     uncapped, matching every existing caller.
+
+    The check is optimistic under `concurrency > 1`, not exact (Task 13):
+    `cost_lock` (one `threading.Lock` per call to this function, shared by
+    every worker -- workers run via `asyncio.to_thread`, i.e. real OS
+    threads, so an `asyncio.Lock` wouldn't do) keeps the read-then-add on
+    `stats.usage_total` internally consistent, but a worker's "check, call
+    the LLM, record spend" isn't one atomic unit -- up to `concurrency`
+    workers can all see "still under the cap" and start a paid call before
+    any of them has recorded its spend. See
+    `Settings.max_cost_usd_per_run`'s docstring for the accepted overshoot
+    bound this trades for real fan-out throughput.
     """
     stats = StageStats()
+    cost_lock = threading.Lock()
 
     context = _load_taxonomy_context(session_factory, course_id)
     if context is None:
@@ -119,7 +132,15 @@ async def run_classify_stage(
     async def _run_one(material_id: int) -> None:
         async with semaphore:
             await asyncio.to_thread(
-                _classify_one, session_factory, backend, context, material_id, stats, progress, cost_cap_usd
+                _classify_one,
+                session_factory,
+                backend,
+                context,
+                material_id,
+                stats,
+                progress,
+                cost_cap_usd,
+                cost_lock,
             )
 
     await asyncio.gather(*(_run_one(material_id) for material_id in material_ids))
@@ -195,7 +216,8 @@ def _classify_one(
     material_id: int,
     stats: StageStats,
     progress: ProgressCallback | None,
-    cost_cap_usd: float | None = None,
+    cost_cap_usd: float | None,
+    cost_lock: threading.Lock,
 ) -> None:
     try:
         with session_factory() as session:
@@ -211,23 +233,31 @@ def _classify_one(
             from_cache = classification is not None
 
             if classification is None:
-                # Cost cap (Task 9): checked right before the only paid call
-                # in this function, so a cache hit above never trips it.
-                # Once the running total reaches the cap, this material (and
-                # the rest of the worklist, as later workers make the same
-                # check) is left exactly as it is -- still
-                # `status='summarized'` -- so a later run retries it.
-                if cost_cap_usd is not None and stats.usage_total["est_cost_usd"] >= cost_cap_usd:
-                    stats.aborted = True
-                    if progress:
-                        progress(f"classify:cost-cap:{material_id}")
-                    return
+                # Cost cap (Task 9; optimistic under concurrency > 1 since
+                # Task 13 -- see run_classify_stage's docstring): checked
+                # right before the only paid call in this function, so a
+                # cache hit above never trips it. Once the running total
+                # reaches the cap, this material (and the rest of the
+                # worklist, as later workers make the same check) is left
+                # exactly as it is -- still `status='summarized'` -- so a
+                # later run retries it. `cost_lock` only guards the read
+                # here, not the LLM call below -- see the module-level note
+                # on why that's optimistic rather than exact.
+                if cost_cap_usd is not None:
+                    with cost_lock:
+                        cap_reached = stats.usage_total["est_cost_usd"] >= cost_cap_usd
+                    if cap_reached:
+                        stats.aborted = True
+                        if progress:
+                            progress(f"classify:cost-cap:{material_id}")
+                        return
                 user_prompt = _build_user_prompt(material, context)
                 parsed, usage = backend.structured_call(
                     ClassificationOut, system=_SYSTEM_PROMPT, user=user_prompt, tier=_TIER
                 )
                 classification = parsed
-                stats.add_usage(usage)
+                with cost_lock:
+                    stats.add_usage(usage)
                 if sha256:
                     _write_cache(session, sha256, context, model, classification)
             else:

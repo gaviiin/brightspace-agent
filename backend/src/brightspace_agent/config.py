@@ -33,6 +33,21 @@ class Settings(BaseSettings):
     # Pipeline runner (Task 9): a hard-ish per-run spend guard shared across
     # the summarize and classify stages (see pipeline/runner.py). Advisory,
     # like the rest of cost estimation -- see agents/llm.py's cost table.
+    #
+    # "Hard-ish", not exact (Task 13): each capped stage fans out across
+    # `_CAPPED_STAGE_CONCURRENCY` (4, pipeline/graph.py) materials at once,
+    # and the cap check for the next paid call happens optimistically -- a
+    # worker checks "are we under the cap yet?", and only *after* its LLM
+    # call completes does it record what that call cost. Up to
+    # `_CAPPED_STAGE_CONCURRENCY` workers can therefore all pass the check
+    # before any of them has recorded its spend, so actual spend for a run
+    # can overshoot this cap by at most
+    # `_CAPPED_STAGE_CONCURRENCY x (one call's cost)`. The alternative --
+    # capping concurrency at 1 for an exact, race-free check -- was this
+    # project's original Task 9 design; it traded away real fan-out
+    # throughput (summarize/classify ran ~4x slower on a large course) for
+    # a guarantee this background job, run by a single local user, doesn't
+    # need to be exact about.
     max_cost_usd_per_run: float = 5.0
 
     @property

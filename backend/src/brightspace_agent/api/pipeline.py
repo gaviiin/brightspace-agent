@@ -170,6 +170,12 @@ def _dry_run_response(session: Session, course: Course, settings: Settings) -> D
     genuinely free), but the estimate here is "what would a real run cost",
     which only the configured model names answer. No LLM backend is
     consulted at all: this function doesn't touch `backend`.
+
+    This total is an *upper-bound estimate* in more than one sense: besides
+    the cache-agnostic call counting `_dry_run_counts` already documents, the
+    actual run this estimate precedes is only capped at
+    `Settings.max_cost_usd_per_run` optimistically (see that field's
+    docstring) -- real spend can run a little past both numbers.
     """
     calls = _dry_run_counts(session, course)
     fast_model = settings.fast_model

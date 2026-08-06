@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
 from importlib import resources
@@ -77,8 +78,20 @@ async def run_summarize_stage(
     (not marked failed, so a later run retries it) and `stats.aborted` is
     set. Cache hits never count against it (nothing was spent). `None`
     (the default) means uncapped, matching every existing caller.
+
+    The check is optimistic under `concurrency > 1`, not exact (Task 13):
+    `cost_lock` (one `threading.Lock` per call to this function, shared by
+    every pass-2 worker -- workers run via `asyncio.to_thread`, i.e. real OS
+    threads, so an `asyncio.Lock` wouldn't do) keeps the read-then-add on
+    `stats.usage_total` internally consistent, but a worker's "check, call
+    the LLM, record spend" isn't one atomic unit -- up to `concurrency`
+    workers can all see "still under the cap" and start a paid call before
+    any of them has recorded its spend. See
+    `Settings.max_cost_usd_per_run`'s docstring for the accepted overshoot
+    bound this trades for real fan-out throughput.
     """
     stats = StageStats()
+    cost_lock = threading.Lock()
 
     fetched_ids = _select_material_ids(
         session_factory, course_id, status="fetched", require_sha256=True
@@ -98,7 +111,15 @@ async def run_summarize_stage(
         extractable_ids,
         concurrency,
         lambda material_id: asyncio.to_thread(
-            _summarize_one, session_factory, blob_store, backend, material_id, stats, progress, cost_cap_usd
+            _summarize_one,
+            session_factory,
+            blob_store,
+            backend,
+            material_id,
+            stats,
+            progress,
+            cost_cap_usd,
+            cost_lock,
         ),
     )
 
@@ -180,7 +201,8 @@ def _summarize_one(
     material_id: int,
     stats: StageStats,
     progress: ProgressCallback | None,
-    cost_cap_usd: float | None = None,
+    cost_cap_usd: float | None,
+    cost_lock: threading.Lock,
 ) -> None:
     with session_factory() as session:
         material = session.get(Material, material_id)
@@ -219,17 +241,24 @@ def _summarize_one(
                 progress(f"summarize:cached:{material_id}")
             return
 
-        # Cost cap (Task 9): checked here, right before the only paid call in
-        # this function -- a cache hit above never reaches this point, so it
-        # never counts against the cap. Once the running total reaches the
-        # cap, this material (and the rest of the worklist, as later workers
-        # make the same check) is left exactly as it is -- still
-        # `status='extracted'` -- so a later run retries it.
-        if cost_cap_usd is not None and stats.usage_total["est_cost_usd"] >= cost_cap_usd:
-            stats.aborted = True
-            if progress:
-                progress(f"summarize:cost-cap:{material_id}")
-            return
+        # Cost cap (Task 9; optimistic under concurrency > 1 since Task 13 --
+        # see run_summarize_stage's docstring): checked here, right before
+        # the only paid call in this function -- a cache hit above never
+        # reaches this point, so it never counts against the cap. Once the
+        # running total reaches the cap, this material (and the rest of the
+        # worklist, as later workers make the same check) is left exactly
+        # as it is -- still `status='extracted'` -- so a later run retries
+        # it. `cost_lock` only guards the read here; it is not held across
+        # the LLM call below, which is the whole reason this is optimistic
+        # rather than exact.
+        if cost_cap_usd is not None:
+            with cost_lock:
+                cap_reached = stats.usage_total["est_cost_usd"] >= cost_cap_usd
+            if cap_reached:
+                stats.aborted = True
+                if progress:
+                    progress(f"summarize:cost-cap:{material_id}")
+                return
 
         text = blob_store.read_text(sha256) or ""
         user_prompt = _build_user_prompt(material, text)
@@ -271,7 +300,8 @@ def _summarize_one(
             .on_conflict_do_nothing(index_elements=["sha256", "stage", "prompt_version", "model"])
         )
         stats.summarized += 1
-        stats.add_usage(usage)
+        with cost_lock:
+            stats.add_usage(usage)
         session.commit()
 
     if progress:
