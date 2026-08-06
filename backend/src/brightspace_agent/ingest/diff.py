@@ -126,36 +126,41 @@ class NeededItem:
     url: str
     title: str
     size_hint: int | None
+    last_modified: str | None
 
 
 def compute_needed(session: Session, course_id: int, entries: list[TocEntry]) -> list[NeededItem]:
     """Return the File-type topics that still need downloading.
 
     A File topic is needed iff: no material row exists for its
-    `d2l_topic_id` yet, OR the stored `d2l_updated_at` is null, OR the
-    incoming `LastModifiedDate` parses to a later timestamp than what's
-    stored.
+    `d2l_topic_id` yet, OR the stored `sha256` is null (a stub row, or a
+    row whose upload never actually completed -- must never become
+    invisible to future diffs regardless of what `d2l_updated_at` says),
+    OR the stored `d2l_updated_at` is null, OR the incoming
+    `LastModifiedDate` parses to a later timestamp than what's stored.
     """
     file_entries = [e for e in entries if is_file_topic(e)]
     topic_ids = [e.topic_id for e in file_entries]
 
-    stored: dict[int, str | None] = {}
+    stored: dict[int, tuple[str | None, str | None]] = {}
     if topic_ids:
         rows = session.execute(
-            select(Material.d2l_topic_id, Material.d2l_updated_at).where(
+            select(Material.d2l_topic_id, Material.d2l_updated_at, Material.sha256).where(
                 Material.course_id == course_id,
                 Material.d2l_topic_id.in_(topic_ids),
             )
         ).all()
-        stored = {topic_id: updated_at for topic_id, updated_at in rows}
+        stored = {topic_id: (updated_at, sha256) for topic_id, updated_at, sha256 in rows}
 
     needed: list[NeededItem] = []
     for entry in file_entries:
         if entry.topic_id not in stored:
             is_needed = True
         else:
-            stored_updated = stored[entry.topic_id]
-            if stored_updated is None:
+            stored_updated, stored_sha256 = stored[entry.topic_id]
+            if stored_sha256 is None:
+                is_needed = True
+            elif stored_updated is None:
                 is_needed = True
             else:
                 incoming_dt = _parse_iso(entry.last_modified_date)
@@ -168,6 +173,7 @@ def compute_needed(session: Session, course_id: int, entries: list[TocEntry]) ->
                 url=entry.url,  # type: ignore[arg-type]  # guaranteed non-None by is_file_topic
                 title=entry.title,
                 size_hint=entry.size_bytes,
+                last_modified=entry.last_modified_date,
             ))
 
     return needed

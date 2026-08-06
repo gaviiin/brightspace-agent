@@ -125,6 +125,12 @@ class NeededItemOut(CamelModel):
     url: str
     title: str
     size_hint: int | None = None
+    # Explicit alias too (belt-and-suspenders with the d2l_topic_id case
+    # above): to_camel("last_modified") does produce "lastModified" with no
+    # digit-boundary quirk, but the wire contract is pinned here rather than
+    # left to alias-generator inference so a future pydantic/to_camel change
+    # can't silently rename this field out from under the extension.
+    last_modified: str | None = Field(default=None, alias="lastModified")
 
 
 class TocResponse(CamelModel):
@@ -183,7 +189,13 @@ def ingest_toc(
     return TocResponse(
         sync_run_id=sync_run.id,
         needed=[
-            NeededItemOut(d2l_topic_id=i.d2l_topic_id, url=i.url, title=i.title, size_hint=i.size_hint)
+            NeededItemOut(
+                d2l_topic_id=i.d2l_topic_id,
+                url=i.url,
+                title=i.title,
+                size_hint=i.size_hint,
+                last_modified=i.last_modified,
+            )
             for i in needed_entries
         ],
     )

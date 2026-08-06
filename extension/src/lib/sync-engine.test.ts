@@ -15,8 +15,14 @@ function fakeFileResponse(body = "filebytes"): Response {
   return new Response(body, { status: 200 });
 }
 
-function makeItem(id: number): NeededItem {
-  return { d2lTopicId: id, url: `https://tenant.example/file/${id}`, title: `Item ${id}`, sizeHint: null };
+function makeItem(id: number, lastModified: string | null = null): NeededItem {
+  return {
+    d2lTopicId: id,
+    url: `https://tenant.example/file/${id}`,
+    title: `Item ${id}`,
+    sizeHint: null,
+    lastModified,
+  };
 }
 
 function courseEnrollment(id: number): D2LEnrollmentItem {
@@ -126,7 +132,11 @@ describe("discover", () => {
 
 describe("syncCourse", () => {
   it("happy path: uploads every needed item in order, updates state per item, completes with no errors", async () => {
-    const items = [makeItem(1), makeItem(2), makeItem(3)];
+    // item 2 has no lastModified (null) -- checks that the d2lUpdated
+    // pass-through omits the header rather than sending "null"/undefined
+    // literally when the backend didn't supply one (e.g. a Link-adjacent
+    // File topic D2L never stamped).
+    const items = [makeItem(1, "2026-01-05T12:00:00.000Z"), makeItem(2, null), makeItem(3, "2026-01-10T09:00:00.000Z")];
     const fetchOrder: number[] = [];
     const uploadOrder: number[] = [];
     const d2l = makeFakeD2L({
@@ -149,6 +159,24 @@ describe("syncCourse", () => {
 
     expect(fetchOrder).toEqual([1, 2, 3]);
     expect(uploadOrder).toEqual([1, 2, 3]);
+    // uploadFile's meta carries each needed item's lastModified through as
+    // d2lUpdated -- this is the fix under test: without it, d2l_updated_at
+    // never gets set server-side and incremental sync is defeated.
+    expect(backend.uploadFile).toHaveBeenNthCalledWith(1, 42, 1, expect.anything(), {
+      sourceUrl: items[0].url,
+      title: items[0].title,
+      d2lUpdated: "2026-01-05T12:00:00.000Z",
+    });
+    expect(backend.uploadFile).toHaveBeenNthCalledWith(2, 42, 2, expect.anything(), {
+      sourceUrl: items[1].url,
+      title: items[1].title,
+      d2lUpdated: undefined,
+    });
+    expect(backend.uploadFile).toHaveBeenNthCalledWith(3, 42, 3, expect.anything(), {
+      sourceUrl: items[2].url,
+      title: items[2].title,
+      d2lUpdated: "2026-01-10T09:00:00.000Z",
+    });
     expect(backend.complete).toHaveBeenCalledTimes(1);
     expect(backend.complete).toHaveBeenCalledWith({ syncRunId: 42, errors: [] });
     expect(state).toEqual({

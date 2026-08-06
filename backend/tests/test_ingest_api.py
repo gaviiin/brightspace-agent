@@ -222,8 +222,16 @@ def test_toc_happy_path_modules_materials_and_needed(client, auth_headers, db_se
     needed_ids = {item["d2lTopicId"] for item in needed}
     assert needed_ids == ALL_FILE_TOPIC_IDS  # fresh course: every File topic is needed
 
+    toc = load_toc()
     for item in needed:
-        assert set(item.keys()) == {"d2lTopicId", "url", "title", "sizeHint"}
+        assert set(item.keys()) == {"d2lTopicId", "url", "title", "sizeHint", "lastModified"}
+        expected_last_modified = find_topic(toc, item["d2lTopicId"])["LastModifiedDate"]
+        assert item["lastModified"] == expected_last_modified
+
+    # 1006 has no LastModifiedDate in the fixture -- lastModified should
+    # round-trip as null, not be dropped or coerced.
+    item_1006 = next(item for item in needed if item["d2lTopicId"] == 1006)
+    assert item_1006["lastModified"] is None
 
     with db_session_factory() as session:
         modules = {m.d2l_module_id: m for m in session.execute(
@@ -290,6 +298,7 @@ def test_diff_excludes_unchanged_and_includes_bumped_material(client, auth_heade
             d2l_topic_id=1002,
             kind="document",
             title="Lecture 1 — Overview",
+            sha256="a" * 64,  # actually uploaded, not just a /toc-time stub
             d2l_updated_at=lecture1_last_modified,
         ))
         session.commit()
@@ -309,6 +318,32 @@ def test_diff_excludes_unchanged_and_includes_bumped_material(client, auth_heade
     resp2 = post_toc(client, auth_headers, bumped_toc)
     needed_ids2 = {item["d2lTopicId"] for item in resp2.json()["needed"]}
     assert 1002 in needed_ids2
+
+
+def test_diff_needed_when_sha256_null_even_with_fresh_d2l_updated_at(client, auth_headers, db_session_factory):
+    """A material row can have a non-null d2l_updated_at while sha256 is
+    still NULL (a stub row from /toc, or a row whose /file upload failed
+    partway through some future flow). That row must stay 'needed'
+    regardless of what d2l_updated_at says -- otherwise a failed upload
+    becomes permanently invisible to future diffs."""
+    course_id = handshake(client, auth_headers)
+    toc = load_toc()
+    lecture1_last_modified = find_topic(toc, 1002)["LastModifiedDate"]
+
+    with db_session_factory() as session:
+        session.add(Material(
+            course_id=course_id,
+            d2l_topic_id=1002,
+            kind="document",
+            title="Lecture 1 — Overview",
+            sha256=None,  # never actually uploaded
+            d2l_updated_at=lecture1_last_modified,  # but d2l_updated_at is set (non-null)
+        ))
+        session.commit()
+
+    resp = post_toc(client, auth_headers, toc)
+    needed_ids = {item["d2lTopicId"] for item in resp.json()["needed"]}
+    assert 1002 in needed_ids  # sha256 IS NULL overrides the fresh-looking d2l_updated_at
 
 
 # --------------------------------------------------------------------------
@@ -563,7 +598,68 @@ def test_toc_extras_upsert_on_repeat_call(client, auth_headers, db_session_facto
 
 
 # --------------------------------------------------------------------------
-# 10. infer_kind unit cases
+# 10. incremental-sync contract (end-to-end)
+# --------------------------------------------------------------------------
+
+
+def test_incremental_sync_contract_upload_with_lastmodified_then_resync_skips_until_bumped(
+    client, auth_headers, db_session_factory
+):
+    """The full incremental-sync loop: /toc hands back a needed item's
+    lastModified, the extension is expected to echo it back as
+    X-D2L-Updated on /file, and a subsequent identical /toc must then treat
+    that topic as not-needed -- unless the fixture's LastModifiedDate
+    actually moved forward, in which case it's needed again. This is the
+    contract that was broken before lastModified was wired through
+    NeededItem: without it, d2l_updated_at never gets set and every re-sync
+    re-downloads everything."""
+    handshake(client, auth_headers)
+    toc = load_toc()
+
+    # 1. First /toc: topic 1001 is needed, and the needed item carries
+    #    lastModified straight from the fixture's LastModifiedDate.
+    resp1 = post_toc(client, auth_headers, toc)
+    sync_run_id = resp1.json()["syncRunId"]
+    needed1 = {item["d2lTopicId"]: item for item in resp1.json()["needed"]}
+    assert 1001 in needed1
+    last_modified = needed1[1001]["lastModified"]
+    assert last_modified == find_topic(toc, 1001)["LastModifiedDate"]
+    assert last_modified is not None
+
+    # 2. /file upload, echoing lastModified back as X-D2L-Updated exactly as
+    #    the extension's sync-engine/backend-client are expected to.
+    upload_resp = upload_file(
+        client, auth_headers, sync_run_id, 1001, b"syllabus bytes",
+        title="Course Syllabus", d2l_updated=last_modified,
+    )
+    assert upload_resp.status_code == 200
+
+    with db_session_factory() as session:
+        material = session.execute(
+            select(Material).where(Material.course_id.in_(
+                select(Course.id).where(Course.d2l_org_unit_id == ORG_UNIT_ID)
+            ), Material.d2l_topic_id == 1001)
+        ).scalar_one()
+        assert material.d2l_updated_at == last_modified
+        assert material.sha256 is not None
+
+    # 3. Second /toc with the identical fixture: 1001 must now be excluded
+    #    from needed -- this is the incremental-sync payoff.
+    resp2 = post_toc(client, auth_headers, toc)
+    needed_ids2 = {item["d2lTopicId"] for item in resp2.json()["needed"]}
+    assert 1001 not in needed_ids2
+
+    # 4. Bump 1001's LastModifiedDate in the fixture: it must become needed
+    #    again.
+    bumped_toc = copy.deepcopy(toc)
+    find_topic(bumped_toc, 1001)["LastModifiedDate"] = "2026-03-01T00:00:00.000Z"
+    resp3 = post_toc(client, auth_headers, bumped_toc)
+    needed_ids3 = {item["d2lTopicId"] for item in resp3.json()["needed"]}
+    assert 1001 in needed_ids3
+
+
+# --------------------------------------------------------------------------
+# 11. infer_kind unit cases
 # --------------------------------------------------------------------------
 
 

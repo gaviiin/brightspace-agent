@@ -44,6 +44,7 @@ export interface NeededItem {
   url: string;
   title: string;
   sizeHint: number | null;
+  lastModified: string | null;
 }
 
 export interface TocResponse {

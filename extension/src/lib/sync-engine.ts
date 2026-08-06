@@ -268,6 +268,7 @@ async function drainQueue(deps: SyncDeps, le: string, initialState: EstablishedS
       await deps.backend.uploadFile(state.syncRunId, item.d2lTopicId, fileResponse, {
         sourceUrl: item.url,
         title: item.title,
+        d2lUpdated: item.lastModified ?? undefined,
       });
       state = { ...state, queue: state.queue.slice(1), done: state.done + 1 };
     } catch (err) {
