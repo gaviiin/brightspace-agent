@@ -17,6 +17,7 @@ from brightspace_agent.api.ingest import router as ingest_router
 from brightspace_agent.api.materials import router as materials_router
 from brightspace_agent.api.pipeline import router as pipeline_router
 from brightspace_agent.api.settings import router as settings_router
+from brightspace_agent.api.taxonomy import router as taxonomy_router
 from brightspace_agent.config import Settings, ensure_data_dir
 from brightspace_agent.db.session import init_db
 from brightspace_agent.ingest.store import BlobStore
@@ -93,6 +94,7 @@ def create_app() -> FastAPI:
     app.include_router(pipeline_router)
     app.include_router(events_router)
     app.include_router(settings_router)
+    app.include_router(taxonomy_router)
 
     if FRONTEND_DIST.exists():
 

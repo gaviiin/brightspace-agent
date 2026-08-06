@@ -449,3 +449,94 @@ def test_sse_events_stream_shows_a_triggered_run(app):
     assert events[0]["status"] == "run-started"
     assert events[-1]["status"] == "run-finished"
     assert subscriber_count_after_disconnect == 0  # the disconnect unsubscribed cleanly
+
+
+# --------------------------------------------------------------------------
+# (7) PUT /{course_id}/taxonomy -- the thin HTTP wrapper around
+# pipeline/taxonomy_apply.py (see test_taxonomy_apply.py for the decision
+# logic itself; this just checks CSRF/404/422 plumbing and one call each of
+# the patch and structural paths end to end).
+# --------------------------------------------------------------------------
+
+
+def _seed_taxonomy_v1(db_session_factory, course_id):
+    with db_session_factory() as session:
+        a = Topic(course_id=course_id, taxonomy_version=1, slug="a", name="A", description="da", order_index=0)
+        b = Topic(course_id=course_id, taxonomy_version=1, slug="b", name="B", description="db", order_index=1)
+        session.add_all([a, b])
+        session.flush()
+        session.get(Course, course_id).taxonomy_version = 1
+        session.commit()
+        return {"a": a.id, "b": b.id}
+
+
+def test_taxonomy_put_requires_csrf_header(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    ids = _seed_taxonomy_v1(db_session_factory, course_id)
+    body = {"topics": [{"id": ids["a"], "name": "A", "description": "da"}], "edges": []}
+
+    resp = client.put(f"/api/courses/{course_id}/taxonomy", json=body)
+    assert resp.status_code == 403
+
+
+def test_taxonomy_put_unknown_course_404(client):
+    body = {"topics": [{"id": None, "name": "A", "description": "da"}], "edges": []}
+    resp = client.put("/api/courses/999999/taxonomy", json=body, headers=CSRF_HEADERS)
+    assert resp.status_code == 404
+
+
+def test_taxonomy_put_unknown_id_is_422(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    _seed_taxonomy_v1(db_session_factory, course_id)
+    body = {"topics": [{"id": 999999, "name": "A", "description": "da"}], "edges": []}
+
+    resp = client.put(f"/api/courses/{course_id}/taxonomy", json=body, headers=CSRF_HEADERS)
+    assert resp.status_code == 422
+
+
+def test_taxonomy_put_patch_path_updates_in_place(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    ids = _seed_taxonomy_v1(db_session_factory, course_id)
+    body = {
+        "topics": [
+            {"id": ids["a"], "name": "A Renamed", "description": "da"},
+            {"id": ids["b"], "name": "B", "description": "db"},
+        ],
+        "edges": [],
+    }
+
+    resp = client.put(f"/api/courses/{course_id}/taxonomy", json=body, headers=CSRF_HEADERS)
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out == {"taxonomyVersion": 1, "reclassify": False, "runToken": None}
+
+    with db_session_factory() as session:
+        row = session.get(Topic, ids["a"])
+        assert row.name == "A Renamed"
+        assert row.created_by == "user"
+
+
+def test_taxonomy_put_structural_path_bumps_version_and_starts_a_run(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    ids = _seed_taxonomy_v1(db_session_factory, course_id)
+    body = {
+        "topics": [
+            {"id": ids["a"], "name": "A", "description": "da"},
+            {"id": ids["b"], "name": "B", "description": "db"},
+            {"id": None, "name": "C", "description": "dc"},
+        ],
+        "edges": [],
+    }
+
+    resp = client.put(f"/api/courses/{course_id}/taxonomy", json=body, headers=CSRF_HEADERS)
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["taxonomyVersion"] == 2
+    assert out["reclassify"] is True
+    assert isinstance(out["runToken"], int)
+
+    status = _wait_for_pipeline_idle(client, course_id)
+    assert [s["stage"] for s in status["stages"]] == ["classify", "assemble"]
+
+    course_resp = client.get(f"/api/courses/{course_id}")
+    assert course_resp.json()["taxonomyVersion"] == 2
