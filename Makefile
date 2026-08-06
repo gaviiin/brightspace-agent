@@ -15,6 +15,7 @@ ext:
 
 test:
 	cd backend && uv run pytest
+	cd extension && pnpm test
 
 e2e:
 	echo "TODO"
