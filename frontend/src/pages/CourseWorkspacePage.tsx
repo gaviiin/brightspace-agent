@@ -1,10 +1,20 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 
-import { getCourse, getGraph, openEvents, pipelineStatus, runPipeline } from "../api/client";
-import type { BsaEvent } from "../api/types";
+import {
+  dryRun,
+  getCourse,
+  getGraph,
+  getSettings,
+  openEvents,
+  pipelineStatus,
+  runPipeline,
+} from "../api/client";
+import type { BsaEvent, DryRunResponse } from "../api/types";
 import { GraphView } from "../graph/GraphView";
+import { DetailPanel } from "../panels/DetailPanel";
+import { OutlinePanel } from "../panels/OutlinePanel";
 import { useUiStore } from "../state/uiStore";
 
 export function CourseWorkspacePage() {
@@ -17,6 +27,8 @@ export function CourseWorkspacePage() {
 
   const selection = useUiStore((state) => state.selection);
   const setSelection = useUiStore((state) => state.setSelection);
+
+  const [confirmDryRun, setConfirmDryRun] = useState(false);
 
   const courseQuery = useQuery({
     queryKey: ["course", courseId],
@@ -33,10 +45,18 @@ export function CourseWorkspacePage() {
     queryFn: () => pipelineStatus(courseId),
     enabled: courseIdValid,
   });
+  const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: getSettings });
 
+  // Run Pipeline is a two-step flow: dry-run first (an estimate, no spend),
+  // then -- once the user confirms the modal it opens -- the real run.
+  const dryRunMutation = useMutation({
+    mutationFn: () => dryRun(courseId),
+    onSuccess: () => setConfirmDryRun(true),
+  });
   const runMutation = useMutation({
     mutationFn: () => runPipeline(courseId),
     onSuccess: () => {
+      setConfirmDryRun(false);
       queryClient.invalidateQueries({ queryKey: ["pipeline-status", courseId] });
     },
   });
@@ -100,6 +120,8 @@ export function CourseWorkspacePage() {
 
   const course = courseQuery.data;
   const active = statusQuery.data?.active ?? false;
+  const runPipelineDisabled =
+    !courseIdValid || active || dryRunMutation.isPending || runMutation.isPending;
 
   return (
     <div className="flex h-screen flex-col bg-neutral-50 dark:bg-neutral-950">
@@ -119,19 +141,34 @@ export function CourseWorkspacePage() {
           </span>
         )}
         <div className="flex-1" />
+        {dryRunMutation.isError && (
+          <span className="text-xs text-red-600 dark:text-red-400">Couldn't estimate cost.</span>
+        )}
+        <Link
+          to="/settings"
+          className="text-sm text-neutral-500 hover:text-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200"
+        >
+          Settings
+        </Link>
         <button
           type="button"
-          disabled={!courseIdValid || active || runMutation.isPending}
-          onClick={() => runMutation.mutate()}
+          disabled={runPipelineDisabled}
+          onClick={() => dryRunMutation.mutate()}
           className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {active ? "Running…" : "Run pipeline"}
+          {active ? "Running…" : dryRunMutation.isPending ? "Estimating…" : "Run pipeline"}
         </button>
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-        <aside className="w-[240px] shrink-0 overflow-y-auto border-r border-neutral-200 p-3 text-sm text-neutral-500 dark:border-neutral-800 dark:text-neutral-400">
-          Outline — Task 11
+        <aside className="w-[260px] shrink-0 overflow-y-auto border-r border-neutral-200 p-3 dark:border-neutral-800">
+          {graphQuery.isLoading && (
+            <p className="text-sm text-neutral-500 dark:text-neutral-400">Loading outline…</p>
+          )}
+          {graphQuery.isError && (
+            <p className="text-sm text-red-600 dark:text-red-400">Couldn't load the outline.</p>
+          )}
+          {graphQuery.data && <OutlinePanel payload={graphQuery.data} />}
         </aside>
 
         <main className="min-w-0 flex-1 overflow-hidden">
@@ -144,12 +181,104 @@ export function CourseWorkspacePage() {
           {graphQuery.data && <GraphView payload={graphQuery.data} />}
         </main>
 
-        <aside className="w-[320px] shrink-0 overflow-y-auto border-l border-neutral-200 p-3 text-sm dark:border-neutral-800">
-          <p className="mb-2 text-neutral-500 dark:text-neutral-400">Details — Task 11</p>
-          <pre className="whitespace-pre-wrap break-words text-xs text-neutral-600 dark:text-neutral-300">
-            {JSON.stringify(selection, null, 2)}
-          </pre>
+        <aside className="w-[360px] shrink-0 overflow-y-auto border-l border-neutral-200 p-3 dark:border-neutral-800">
+          {graphQuery.isLoading && (
+            <p className="text-sm text-neutral-500 dark:text-neutral-400">Loading details…</p>
+          )}
+          {graphQuery.isError && (
+            <p className="text-sm text-red-600 dark:text-red-400">Couldn't load details.</p>
+          )}
+          {graphQuery.data && <DetailPanel payload={graphQuery.data} />}
         </aside>
+      </div>
+
+      {confirmDryRun && dryRunMutation.data && (
+        <DryRunConfirmDialog
+          dryRun={dryRunMutation.data}
+          mockLlm={settingsQuery.data?.mockLlm ?? false}
+          confirming={runMutation.isPending}
+          onCancel={() => setConfirmDryRun(false)}
+          onConfirm={() => runMutation.mutate()}
+        />
+      )}
+    </div>
+  );
+}
+
+const STAGE_LABELS: Record<string, string> = {
+  summarize: "Summarize",
+  taxonomy: "Build taxonomy",
+  classify: "Classify",
+};
+
+function formatUsd(amount: number): string {
+  return `$${amount.toFixed(4)}`;
+}
+
+interface DryRunConfirmDialogProps {
+  dryRun: DryRunResponse;
+  mockLlm: boolean;
+  confirming: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}
+
+function DryRunConfirmDialog({ dryRun, mockLlm, confirming, onCancel, onConfirm }: DryRunConfirmDialogProps) {
+  const stages = Object.entries(dryRun.byStage);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="dry-run-confirm-title"
+        className="w-full max-w-sm rounded-lg bg-white p-5 shadow-xl dark:bg-neutral-900"
+      >
+        <h2 id="dry-run-confirm-title" className="text-base font-semibold text-neutral-900 dark:text-neutral-100">
+          Run the pipeline?
+        </h2>
+
+        <ul className="mt-3 space-y-1 text-sm">
+          {stages.map(([stage, stats]) => (
+            <li key={stage} className="flex items-center justify-between text-neutral-700 dark:text-neutral-300">
+              <span>
+                {STAGE_LABELS[stage] ?? stage} ({stats.calls} {stats.calls === 1 ? "call" : "calls"})
+              </span>
+              <span className="tabular-nums text-neutral-500 dark:text-neutral-400">
+                {formatUsd(stats.estCostUsd)}
+              </span>
+            </li>
+          ))}
+        </ul>
+
+        <div className="mt-2 flex items-center justify-between border-t border-neutral-200 pt-2 text-sm font-medium text-neutral-900 dark:border-neutral-800 dark:text-neutral-100">
+          <span>Total estimated cost</span>
+          <span className="tabular-nums">{formatUsd(dryRun.totalEstCostUsd)}</span>
+        </div>
+
+        {mockLlm && (
+          <p className="mt-2 rounded-md bg-amber-50 px-2 py-1.5 text-xs text-amber-700 dark:bg-amber-950 dark:text-amber-300">
+            Mock mode — free. No real LLM calls will be made or billed.
+          </p>
+        )}
+
+        <div className="mt-4 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 transition hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={confirming}
+            onClick={onConfirm}
+            className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {confirming ? "Starting…" : "Confirm"}
+          </button>
+        </div>
       </div>
     </div>
   );
