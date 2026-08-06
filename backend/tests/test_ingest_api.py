@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from brightspace_agent.db.models import Course, Material, Module, SyncRun
+from brightspace_agent.db.models import Course, Material, MaterialTopic, Module, SyncRun, Topic
 from brightspace_agent.ingest.diff import infer_kind
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "d2l"
@@ -483,6 +483,65 @@ def test_file_upload_status_rule_preserves_progress_unless_bytes_change(client, 
         assert material.summary is None
 
 
+def _seed_taxonomy_and_assignment(session, course_id, material_id, *, version: int) -> None:
+    """Put the course on taxonomy `version` with one topic, and file
+    `material_id` under it at both `version` and an older one -- so a test
+    can tell "cleared the current version" apart from "wiped the history"."""
+    course = session.get(Course, course_id)
+    course.taxonomy_version = version
+    topic = Topic(
+        course_id=course_id, taxonomy_version=version, slug="intro", name="Intro",
+        description="d", order_index=0, created_by="agent",
+    )
+    session.add(topic)
+    session.flush()
+    for row_version in (version - 1, version):
+        session.add(
+            MaterialTopic(
+                material_id=material_id, topic_id=topic.id, taxonomy_version=row_version,
+                confidence=0.9, rationale="r", method="llm", review_status="auto",
+            )
+        )
+    session.commit()
+
+
+def _assignment_versions(db_session_factory, material_id) -> list[int]:
+    with db_session_factory() as session:
+        return sorted(
+            session.execute(
+                select(MaterialTopic.taxonomy_version).where(MaterialTopic.material_id == material_id)
+            ).scalars().all()
+        )
+
+
+def test_file_upload_changed_bytes_clears_stale_classifications(client, auth_headers, db_session_factory):
+    """Changed content must not keep the topics its old content earned.
+
+    S3's worklist is "summarized materials with no material_topics row at
+    the current taxonomy version", so a row left behind by a re-upload means
+    the material is never re-classified -- it keeps stale topics forever.
+    Only the CURRENT version's rows go: older versions are history the
+    taxonomy editor still reads.
+    """
+    handshake(client, auth_headers)
+    sync_run_id = post_toc(client, auth_headers, load_toc()).json()["syncRunId"]
+    data = b"original bytes"
+    material_id = upload_file(client, auth_headers, sync_run_id, 1001, data).json()["materialId"]
+
+    with db_session_factory() as session:
+        course_id = session.get(Material, material_id).course_id
+        _seed_taxonomy_and_assignment(session, course_id, material_id, version=1)
+
+    # Same bytes: nothing is thrown away.
+    upload_file(client, auth_headers, sync_run_id, 1001, data)
+    assert _assignment_versions(db_session_factory, material_id) == [0, 1]
+
+    # Different bytes: the current version's assignment goes with the
+    # summary; version 0 (history) survives.
+    upload_file(client, auth_headers, sync_run_id, 1001, b"different bytes")
+    assert _assignment_versions(db_session_factory, material_id) == [0]
+
+
 # --------------------------------------------------------------------------
 # 8. complete
 # --------------------------------------------------------------------------
@@ -634,6 +693,31 @@ def test_toc_extras_status_rule_preserves_progress_unless_content_changes(
         material = session.get(Material, material_id)
         assert material.status == "extracted"
         assert material.summary is None
+
+
+def test_changed_extras_body_clears_stale_classifications_at_the_current_version(
+    client, auth_headers, db_session_factory
+):
+    """The upsert_text_material half of the stale-classification fix (see
+    test_file_upload_changed_bytes_clears_stale_classifications)."""
+    course_id = handshake(client, auth_headers)
+    extras = {"news": [{"id": 1, "title": "Midterm moved", "html": "<p>Friday</p>"}], "dropbox": None}
+    post_toc(client, auth_headers, load_toc(), extras=extras)
+
+    with db_session_factory() as session:
+        material = session.execute(
+            select(Material).where(Material.course_id == course_id, Material.source_url == "d2l:news:1")
+        ).scalar_one()
+        material_id = material.id
+        _seed_taxonomy_and_assignment(session, course_id, material_id, version=1)
+
+    # Unchanged extras: the assignment survives, like the summary does.
+    post_toc(client, auth_headers, load_toc(), extras=extras)
+    assert _assignment_versions(db_session_factory, material_id) == [0, 1]
+
+    extras["news"][0]["html"] = "<p>Monday instead</p>"
+    post_toc(client, auth_headers, load_toc(), extras=extras)
+    assert _assignment_versions(db_session_factory, material_id) == [0]
 
 
 def test_toc_malformed_extras_items_are_skipped_not_422(client, auth_headers, db_session_factory):

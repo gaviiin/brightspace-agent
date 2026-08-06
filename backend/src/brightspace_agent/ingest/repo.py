@@ -13,16 +13,56 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from brightspace_agent.db.models import Course, Material, Module, SyncRun
+from brightspace_agent.db.models import Course, Material, MaterialTopic, Module, SyncRun
 from brightspace_agent.ingest.diff import ModuleRef, TocEntry, infer_kind
 from brightspace_agent.ingest.store import BlobStore
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# --------------------------------------------------------------------------
+# Shared: what "the bytes actually changed" costs a material
+# --------------------------------------------------------------------------
+
+
+def reset_pipeline_progress(session: Session, course_id: int, material: Material, *, status: str) -> None:
+    """Roll a material back to the start of the pipeline because its content
+    changed (or it's brand new).
+
+    Resetting status/summary/error is only half the job. `material_topics`
+    rows are keyed on (material, topic, taxonomy_version) and are what S3's
+    worklist checks -- a material that already has rows at the course's
+    CURRENT version is skipped, so leaving them behind meant a re-uploaded
+    file kept the topics its OLD contents earned, forever: re-summarized
+    from the new bytes, but never re-classified. The rows at the current
+    version go with the summary.
+
+    Older versions are deliberately untouched: they are history (the
+    taxonomy editor and any later remap read them), and nothing selects
+    work off them.
+
+    `material` must already have an id -- call this after the flush that
+    assigns one.
+    """
+    material.status = status
+    material.summary = None
+    material.error = None
+
+    if material.id is None:  # pragma: no cover -- defensive; callers flush first
+        return
+    course = session.get(Course, course_id)
+    version = course.taxonomy_version if course is not None else 0
+    session.execute(
+        delete(MaterialTopic).where(
+            MaterialTopic.material_id == material.id,
+            MaterialTopic.taxonomy_version == version,
+        )
+    )
 
 
 # --------------------------------------------------------------------------
@@ -219,22 +259,25 @@ def upsert_text_material(
     material.mime = mime
     material.size_bytes = size
     material.fetched_at = now_iso()
+    session.flush()
 
     if not sha_unchanged:
         # Bytes actually changed (or this is a brand new material): reset
         # pipeline progress, matching upsert_file_material's rule. Without
-        # this, every /toc call that carries extras (news/dropbox) -- which
-        # is every sync, since the extension always resends whatever's
-        # currently posted -- would unconditionally knock an
-        # already-summarized announcement/assignment back to 'extracted'
+        # the sha_unchanged guard, every /toc call that carries extras
+        # (news/dropbox) -- which is every sync, since the extension always
+        # resends whatever's currently posted -- would unconditionally knock
+        # an already-summarized announcement/assignment back to 'extracted'
         # even though its content hasn't changed at all, silently dropping
         # it out of the taxonomy prompt's material list and out of
         # classify's worklist (both keyed on status=='summarized').
-        material.status = "extracted"
-        material.summary = None
-        material.error = None
+        #
+        # Note the status here is 'extracted', not 'fetched': the body IS
+        # the extracted text (written to the sidecar just above), so this
+        # material re-enters the pipeline at the summarize pass.
+        reset_pipeline_progress(session, course_id, material, status="extracted")
+        session.flush()
 
-    session.flush()
     return material
 
 
@@ -283,16 +326,16 @@ def upsert_file_material(
     material.title = title
     material.d2l_updated_at = d2l_updated_at
     material.fetched_at = now_iso()
+    session.flush()
 
     if not sha_unchanged:
         # Bytes actually changed (or this is a brand new material): reset
-        # pipeline progress. Unchanged bytes leave status/summary/error as
-        # they are, so re-syncing never throws away downstream work.
-        material.status = "fetched"
-        material.summary = None
-        material.error = None
+        # pipeline progress, topic assignments included (see
+        # reset_pipeline_progress). Unchanged bytes leave everything as it
+        # is, so re-syncing never throws away downstream work.
+        reset_pipeline_progress(session, course_id, material, status="fetched")
+        session.flush()
 
-    session.flush()
     return material
 
 
@@ -424,13 +467,12 @@ def upsert_zip_material(
     material.mime = mime
     material.size_bytes = size_bytes
     material.fetched_at = now_iso()
+    session.flush()
 
     if not sha_unchanged:
         # Bytes actually changed (or this is a brand new material): reset
         # pipeline progress, matching upsert_file_material's rule.
-        material.status = "fetched"
-        material.summary = None
-        material.error = None
+        reset_pipeline_progress(session, course_id, material, status="fetched")
+        session.flush()
 
-    session.flush()
     return material

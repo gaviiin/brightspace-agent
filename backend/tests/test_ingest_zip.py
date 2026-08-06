@@ -15,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from brightspace_agent.db.models import Material, Module, SyncRun
+from brightspace_agent.db.models import Course, Material, MaterialTopic, Module, SyncRun, Topic
 
 ORG_UNIT_ID = 555
 
@@ -230,6 +230,54 @@ def test_zip_import_reupload_same_zip_dedupes(client, auth_headers, db_session_f
     assert module_count_2 == module_count_1 == 3
     assert material_count_2 == material_count_1 == 3
     assert material_ids_2 == material_ids_1
+
+
+def test_zip_import_changed_entry_bytes_clears_stale_classifications(
+    client, auth_headers, db_session_factory
+):
+    """The upsert_zip_material half of the stale-classification fix: a
+    re-uploaded zip whose entry actually changed must drop that material's
+    topic assignments at the CURRENT taxonomy version (S3's worklist skips
+    anything that already has rows there), while leaving older versions --
+    the taxonomy editor's history -- alone. Unchanged entries keep
+    everything, exactly as they keep their summary.
+    """
+    course_id = handshake(client, auth_headers)
+    post_zip(client, auth_headers, _make_zip({"week1/a.txt": b"original"}))
+
+    with db_session_factory() as session:
+        material = session.execute(select(Material)).scalars().one()
+        material_id = material.id
+        course = session.get(Course, course_id)
+        course.taxonomy_version = 1
+        topic = Topic(
+            course_id=course_id, taxonomy_version=1, slug="intro", name="Intro",
+            description="d", order_index=0, created_by="agent",
+        )
+        session.add(topic)
+        session.flush()
+        for version in (0, 1):
+            session.add(
+                MaterialTopic(
+                    material_id=material_id, topic_id=topic.id, taxonomy_version=version,
+                    confidence=0.9, rationale="r", method="llm", review_status="auto",
+                )
+            )
+        session.commit()
+
+    def versions() -> list[int]:
+        with db_session_factory() as session:
+            return sorted(
+                session.execute(
+                    select(MaterialTopic.taxonomy_version).where(MaterialTopic.material_id == material_id)
+                ).scalars().all()
+            )
+
+    post_zip(client, auth_headers, _make_zip({"week1/a.txt": b"original"}))
+    assert versions() == [0, 1]
+
+    post_zip(client, auth_headers, _make_zip({"week1/a.txt": b"rewritten content"}))
+    assert versions() == [0]
 
 
 # --------------------------------------------------------------------------

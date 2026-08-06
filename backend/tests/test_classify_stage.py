@@ -432,6 +432,81 @@ def test_version_bump_reclassifies_and_keeps_old_rows(session_factory, backend, 
     assert stats.classified == 1
 
 
+def test_resynced_material_with_changed_bytes_is_reclassified_from_scratch(
+    session_factory, backend, course_id
+):
+    """Regression: changed content used to keep its old topics forever.
+
+    `upsert_file_material` reset status/summary on a sha change but left the
+    `material_topics` rows at the current version in place -- and this
+    stage's worklist skips any material that already has rows there. So a
+    re-uploaded file was re-extracted and re-summarized from the new bytes,
+    then never re-classified: it kept the topics its OLD contents earned,
+    with no way to repair it short of a taxonomy version bump.
+    """
+    from brightspace_agent.ingest import repo
+
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    material_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Quicksort", kind="slides", sha256="a" * 64
+    )
+    with session_factory() as session:
+        material = session.get(Material, material_id)
+        material.d2l_topic_id = 1001
+        session.commit()
+
+    _run(session_factory, backend, course_id)
+    assert len(_rows(session_factory, material_id=material_id, version=1)) == 2
+    # A stale row at an OLDER version: history, and not this stage's
+    # business -- it must survive the re-sync untouched.
+    with session_factory() as session:
+        session.add(
+            MaterialTopic(
+                material_id=material_id,
+                topic_id=_rows(session_factory, material_id=material_id)[0].topic_id,
+                taxonomy_version=0,
+                confidence=0.5,
+                rationale="from an earlier taxonomy",
+                method="llm",
+                review_status="auto",
+            )
+        )
+        session.commit()
+
+    # The re-sync: same topic, genuinely different bytes.
+    with session_factory() as session:
+        repo.upsert_file_material(
+            session,
+            course_id=course_id,
+            d2l_topic_id=1001,
+            sha256="b" * 64,
+            mime="text/plain",
+            size_bytes=120,
+            source_url="https://tenant.example/topics/1001/file",
+            title="Lecture 5 Quicksort",
+            d2l_updated_at="2026-03-01T00:00:00.000Z",
+        )
+        session.commit()
+
+    assert _rows(session_factory, material_id=material_id, version=1) == []
+    assert len(_rows(session_factory, material_id=material_id, version=0)) == 1  # history intact
+
+    # S1 re-extracts and re-summarizes the new bytes; then S3 gets its turn.
+    with session_factory() as session:
+        material = session.get(Material, material_id)
+        assert material.status == "fetched"
+        assert material.summary is None
+        material.status = "summarized"
+        material.summary = "Rewritten lecture: now about graph traversal."
+        session.commit()
+
+    stats = _run(session_factory, backend, course_id)
+
+    fresh = _rows(session_factory, material_id=material_id, version=1)
+    assert len(fresh) == 2
+    assert stats.classified == 1
+
+
 def test_same_taxonomy_content_at_a_new_version_reuses_the_cache(session_factory, backend, course_id):
     """A version number is not a reason to re-bill a course. Only the
     taxonomy's content is."""
