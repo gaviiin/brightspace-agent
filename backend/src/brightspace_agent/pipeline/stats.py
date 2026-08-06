@@ -37,6 +37,13 @@ class StageStats:
         default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "est_cost_usd": 0.0}
     )
 
+    # Task 9's cost cap (see pipeline/runner.py + the `cost_cap_usd` kwarg on
+    # run_summarize_stage/run_classify_stage): True if the stage stopped its
+    # worklist early because accumulated spend reached the cap. The
+    # remaining worklist items are left untouched (not marked failed) so a
+    # later run retries them.
+    aborted: bool = False
+
     def add_usage(self, usage: dict) -> None:
         self.usage_total["input_tokens"] += usage["input_tokens"]
         self.usage_total["output_tokens"] += usage["output_tokens"]

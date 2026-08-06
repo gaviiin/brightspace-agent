@@ -524,6 +524,82 @@ def test_changed_taxonomy_content_still_bumps_the_version(session_factory, blob_
     ]
 
 
+def test_edge_only_change_still_bumps_the_version_and_writes_new_edges(session_factory, blob_store, course_id):
+    """Regression for the S2 edge-digest gap: the unchanged-comparison used
+    to hash topics only, so an edge-only change (same topics, a different
+    prerequisite/related link) digested identically to the taxonomy already
+    on disk. The guarded write treats "unchanged" as "write nothing", so the
+    new edges were silently discarded -- and could never be repaired by
+    re-running S2, since every subsequent run saw the same "unchanged"
+    topics and skipped the write again."""
+    _seed_course_content(session_factory, blob_store, course_id)
+    same_topics = [
+        TopicDef(slug="alpha", name="Alpha", description="a"),
+        TopicDef(slug="beta", name="Beta", description="b"),
+        TopicDef(slug="gamma", name="Gamma", description="c"),
+    ]
+    first = _StubBackend(
+        TaxonomyOut(
+            topics=same_topics,
+            edges=[TopicEdgeDef(from_slug="alpha", to_slug="beta", relation="prerequisite")],
+        )
+    )
+    _run(session_factory, first, course_id, blob_store)
+    assert _taxonomy_version(session_factory, course_id) == 1
+
+    # Force a cache miss (identical inputs would otherwise just replay the
+    # cached first proposal, edges and all) without changing the topics the
+    # stub returns -- only the edges differ.
+    _add_summarized_material(
+        session_factory, blob_store, course_id,
+        title="Lecture 12: Hash Tables", body="Hashing and load factors.", key_terms=["hashing"],
+    )
+    second = _StubBackend(
+        TaxonomyOut(
+            topics=same_topics,
+            edges=[TopicEdgeDef(from_slug="beta", to_slug="gamma", relation="related")],
+        )
+    )
+    stats = _run(session_factory, second, course_id, blob_store)
+
+    assert stats.unchanged is False
+    assert stats.taxonomy_version == 2
+    assert _taxonomy_version(session_factory, course_id) == 2
+    assert [topic.slug for topic in _topics(session_factory, course_id, 2)] == ["alpha", "beta", "gamma"]
+
+    with session_factory() as session:
+        edges_v2 = list(session.execute(select(TopicEdge)).scalars().all())
+        topic_by_id = {topic.id: topic for topic in session.execute(select(Topic)).scalars().all()}
+    v2_topic_ids = {topic.id for topic in _topics(session_factory, course_id, 2)}
+    edges_v2 = [e for e in edges_v2 if e.from_topic_id in v2_topic_ids and e.to_topic_id in v2_topic_ids]
+    assert len(edges_v2) == 1
+    assert topic_by_id[edges_v2[0].from_topic_id].slug == "beta"
+    assert topic_by_id[edges_v2[0].to_topic_id].slug == "gamma"
+
+
+def test_edge_only_change_at_a_new_version_is_still_a_no_op_when_edges_match(
+    session_factory, blob_store, course_id
+):
+    """Sanity check on the other side of the same fix: identical topics AND
+    identical edges must still be a true no-op (no spurious version bump)."""
+    _seed_course_content(session_factory, blob_store, course_id)
+    same_topics = [
+        TopicDef(slug="alpha", name="Alpha", description="a"),
+        TopicDef(slug="beta", name="Beta", description="b"),
+        TopicDef(slug="gamma", name="Gamma", description="c"),
+    ]
+    same_edges = [TopicEdgeDef(from_slug="alpha", to_slug="beta", relation="prerequisite")]
+    first = _StubBackend(TaxonomyOut(topics=same_topics, edges=same_edges))
+    _run(session_factory, first, course_id, blob_store)
+    assert _taxonomy_version(session_factory, course_id) == 1
+
+    second = _StubBackend(TaxonomyOut(topics=same_topics, edges=same_edges))
+    stats = _run(session_factory, second, course_id, blob_store)
+
+    assert stats.unchanged is True
+    assert _taxonomy_version(session_factory, course_id) == 1
+
+
 def test_two_courses_with_identical_module_titles_do_not_share_a_taxonomy(
     session_factory, blob_store, backend
 ):

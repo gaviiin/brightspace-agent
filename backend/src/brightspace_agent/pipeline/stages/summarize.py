@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from importlib import resources
 
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from brightspace_agent.agents.llm import LLMBackend, LLMCallError, Tier, UsageInfo
@@ -68,7 +69,15 @@ async def run_summarize_stage(
     *,
     concurrency: int = 4,
     progress: ProgressCallback | None = None,
+    cost_cap_usd: float | None = None,
 ) -> StageStats:
+    """`cost_cap_usd` (Task 9's runner-level spend guard): if given, checked
+    before every LLM call in pass 2 against `stats.usage_total["est_cost_usd"]`
+    -- once that reaches the cap, the remaining worklist is left untouched
+    (not marked failed, so a later run retries it) and `stats.aborted` is
+    set. Cache hits never count against it (nothing was spent). `None`
+    (the default) means uncapped, matching every existing caller.
+    """
     stats = StageStats()
 
     fetched_ids = _select_material_ids(
@@ -89,7 +98,7 @@ async def run_summarize_stage(
         extractable_ids,
         concurrency,
         lambda material_id: asyncio.to_thread(
-            _summarize_one, session_factory, blob_store, backend, material_id, stats, progress
+            _summarize_one, session_factory, blob_store, backend, material_id, stats, progress, cost_cap_usd
         ),
     )
 
@@ -171,6 +180,7 @@ def _summarize_one(
     material_id: int,
     stats: StageStats,
     progress: ProgressCallback | None,
+    cost_cap_usd: float | None = None,
 ) -> None:
     with session_factory() as session:
         material = session.get(Material, material_id)
@@ -209,6 +219,18 @@ def _summarize_one(
                 progress(f"summarize:cached:{material_id}")
             return
 
+        # Cost cap (Task 9): checked here, right before the only paid call in
+        # this function -- a cache hit above never reaches this point, so it
+        # never counts against the cap. Once the running total reaches the
+        # cap, this material (and the rest of the worklist, as later workers
+        # make the same check) is left exactly as it is -- still
+        # `status='extracted'` -- so a later run retries it.
+        if cost_cap_usd is not None and stats.usage_total["est_cost_usd"] >= cost_cap_usd:
+            stats.aborted = True
+            if progress:
+                progress(f"summarize:cost-cap:{material_id}")
+            return
+
         text = blob_store.read_text(sha256) or ""
         user_prompt = _build_user_prompt(material, text)
 
@@ -227,8 +249,18 @@ def _summarize_one(
 
         doc_summary_data = parsed.model_dump()
         _apply_summary(material, doc_summary_data, model, usage)
-        session.add(
-            LlmCache(
+
+        # Cache-race guard: two workers summarizing materials with identical
+        # bytes both miss the cache above and both call the LLM: the second
+        # write here reaches a sha256/stage/prompt_version/model that the
+        # first has already inserted. An upsert (rather than a plain insert)
+        # treats that as a harmless duplicate instead of raising
+        # IntegrityError and crashing the whole stage over a healthy
+        # material -- the first writer's cached row wins, which is fine,
+        # since both were computed from byte-identical input.
+        session.execute(
+            sqlite_insert(LlmCache)
+            .values(
                 sha256=sha256,
                 stage=_STAGE,
                 prompt_version=PROMPT_VERSION,
@@ -236,6 +268,7 @@ def _summarize_one(
                 output_json=json.dumps(doc_summary_data),
                 created_at=_now_iso(),
             )
+            .on_conflict_do_nothing(index_elements=["sha256", "stage", "prompt_version", "model"])
         )
         stats.summarized += 1
         stats.add_usage(usage)

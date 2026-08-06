@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     smart_model: str = "claude-sonnet-5"
     mock_llm: bool = False
 
+    # Pipeline runner (Task 9): a hard-ish per-run spend guard shared across
+    # the summarize and classify stages (see pipeline/runner.py). Advisory,
+    # like the rest of cost estimation -- see agents/llm.py's cost table.
+    max_cost_usd_per_run: float = 5.0
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "brightspace.db"

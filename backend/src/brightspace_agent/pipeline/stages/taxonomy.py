@@ -34,6 +34,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import resources
@@ -145,8 +146,9 @@ def _run_sync(
         stats.add_usage(usage)
 
     topics, edges = _validate(proposal, course_id)
-    proposed_digest = taxonomy_digest(
-        render_topic_block((topic.slug, topic.name, topic.description) for topic in topics)
+    proposed_digest = _content_digest(
+        render_topic_block((topic.slug, topic.name, topic.description) for topic in topics),
+        ((edge.from_slug, edge.to_slug, edge.relation) for edge in edges),
     )
 
     with session_factory() as session:
@@ -419,9 +421,30 @@ def _upsert_cache(session: Session, cache_key: str, model: str, proposal: Taxono
     )
 
 
+def _content_digest(topic_block: str, edges: Iterable[tuple[str, str, str]]) -> str:
+    """A content fingerprint covering BOTH topics and edges.
+
+    Topics alone used to be the whole story here, which meant an edge-only
+    change (same topics, a different prerequisite/related link) digested
+    identically to whatever the course already had -- the guarded write
+    below treats "unchanged" as "write nothing", so a legitimate edge
+    change was silently discarded and could never be repaired by
+    re-running S2. Edges are sorted by (from_slug, to_slug, relation) --
+    not proposal order -- so the model listing the same edges in a
+    different order never causes a spurious version bump.
+
+    Deliberately NOT reused for S3's cache key: classify.py's prompt only
+    ever shows the topic list (`render_topic_block`), never the edges, so
+    its cache key stays topic-only -- an edge-only taxonomy change must not
+    force every material to be re-classified (and re-billed).
+    """
+    edge_block = "\n".join(f"{from_slug} -> {to_slug} :: {relation}" for from_slug, to_slug, relation in sorted(edges))
+    return taxonomy_digest(f"{topic_block}\n{edge_block}")
+
+
 def _current_digest(session: Session, course_id: int, version: int) -> str | None:
-    """The content digest of the taxonomy the course is on right now, or None
-    if it has no topics yet."""
+    """The content digest (topics AND edges) of the taxonomy the course is on
+    right now, or None if it has no topics yet."""
     topics = list(
         session.execute(
             select(Topic)
@@ -431,9 +454,21 @@ def _current_digest(session: Session, course_id: int, version: int) -> str | Non
     )
     if not topics:
         return None
-    return taxonomy_digest(
-        render_topic_block((topic.slug, topic.name, topic.description) for topic in topics)
+    topic_block = render_topic_block((topic.slug, topic.name, topic.description) for topic in topics)
+
+    # Edges aren't versioned themselves (see topic_edges' schema): an edge
+    # belongs to this version iff both endpoints are topics at this version
+    # -- the same rule graph/build.py uses to scope edges into the graph.
+    slug_by_topic_id = {topic.id: topic.slug for topic in topics}
+    edge_rows = list(
+        session.execute(select(TopicEdge).where(TopicEdge.course_id == course_id)).scalars().all()
     )
+    edges = [
+        (slug_by_topic_id[edge.from_topic_id], slug_by_topic_id[edge.to_topic_id], edge.relation)
+        for edge in edge_rows
+        if edge.from_topic_id in slug_by_topic_id and edge.to_topic_id in slug_by_topic_id
+    ]
+    return _content_digest(topic_block, edges)
 
 
 def _parse_cached(output_json: str) -> TaxonomyOut | None:

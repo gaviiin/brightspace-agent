@@ -523,3 +523,63 @@ def test_progress_callback_fires_per_material(session_factory, backend, course_i
     _run(session_factory, backend, course_id, progress=seen.append)
 
     assert len(seen) == 3
+
+
+# --------------------------------------------------------------------------
+# Cost cap (Task 9)
+# --------------------------------------------------------------------------
+
+
+class _FixedCostBackend:
+    """Wraps a backend, reporting a fixed `est_cost_usd` per call regardless
+    of what the inner backend actually used."""
+
+    def __init__(self, inner, est_cost_usd: float) -> None:
+        self._inner = inner
+        self._est_cost_usd = est_cost_usd
+        self.calls = 0
+
+    def structured_call(self, schema, *, system, user, tier):
+        self.calls += 1
+        parsed, usage = self._inner.structured_call(schema, system=system, user=user, tier=tier)
+        usage = {**usage, "est_cost_usd": self._est_cost_usd}
+        return parsed, usage
+
+    def model_for_tier(self, tier):
+        return self._inner.model_for_tier(tier)
+
+
+def test_cost_cap_stops_the_worklist_and_leaves_the_rest_unprocessed(session_factory, backend, course_id):
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    material_ids = [_add_material(session_factory, course_id, title=f"Lecture {i}") for i in range(3)]
+
+    costly_backend = _FixedCostBackend(backend, est_cost_usd=10.0)
+    # concurrency=1: makes "exactly one call, then abort" deterministic
+    # rather than a matter of thread timing.
+    stats = _run(session_factory, costly_backend, course_id, concurrency=1, cost_cap_usd=5.0)
+
+    assert costly_backend.calls == 1
+    assert stats.aborted is True
+    assert stats.classified == 1
+
+    rows_by_material = {material_id: _rows(session_factory, material_id=material_id) for material_id in material_ids}
+    processed = [material_id for material_id, rows in rows_by_material.items() if rows]
+    untouched = [material_id for material_id, rows in rows_by_material.items() if not rows]
+    assert len(processed) == 1
+    assert len(untouched) == 2
+    with session_factory() as session:
+        for material_id in untouched:
+            assert session.get(Material, material_id).status == "summarized"  # left for a later retry
+
+
+def test_cost_cap_never_blocks_a_cache_hit(session_factory, backend, course_id):
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    _add_material(session_factory, course_id, title="Lecture 5", sha256="shared-sha")
+    _run(session_factory, backend, course_id)  # primes the cache
+
+    mirror_id = _add_material(session_factory, course_id, title="Lecture 5 (mirror)", sha256="shared-sha")
+
+    stats = _run(session_factory, backend, course_id, cost_cap_usd=0.0)
+
+    assert stats.aborted is False
+    assert len(_rows(session_factory, material_id=mirror_id)) == 2

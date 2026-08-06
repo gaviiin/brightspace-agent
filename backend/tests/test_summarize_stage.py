@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 
 import fitz  # PyMuPDF
 import pytest
@@ -289,3 +290,161 @@ def test_concurrent_fan_out_over_five_materials_all_complete(session_factory, bl
         material = _get_material(session_factory, material_id)
         assert material.status == "summarized"
         assert material.summary
+
+
+# --------------------------------------------------------------------------
+# Cache-race guard (Task 9 folded-in fix)
+# --------------------------------------------------------------------------
+
+
+class _BarrierBackend:
+    """Wraps a backend and forces every `structured_call` to block until
+    `n` calls are in flight simultaneously, before letting all of them
+    proceed together.
+
+    Without this, two workers racing to summarize identical bytes is a
+    matter of thread-scheduling luck -- usually fine, occasionally a flaky
+    test. The barrier makes the race deterministic: both workers are
+    guaranteed to have already missed the cache before either one writes to
+    it, every time this test runs.
+    """
+
+    def __init__(self, inner, n: int) -> None:
+        self._inner = inner
+        self._barrier = threading.Barrier(n)
+
+    def structured_call(self, schema, *, system, user, tier):
+        self._barrier.wait(timeout=5)
+        return self._inner.structured_call(schema, system=system, user=user, tier=tier)
+
+    def model_for_tier(self, tier):
+        return self._inner.model_for_tier(tier)
+
+
+def test_concurrent_identical_content_cache_race_does_not_fail_either_material(
+    session_factory, blob_store, backend, course_id
+):
+    """Regression: two materials with byte-identical content, summarized
+    concurrently, both miss the cache (neither has committed yet) and both
+    call the LLM. Without a guard, the second `llm_cache` insert raises
+    IntegrityError on the shared (sha256, stage, prompt_version, model) key
+    -- which used to propagate out of `asyncio.gather` uncaught, crashing
+    the whole stage rather than just that one material."""
+    body = "Shared lecture content for the cache-race regression test."
+    sha256, size = blob_store.put_bytes(body.encode("utf-8"))
+    blob_store.write_text(sha256, body)
+    material_a_id = _add_material(
+        session_factory, course_id,
+        kind="document", title="Copy A", mime="text/plain",
+        sha256=sha256, size_bytes=size, status="extracted",
+    )
+    material_b_id = _add_material(
+        session_factory, course_id,
+        kind="document", title="Copy B", mime="text/plain",
+        sha256=sha256, size_bytes=size, status="extracted",
+    )
+
+    racing_backend = _BarrierBackend(backend, 2)
+    stats = _run_stage(session_factory, blob_store, racing_backend, course_id, concurrency=2)
+
+    material_a = _get_material(session_factory, material_a_id)
+    material_b = _get_material(session_factory, material_b_id)
+    assert material_a.status == "summarized"
+    assert material_b.status == "summarized"
+    assert material_a.summary
+    assert material_b.summary
+    assert stats.summarized == 2
+    assert stats.failed == 0
+
+    with session_factory() as session:
+        cache_rows = session.execute(
+            select(LlmCache).where(LlmCache.sha256 == sha256, LlmCache.stage == "summarize")
+        ).scalars().all()
+    assert len(cache_rows) == 1  # the race produced exactly one row, not zero and not a crash
+
+
+# --------------------------------------------------------------------------
+# Cost cap (Task 9)
+# --------------------------------------------------------------------------
+
+
+class _FixedCostBackend:
+    """Wraps a backend, reporting a fixed `est_cost_usd` per call regardless
+    of what the inner backend actually used."""
+
+    def __init__(self, inner, est_cost_usd: float) -> None:
+        self._inner = inner
+        self._est_cost_usd = est_cost_usd
+        self.calls = 0
+
+    def structured_call(self, schema, *, system, user, tier):
+        self.calls += 1
+        parsed, usage = self._inner.structured_call(schema, system=system, user=user, tier=tier)
+        usage = {**usage, "est_cost_usd": self._est_cost_usd}
+        return parsed, usage
+
+    def model_for_tier(self, tier):
+        return self._inner.model_for_tier(tier)
+
+
+def test_cost_cap_stops_the_worklist_and_leaves_the_rest_unprocessed(
+    session_factory, blob_store, backend, course_id
+):
+    material_ids = []
+    for i in range(3):
+        body = f"Distinct lecture body number {i} about topic {i}."
+        sha, size = blob_store.put_bytes(body.encode("utf-8"))
+        material_ids.append(
+            _add_material(
+                session_factory, course_id,
+                kind="document", title=f"Lecture {i}", mime="text/plain",
+                sha256=sha, size_bytes=size, status="extracted",
+            )
+        )
+
+    costly_backend = _FixedCostBackend(backend, est_cost_usd=10.0)
+    # concurrency=1: the cap check happens per material, right before that
+    # material's LLM call -- serial processing is what makes "exactly one
+    # call, then abort" deterministic rather than a matter of thread timing.
+    stats = _run_stage(
+        session_factory, blob_store, costly_backend, course_id, concurrency=1, cost_cap_usd=5.0
+    )
+
+    assert costly_backend.calls == 1  # cap (5) < per-call cost (10): only the first call happens
+    assert stats.aborted is True
+    assert stats.summarized == 1
+    assert stats.failed == 0
+
+    statuses = {
+        material_id: _get_material(session_factory, material_id).status for material_id in material_ids
+    }
+    summarized_count = sum(1 for status in statuses.values() if status == "summarized")
+    extracted_count = sum(1 for status in statuses.values() if status == "extracted")
+    assert summarized_count == 1
+    assert extracted_count == 2  # left untouched (not 'failed') for a later run to retry
+
+
+def test_cost_cap_never_blocks_a_cache_hit(session_factory, blob_store, backend, course_id):
+    """A cache hit spends nothing, so it must never trip the cap -- even a
+    cap of 0 should still let every cache hit through."""
+    body = "Cached lecture content."
+    sha256, size = blob_store.put_bytes(body.encode("utf-8"))
+    blob_store.write_text(sha256, body)
+    _add_material(
+        session_factory, course_id,
+        kind="document", title="First copy", mime="text/plain",
+        sha256=sha256, size_bytes=size, status="extracted",
+    )
+    _run_stage(session_factory, blob_store, backend, course_id)  # primes the cache
+
+    mirror_id = _add_material(
+        session_factory, course_id,
+        kind="document", title="Second copy (same bytes)", mime="text/plain",
+        sha256=sha256, size_bytes=size, status="extracted",
+    )
+
+    stats = _run_stage(session_factory, blob_store, backend, course_id, cost_cap_usd=0.0)
+
+    assert stats.aborted is False
+    assert stats.cached_hits == 1
+    assert _get_material(session_factory, mirror_id).status == "summarized"
