@@ -331,6 +331,28 @@ def test_slugs_normalized_and_duplicates_dropped(session_factory, blob_store, co
     assert stats.topics == 3
 
 
+def test_absurdly_long_slug_is_capped_and_its_edges_still_resolve(session_factory, blob_store, course_id):
+    _seed_course_content(session_factory, blob_store, course_id)
+    long_slug = "-".join(["extremely-verbose-topic-name"] * 6)  # ~170 chars
+    stub = _StubBackend(
+        TaxonomyOut(
+            topics=[
+                TopicDef(slug=long_slug, name="Verbose", description="a"),
+                TopicDef(slug="beta", name="Beta", description="b"),
+                TopicDef(slug="gamma", name="Gamma", description="c"),
+            ],
+            edges=[TopicEdgeDef(from_slug=long_slug, to_slug="beta", relation="prerequisite")],
+        )
+    )
+
+    stats = _run(session_factory, stub, course_id, blob_store)
+
+    topics = _topics(session_factory, course_id, 1)
+    assert len(topics[0].slug) <= 80
+    assert long_slug.startswith(topics[0].slug)
+    assert stats.edges == 1  # the edge was normalized the same way, so it resolved
+
+
 def test_self_loop_and_duplicate_edges_dropped(session_factory, blob_store, course_id):
     _seed_course_content(session_factory, blob_store, course_id)
     stub = _StubBackend(

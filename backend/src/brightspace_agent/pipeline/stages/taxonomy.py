@@ -63,6 +63,7 @@ _PROMPT_MAX_CHARS = 60_000
 _SUMMARY_LINES = 2
 _MIN_TOPICS = 3
 _MAX_TOPICS = 30
+_MAX_SLUG_CHARS = 80  # slugs end up in URLs and the taxonomy editor
 
 _SYSTEM_PROMPT = (
     resources.files("brightspace_agent.agents.prompts").joinpath("taxonomy.md").read_text(encoding="utf-8")
@@ -407,12 +408,18 @@ def _parse_cached(output_json: str) -> TaxonomyOut | None:
 # --------------------------------------------------------------------------
 
 
+def _normalize_slug(value: str) -> str:
+    """Kebab-case and length-capped. Edges go through this too, so a slug the
+    model wrote out in full still resolves to its truncated topic."""
+    return slugify(value)[:_MAX_SLUG_CHARS].strip("-")
+
+
 def _validate(proposal: TaxonomyOut, course_id: int) -> tuple[list[TopicDef], list[TopicEdgeDef]]:
     topics: list[TopicDef] = []
     seen_slugs: set[str] = set()
 
     for topic in proposal.topics:
-        slug = slugify(topic.slug) or slugify(topic.name)
+        slug = _normalize_slug(topic.slug) or _normalize_slug(topic.name)
         name = topic.name.strip()
         if not slug or not name:
             logger.warning("taxonomy: dropping topic with empty slug/name (%r)", topic)
@@ -447,8 +454,8 @@ def _validate(proposal: TaxonomyOut, course_id: int) -> tuple[list[TopicDef], li
     edges: list[TopicEdgeDef] = []
     seen_edges: set[tuple[str, str, str]] = set()
     for edge in proposal.edges:
-        from_slug = slugify(edge.from_slug)
-        to_slug = slugify(edge.to_slug)
+        from_slug = _normalize_slug(edge.from_slug)
+        to_slug = _normalize_slug(edge.to_slug)
         if from_slug not in seen_slugs or to_slug not in seen_slugs:
             logger.warning(
                 "taxonomy: dropping edge %r -> %r (%s): unknown topic slug",
