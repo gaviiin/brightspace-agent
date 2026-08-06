@@ -102,14 +102,18 @@ class _FakeAIMessage:
 class _FakeStructuredRunnable:
     """Stands in for `chat.with_structured_output(schema, include_raw=True)`:
     a `.invoke()` that returns pre-scripted include_raw-style dicts, one per
-    call, and counts how many times it was called."""
+    call, counts how many times it was called, and records the messages
+    each call received (so a retry can be asserted to actually carry the
+    validation error, not just re-ask the same question)."""
 
     def __init__(self, responses: list[dict]) -> None:
         self._responses = list(responses)
         self.call_count = 0
+        self.call_args_list: list[list] = []
 
     def invoke(self, messages):
         self.call_count += 1
+        self.call_args_list.append(messages)
         return self._responses.pop(0)
 
 
@@ -157,6 +161,14 @@ def test_anthropic_backend_retries_once_on_validation_error_then_succeeds(monkey
     assert usage["input_tokens"] == 100
     assert usage["output_tokens"] == 50
     assert usage["model"] == Settings().fast_model
+
+    # The retry must actually surface the validation error to the model,
+    # not silently re-ask the identical question and hope for a different
+    # answer.
+    assert len(structured.call_args_list) == 2
+    retry_messages = structured.call_args_list[1]
+    retry_human_content = retry_messages[-1].content
+    assert "key_terms: field required" in retry_human_content
 
 
 def test_anthropic_backend_raises_llm_call_error_when_always_invalid(monkeypatch):

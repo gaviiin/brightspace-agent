@@ -77,6 +77,29 @@ def _run_stage(session_factory, blob_store, backend, course_id, **kwargs):
     return asyncio.run(run_summarize_stage(session_factory, blob_store, backend, course_id, **kwargs))
 
 
+class _CountingBackend:
+    """Wraps an LLMBackend, counting `structured_call` invocations.
+
+    Cache-row counts and summary text are consequences of whether the LLM
+    was called, not direct evidence of it -- a regression that skipped the
+    cache check entirely could still coincidentally leave those looking
+    right (or fail loudly with an unrelated IntegrityError on the
+    duplicate-PK insert instead of a clean assertion). This wrapper lets
+    tests assert the call count itself: a cache hit must not increment it.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.calls = 0
+
+    def structured_call(self, schema, *, system, user, tier):
+        self.calls += 1
+        return self._inner.structured_call(schema, system=system, user=user, tier=tier)
+
+    def model_for_tier(self, tier):
+        return self._inner.model_for_tier(tier)
+
+
 # --------------------------------------------------------------------------
 # Basic extract + summarize flow
 # --------------------------------------------------------------------------
@@ -155,6 +178,8 @@ def test_stage_extracts_summarizes_and_fails_appropriately(session_factory, blob
 def test_rerun_reuses_cache_for_duplicate_content_no_new_rows_summaries_unchanged(
     session_factory, blob_store, backend, course_id
 ):
+    counting_backend = _CountingBackend(backend)
+
     pdf_bytes = _make_pdf_bytes("Lecture on hash tables and collision resolution")
     pdf_sha, pdf_size = blob_store.put_bytes(pdf_bytes)
     material_a_id = _add_material(
@@ -172,8 +197,9 @@ def test_rerun_reuses_cache_for_duplicate_content_no_new_rows_summaries_unchange
         sha256=ann_sha, size_bytes=ann_size, status="extracted",
     )
 
-    first_stats = _run_stage(session_factory, blob_store, backend, course_id)
+    first_stats = _run_stage(session_factory, blob_store, counting_backend, course_id)
     assert first_stats.cached_hits == 0
+    assert counting_backend.calls == 2  # (a) and (b), both fresh cache misses
 
     with session_factory() as session:
         cache_rows_after_first = session.execute(select(LlmCache)).scalars().all()
@@ -191,14 +217,35 @@ def test_rerun_reuses_cache_for_duplicate_content_no_new_rows_summaries_unchange
         kind="document", title="Lecture 5 (mirror)", mime="application/pdf",
         sha256=pdf_sha, size_bytes=pdf_size, status="fetched",
     )
+    # A genuinely new material with distinct content, seeded alongside (d)
+    # so this test can assert *both* directions: the cache hit must not
+    # reach the backend, and a real cache miss still must.
+    new_body = "Lecture on graph coloring and the chromatic number."
+    new_sha, new_size = blob_store.put_bytes(new_body.encode("utf-8"))
+    material_e_id = _add_material(
+        session_factory, course_id,
+        kind="document", title="Lecture 6", mime="text/plain",
+        sha256=new_sha, size_bytes=new_size, status="fetched",
+    )
 
-    second_stats = _run_stage(session_factory, blob_store, backend, course_id)
+    calls_before_second_run = counting_backend.calls
+    second_stats = _run_stage(session_factory, blob_store, counting_backend, course_id)
 
     assert second_stats.cached_hits >= 1
+    # Direct evidence the cache hit skipped the LLM entirely: the only new
+    # call across the whole second run is (e)'s genuine cache miss. If a
+    # regression made the cache check a no-op, this would be off by one
+    # (or more) regardless of what the cache-row/summary assertions below
+    # happen to show.
+    assert counting_backend.calls == calls_before_second_run + 1
 
     with session_factory() as session:
         cache_rows_after_second = session.execute(select(LlmCache)).scalars().all()
-    assert len(cache_rows_after_second) == cache_count_after_first  # no new cache rows
+        pdf_cache_rows = session.execute(
+            select(LlmCache).where(LlmCache.sha256 == pdf_sha, LlmCache.stage == "summarize")
+        ).scalars().all()
+    assert len(cache_rows_after_second) == cache_count_after_first + 1  # only (e)'s new row
+    assert len(pdf_cache_rows) == 1  # (d)'s cache hit did not insert a duplicate row
 
     # (a) and (b) were already summarized before the re-run and weren't
     # touched by it (pass 2 only selects summary IS NULL).
@@ -208,6 +255,10 @@ def test_rerun_reuses_cache_for_duplicate_content_no_new_rows_summaries_unchange
     material_d = _get_material(session_factory, material_d_id)
     assert material_d.status == "summarized"
     assert material_d.summary == summary_a_before  # same content -> same cached summary
+
+    material_e = _get_material(session_factory, material_e_id)
+    assert material_e.status == "summarized"
+    assert material_e.summary  # genuinely new content -> its own (mock) summary
 
 
 # --------------------------------------------------------------------------
