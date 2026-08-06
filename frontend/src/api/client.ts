@@ -7,8 +7,10 @@ import type {
   CourseSummary,
   DryRunResponse,
   GraphPayload,
+  MaterialDetail,
   PipelineRunResponse,
   PipelineStatusResponse,
+  SettingsResponse,
 } from "./types";
 
 // Mutating endpoints under /api/ (besides /api/ingest/*, which the
@@ -52,6 +54,26 @@ export function getCourse(courseId: number): Promise<CourseSummary> {
 
 export function getGraph(courseId: number): Promise<GraphPayload> {
   return request<GraphPayload>(`/api/courses/${courseId}/graph`);
+}
+
+export function getMaterial(materialId: number): Promise<MaterialDetail> {
+  return request<MaterialDetail>(`/api/materials/${materialId}`);
+}
+
+/** The extracted-text sidecar's URL (plain text, not JSON -- MaterialReader
+ * fetches it directly rather than through `request()`). */
+export function getMaterialTextUrl(materialId: number): string {
+  return `/api/materials/${materialId}/text`;
+}
+
+/** The raw blob's URL -- used as an `<iframe>` src (PDFs) or a download
+ * anchor's `href`, never fetched as JSON. */
+export function getMaterialFileUrl(materialId: number): string {
+  return `/api/materials/${materialId}/file`;
+}
+
+export function getSettings(): Promise<SettingsResponse> {
+  return request<SettingsResponse>("/api/settings");
 }
 
 export function runPipeline(courseId: number, stages?: string[]): Promise<PipelineRunResponse> {

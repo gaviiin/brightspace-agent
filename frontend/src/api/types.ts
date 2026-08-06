@@ -60,6 +60,24 @@ export interface GraphPayload {
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/materials/{id}  (api/materials.py)
+// ---------------------------------------------------------------------------
+
+export interface MaterialDetail {
+  id: number;
+  courseId: number;
+  title: string;
+  kind: MaterialKind;
+  status: string;
+  mime: string | null;
+  sizeBytes: number | null;
+  sourceUrl: string | null;
+  summary: string | null;
+  keyTerms: string[];
+  topicIds: number[];
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/courses, GET /api/courses/{id}  (api/courses.py)
 // ---------------------------------------------------------------------------
 
@@ -138,3 +156,21 @@ export interface SyncBsaEvent {
 }
 
 export type BsaEvent = PipelineBsaEvent | SyncBsaEvent;
+
+// ---------------------------------------------------------------------------
+// GET /api/settings  (api/settings.py)
+// ---------------------------------------------------------------------------
+
+export interface SettingsModels {
+  fast: string;
+  smart: string;
+}
+
+export interface SettingsResponse {
+  pairingToken: string;
+  dataDir: string;
+  models: SettingsModels;
+  mockLlm: boolean;
+  maxCostUsdPerRun: number;
+  apiKeyConfigured: boolean;
+}

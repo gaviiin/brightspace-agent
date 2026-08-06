@@ -18,7 +18,9 @@ import type { MaterialKind } from "../../api/types";
 import { MATERIAL_NODE_SIZE } from "../layout";
 import type { MaterialFlowNode } from "../transform";
 
-const KIND_ICON: Record<MaterialKind, ComponentType<{ size?: number; className?: string }>> = {
+/** Per-kind icon, shared with the outline/detail panels (Task 11) so the
+ * kind→icon mapping lives in exactly one place. */
+export const KIND_ICON: Record<MaterialKind, ComponentType<{ size?: number; className?: string }>> = {
   syllabus: BookOpen,
   slides: Presentation,
   document: FileText,
