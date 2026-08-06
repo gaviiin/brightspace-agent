@@ -4,10 +4,9 @@ import secrets
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from brightspace_agent import __version__
 from brightspace_agent.agents.llm import make_backend
@@ -93,9 +92,44 @@ def create_app() -> FastAPI:
     app.include_router(events_router)
 
     if FRONTEND_DIST.exists():
-        app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+
+        @app.get("/{full_path:path}")
+        async def spa_fallback(full_path: str) -> Response:
+            return _spa_or_static_response(full_path)
 
     return app
+
+
+def _spa_or_static_response(full_path: str) -> Response:
+    """The Task-1 minor this task's brief ledgers: `StaticFiles(html=True)`
+    only auto-serves `index.html` for a path that resolves to an actual
+    *directory* on disk (see starlette.staticfiles.StaticFiles.get_response)
+    -- it does nothing for a client-side route like `/courses/3`, which is
+    neither a file nor a directory under `frontend/dist`, so it 404s on a
+    hard refresh or a shared deep link instead of handing off to the SPA.
+
+    Registered as a catch-all GET route (below `/api/*`'s routers in
+    registration order, so those always win the match first): a path that
+    resolves to a real file under `frontend/dist` (assets, favicon, etc.) is
+    served as-is; a path with no file extension in its last segment falls
+    back to `index.html` (the SPA shell, which client-side-routes from
+    there); anything else (a typo'd asset URL, or `/api/*` -- excluded
+    explicitly since this route would otherwise shadow FastAPI's own 404
+    for an unknown API path) 404s.
+    """
+    if full_path == "api" or full_path.startswith("api/"):
+        raise HTTPException(status_code=404)
+
+    dist_root = FRONTEND_DIST.resolve()
+    candidate = (dist_root / full_path).resolve()
+    if candidate.is_relative_to(dist_root) and candidate.is_file():
+        return FileResponse(candidate)
+
+    last_segment = full_path.rsplit("/", 1)[-1]
+    if "." not in last_segment:
+        return FileResponse(dist_root / "index.html")
+
+    raise HTTPException(status_code=404)
 
 
 def _is_paired(request: Request, pairing_token: str) -> bool:
