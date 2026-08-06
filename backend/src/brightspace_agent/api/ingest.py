@@ -1,11 +1,12 @@
 """The extension-facing ingest API: handshake -> toc (diff) -> per-file
-streaming upload -> complete. All routes require the pairing token (see
-`deps.require_pairing_token`, applied at the router level below).
+streaming upload -> complete, plus the manual zip-import fallback (/zip).
+All routes require the pairing token (see `deps.require_pairing_token`,
+applied at the router level below).
 
 Wire format is camelCase JSON (`CamelModel`); this module only handles HTTP
 concerns (request/response shapes, header parsing, streaming the upload to
 disk) -- DB upsert logic lives in `ingest/repo.py`, ToC parsing/diffing in
-`ingest/diff.py`.
+`ingest/diff.py`, zip walking in `ingest/zip_import.py`.
 """
 
 from __future__ import annotations
@@ -15,19 +16,20 @@ import json
 import logging
 import os
 import tempfile
+import zipfile
 from email.header import decode_header
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from sqlalchemy.orm import Session
 
 from brightspace_agent.api.deps import get_blob_store, get_session, require_pairing_token
 from brightspace_agent.db.models import SyncRun
-from brightspace_agent.ingest import repo
+from brightspace_agent.ingest import repo, zip_import
 from brightspace_agent.ingest.diff import compute_needed, is_file_topic, parse_toc
 from brightspace_agent.ingest.store import BlobStore
 
@@ -363,3 +365,55 @@ def complete_sync(
     )
 
     return CompleteResponse(status=sync_run.status, stats=stats)
+
+
+# --------------------------------------------------------------------------
+# /zip -- manual import fallback (deferred from Task 3; see the Task 13
+# brief). A synchronous `def` endpoint (not `async def`): FastAPI has
+# already fully spooled the multipart body into `file.file` by the time
+# this runs, so there's no async streaming to do here (unlike /file above),
+# and running it as `def` lets FastAPI offload the zip-walking/blob-writing
+# work to its worker thread pool instead of blocking the event loop.
+# --------------------------------------------------------------------------
+
+
+class ZipImportResponse(CamelModel):
+    status: str
+    stats: dict[str, Any]
+
+
+@router.post("/zip", response_model=ZipImportResponse)
+def import_zip(
+    request: Request,
+    org_unit_id: int = Form(alias="orgUnitId"),
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+    blob_store: BlobStore = Depends(get_blob_store),
+) -> ZipImportResponse:
+    course = repo.get_course_by_org_unit(session, org_unit_id)
+    if course is None:
+        raise HTTPException(status_code=404, detail="unknown course; run handshake first")
+
+    sync_run = repo.create_sync_run(session, course.id, not_needed=0, source="zip")
+
+    try:
+        walk_stats = zip_import.import_zip(session, blob_store, course.id, file.file)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="not a valid zip file") from None
+
+    sync_run.stats_json = json.dumps(
+        {"modules": walk_stats["modules"], "files": walk_stats["files"], "bytes": walk_stats["bytes"]}
+    )
+    stats = repo.finalize_sync_run(session, sync_run, walk_stats["errors"])
+    session.commit()
+
+    request.app.state.event_bus.publish(
+        {
+            "type": "sync",
+            "courseId": sync_run.course_id,
+            "syncRunId": sync_run.id,
+            "status": sync_run.status,
+        }
+    )
+
+    return ZipImportResponse(status=sync_run.status, stats=stats)

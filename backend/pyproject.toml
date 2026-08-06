@@ -16,6 +16,7 @@ dependencies = [
     "langchain-anthropic>=1.5.4",
     "langgraph>=1.2.10",
     "sse-starlette>=3.4.8",
+    "python-multipart>=0.0.20",
 ]
 
 [project.scripts]

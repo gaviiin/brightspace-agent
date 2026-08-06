@@ -9,6 +9,7 @@ boundary and commits once, after everything for that request is staged.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 
@@ -284,10 +285,10 @@ def upsert_file_material(
 # --------------------------------------------------------------------------
 
 
-def create_sync_run(session: Session, course_id: int, not_needed: int) -> SyncRun:
+def create_sync_run(session: Session, course_id: int, not_needed: int, *, source: str = "extension") -> SyncRun:
     sync_run = SyncRun(
         course_id=course_id,
-        source="extension",
+        source=source,
         started_at=now_iso(),
         status="running",
         stats_json=json.dumps({"files": 0, "bytes": 0, "notNeeded": not_needed}),
@@ -317,3 +318,90 @@ def finalize_sync_run(session: Session, sync_run: SyncRun, errors: list[dict]) -
         sync_run.stats_json = json.dumps(stats)
         session.flush()
     return json.loads(sync_run.stats_json or "{}")
+
+
+# --------------------------------------------------------------------------
+# Modules -- zip-import path (Task 13, ingest/zip_import.py). A zip has no
+# D2L module id to key on, so one is derived deterministically (and always
+# negative, since real D2L module ids are always positive) from the
+# folder's own path within the zip -- re-uploading the same zip resolves to
+# the exact same module rows instead of creating duplicates.
+# --------------------------------------------------------------------------
+
+
+def zip_module_d2l_id(path: str) -> int:
+    digest = hashlib.sha256(path.encode("utf-8")).hexdigest()
+    return -(int(digest[:8], 16) + 1)
+
+
+def upsert_zip_module(
+    session: Session, course_id: int, *, path: str, parent_id: int | None, title: str, sort_order: int
+) -> Module:
+    d2l_module_id = zip_module_d2l_id(path)
+    module = session.execute(
+        select(Module).where(Module.course_id == course_id, Module.d2l_module_id == d2l_module_id)
+    ).scalar_one_or_none()
+    if module is None:
+        module = Module(
+            course_id=course_id,
+            d2l_module_id=d2l_module_id,
+            parent_id=parent_id,
+            title=title,
+            sort_order=sort_order,
+        )
+        session.add(module)
+    else:
+        module.parent_id = parent_id
+        module.title = title
+        module.sort_order = sort_order
+    session.flush()
+    return module
+
+
+# --------------------------------------------------------------------------
+# Materials -- zip-import path: identity is `source_url` ("zip:{path within
+# the archive}"), since there's no D2L topic id to key on -- mirrors
+# upsert_text_material's use of a synthetic source_url as identity. Content
+# dedupe is still sha256/blob-store based; re-uploading the same zip
+# resolves every entry back to the same row instead of duplicating it.
+# --------------------------------------------------------------------------
+
+
+def upsert_zip_material(
+    session: Session,
+    course_id: int,
+    *,
+    module_id: int | None,
+    source_url: str,
+    title: str,
+    kind: str,
+    sha256: str,
+    mime: str | None,
+    size_bytes: int,
+) -> Material:
+    material = session.execute(
+        select(Material).where(Material.course_id == course_id, Material.source_url == source_url)
+    ).scalar_one_or_none()
+    sha_unchanged = material is not None and material.sha256 == sha256
+
+    if material is None:
+        material = Material(course_id=course_id, source_url=source_url, title=title, status="fetched")
+        session.add(material)
+
+    material.module_id = module_id
+    material.kind = kind
+    material.title = title
+    material.sha256 = sha256
+    material.mime = mime
+    material.size_bytes = size_bytes
+    material.fetched_at = now_iso()
+
+    if not sha_unchanged:
+        # Bytes actually changed (or this is a brand new material): reset
+        # pipeline progress, matching upsert_file_material's rule.
+        material.status = "fetched"
+        material.summary = None
+        material.error = None
+
+    session.flush()
+    return material
