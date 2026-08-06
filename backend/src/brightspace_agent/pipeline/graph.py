@@ -234,9 +234,9 @@ def build_pipeline_graph(deps: PipelineDeps):
         if state.get("error"):
             return END
         if state["stage_stats"].get("summarize", {}).get("aborted"):
-            # Cost cap hit: never proceed to a later LLM stage, but assemble
-            # is free and still worth running (see the module docstring's
-            # cost-cap discussion in pipeline/runner.py).
+            # Cost cap hit: never proceed to a later LLM stage (taxonomy,
+            # classify), but assemble is free (no LLM call) and still worth
+            # running -- it's the run's final consistency check.
             return "assemble"
         return "taxonomy"
 
