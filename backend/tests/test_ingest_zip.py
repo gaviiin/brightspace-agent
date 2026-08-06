@@ -40,7 +40,9 @@ def app(data_dir):
 
 @pytest.fixture
 def client(app):
-    return TestClient(app)
+    # Loopback Host, not TestClient's default "testserver" -- see
+    # test_health.py's LOOPBACK_BASE_URL for why.
+    return TestClient(app, base_url="http://127.0.0.1:8730")
 
 
 @pytest.fixture

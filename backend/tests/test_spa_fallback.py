@@ -37,7 +37,9 @@ def dist_dir(tmp_path, monkeypatch):
 def client(data_dir, dist_dir):
     from brightspace_agent.main import create_app
 
-    with TestClient(create_app()) as test_client:
+    # Loopback Host, not TestClient's default "testserver" -- see
+    # test_health.py's LOOPBACK_BASE_URL for why.
+    with TestClient(create_app(), base_url="http://127.0.0.1:8730") as test_client:
         yield test_client
 
 

@@ -53,7 +53,10 @@ def client(app):
     # run between two calls in the same test, e.g. the active-run-guard
     # test below. `with` keeps one portal alive for the fixture's scope,
     # matching how a real server actually behaves.
-    with TestClient(app) as test_client:
+    #
+    # base_url pins a loopback Host, not TestClient's default "testserver"
+    # -- see test_health.py's LOOPBACK_BASE_URL for why.
+    with TestClient(app, base_url="http://127.0.0.1:8730") as test_client:
         yield test_client
 
 
@@ -177,7 +180,54 @@ def test_material_file_streams_exact_bytes_with_mime(client, db_session_factory,
     assert resp.status_code == 200
     assert resp.content == data
     assert resp.headers["content-type"] == "application/pdf"
+    # PDFs stay inline: they're the only type the reader embeds, and the
+    # browser's PDF viewer isn't a script host.
     assert "inline" in resp.headers["content-disposition"]
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["content-security-policy"] == "sandbox"
+
+
+def test_material_file_serves_html_as_a_sandboxed_attachment(client, db_session_factory, blob_store):
+    """Hostile HTML must not execute on the backend's own origin.
+
+    /file used to stream every material with its stored mime and
+    `inline`, so a `text/html` course material ran as a page on
+    127.0.0.1:8730 -- same origin as GET /api/settings, which hands out the
+    pairing token (full ingest-API access). Anything that isn't a PDF is now
+    an opaque-typed attachment, nosniff'd, with a sandbox CSP.
+    """
+    course_id = _add_course(db_session_factory)
+    data = b"<script>fetch('/api/settings').then(r => r.text()).then(t => 1)</script>"
+    sha256, size = blob_store.put_bytes(data)
+    material_id = _add_material(
+        db_session_factory, course_id, kind="document", title="evil.html", mime="text/html",
+        sha256=sha256, size_bytes=size, status="extracted",
+    )
+
+    resp = client.get(f"/api/materials/{material_id}/file")
+
+    assert resp.status_code == 200
+    assert resp.content == data  # still served -- just never as a live page
+    assert resp.headers["content-type"] == "application/octet-stream"
+    assert resp.headers["content-disposition"].startswith("attachment")
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["content-security-policy"] == "sandbox"
+
+
+def test_material_file_pdf_with_charset_parameter_is_still_inline(client, db_session_factory, blob_store):
+    """A stored mime can carry parameters ("application/pdf; charset=..."),
+    which must not fall through to the attachment path."""
+    course_id = _add_course(db_session_factory)
+    sha256, size = blob_store.put_bytes(b"%PDF-1.4 x")
+    material_id = _add_material(
+        db_session_factory, course_id, kind="document", title="Notes.pdf",
+        mime="Application/PDF; charset=binary", sha256=sha256, size_bytes=size, status="extracted",
+    )
+
+    resp = client.get(f"/api/materials/{material_id}/file")
+
+    assert resp.headers["content-type"] == "application/pdf"
+    assert resp.headers["content-disposition"].startswith("inline")
 
 
 def test_material_text_returns_sidecar(client, db_session_factory, blob_store):

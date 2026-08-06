@@ -1,6 +1,10 @@
 """`GET /api/materials/{id}` (+ `/file`, `/text`): the frontend's material
 detail view, the raw blob (streamed, for previewing in an iframe), and its
 extracted-text sidecar.
+
+`/file` serves untrusted third-party bytes from this server's own origin,
+so how they're delivered is a security decision, not a convenience one --
+see `_file_delivery`.
 """
 
 from __future__ import annotations
@@ -100,12 +104,46 @@ def get_material_file(
         raise HTTPException(status_code=404, detail="no file for this material")
 
     filename = _CONTENT_DISPOSITION_UNSAFE.sub("", material.title or "material")
+    media_type, disposition = _file_delivery(material.mime)
     return StreamingResponse(
         blob_path.open("rb"),
-        media_type=material.mime or "application/octet-stream",
-        # inline (not attachment): the frontend previews this in an iframe.
-        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{filename}"',
+            # Never let a browser second-guess the declared type back into
+            # something scriptable.
+            "X-Content-Type-Options": "nosniff",
+            # `sandbox` with no tokens: even if something did render, it
+            # renders in an opaque origin with scripts, forms and top-level
+            # navigation disabled -- so it cannot reach this origin's own
+            # endpoints. Applied to every /file response, PDFs included
+            # (the browser's built-in PDF viewer is unaffected).
+            "Content-Security-Policy": "sandbox",
+        },
     )
+
+
+def _file_delivery(mime: str | None) -> tuple[str, str]:
+    """(media_type, content_disposition_type) for a stored blob.
+
+    Course materials are arbitrary files a tenant served us, and this route
+    hands them back on the BACKEND's own origin -- the same origin as
+    `GET /api/settings`, which returns the pairing token. Serving a
+    `text/html` material inline meant any HTML a course happened to contain
+    (or that anyone got into a course) executed with full read access to
+    that endpoint.
+
+    So: `application/pdf` alone keeps its real type and renders inline --
+    it's the only type the reader ever embeds (see the frontend's
+    `chooseReaderMode`), and the PDF viewer is not a script host. Everything
+    else is downgraded to `application/octet-stream` and marked
+    `attachment`, which the frontend's only other use of this route (an
+    `<a download>`) is happy with.
+    """
+    normalized = (mime or "").split(";")[0].strip().lower()
+    if normalized == "application/pdf":
+        return "application/pdf", "inline"
+    return "application/octet-stream", "attachment"
 
 
 @router.get("/{material_id}/text")

@@ -22,11 +22,16 @@ def data_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+# Loopback Host, not TestClient's default "testserver" -- see
+# test_health.py's LOOPBACK_BASE_URL for why.
+LOOPBACK_BASE_URL = "http://127.0.0.1:8730"
+
+
 @pytest.fixture
 def client(data_dir):
     from brightspace_agent.main import create_app
 
-    return TestClient(create_app())
+    return TestClient(create_app(), base_url=LOOPBACK_BASE_URL)
 
 
 def test_settings_shape_and_pairing_token_matches_config_toml(client, data_dir):
@@ -59,7 +64,7 @@ def test_settings_api_key_configured_true_but_key_material_never_serialized(monk
 
     secret = "sk-ant-super-secret-value-should-never-leak"  # pragma: allowlist secret
     monkeypatch.setenv("BSA_ANTHROPIC_API_KEY", secret)
-    client = TestClient(create_app())
+    client = TestClient(create_app(), base_url=LOOPBACK_BASE_URL)
 
     resp = client.get("/api/settings")
 

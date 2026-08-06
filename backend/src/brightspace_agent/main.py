@@ -6,6 +6,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from brightspace_agent import __version__
@@ -39,6 +40,22 @@ _CSRF_HEADER = "X-BSA-Request"
 _CSRF_EXEMPT_PREFIX = "/api/ingest/"
 _CSRF_GUARDED_METHODS = {"POST", "PUT", "DELETE"}
 
+# Anti-DNS-rebinding. Both guards above assume an attacker page is
+# cross-origin: CORS restricts who may read a response, and the CSRF header
+# survives because a browser won't attach it cross-origin without a
+# preflight the CORS policy denies. DNS rebinding breaks that assumption
+# outright -- the attacker points evil.example at 127.0.0.1, so the page IS
+# same-origin as this server, CORS never engages, and the page may freely
+# set X-BSA-Request: 1. It could then read GET /api/settings (which returns
+# the pairing token, i.e. full ingest-API access) and start real runs.
+#
+# The one thing a rebound request cannot forge is the Host header: the
+# browser sends the attacker's own hostname. Rejecting any Host that isn't
+# loopback closes the hole for every route at once, before routing.
+# Starlette compares the hostname only (the port is stripped), so any port
+# this server is configured on works.
+_ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
+
 
 def create_app() -> FastAPI:
     settings = Settings()
@@ -59,6 +76,12 @@ def create_app() -> FastAPI:
     app.state.event_bus = event_bus
     app.state.runner = runner
     app.state.settings = settings
+
+    # Registered before CORS/CSRF below, which (Starlette adds each new
+    # middleware *outside* the previous one) makes it the innermost of the
+    # three -- it still runs ahead of every route, which is all that
+    # matters: a rebound request never reaches a handler.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_ALLOWED_HOSTS)
 
     app.add_middleware(
         CORSMiddleware,
