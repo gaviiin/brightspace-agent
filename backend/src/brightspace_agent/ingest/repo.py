@@ -82,7 +82,10 @@ def upsert_modules_from_entries(session: Session, course_id: int, entries: list[
     """Upsert every module referenced by any entry's `module_chain`,
     preserving parent relationships and sibling order. Modules with no
     topics anywhere in their subtree are not represented in any chain and
-    so are not upserted (the ToC walk only reaches modules via topics)."""
+    so are not upserted (the ToC walk only reaches modules via topics).
+
+    Returns d2l_module_id -> Module, so callers can resolve a topic's
+    immediate parent module (see `resolve_module_id`)."""
     by_d2l_id: dict[int, Module] = {}
     for entry in entries:
         parent_db_id: int | None = None
@@ -97,12 +100,24 @@ def upsert_modules_from_entries(session: Session, course_id: int, entries: list[
     return by_d2l_id
 
 
+def resolve_module_id(entry: TocEntry, modules_by_d2l_id: dict[int, Module]) -> int | None:
+    """The DB id of `entry`'s immediate parent module, if it has one and it
+    was resolved by `upsert_modules_from_entries`."""
+    if not entry.module_chain:
+        return None
+    immediate = entry.module_chain[-1]
+    module = modules_by_d2l_id.get(immediate.d2l_module_id)
+    return module.id if module else None
+
+
 # --------------------------------------------------------------------------
 # Materials -- Link topics (created eagerly at /toc time)
 # --------------------------------------------------------------------------
 
 
-def upsert_link_material(session: Session, course_id: int, entry: TocEntry) -> Material:
+def upsert_link_material(
+    session: Session, course_id: int, entry: TocEntry, module_id: int | None = None
+) -> Material:
     material = session.execute(
         select(Material).where(Material.course_id == course_id, Material.d2l_topic_id == entry.topic_id)
     ).scalar_one_or_none()
@@ -110,6 +125,7 @@ def upsert_link_material(session: Session, course_id: int, entry: TocEntry) -> M
         material = Material(
             course_id=course_id,
             d2l_topic_id=entry.topic_id,
+            module_id=module_id,
             kind="link",
             title=entry.title,
             source_url=entry.url,
@@ -117,10 +133,53 @@ def upsert_link_material(session: Session, course_id: int, entry: TocEntry) -> M
         )
         session.add(material)
     else:
+        material.module_id = module_id
         material.kind = "link"
         material.title = entry.title
         material.source_url = entry.url
         material.status = "fetched"
+    session.flush()
+    return material
+
+
+# --------------------------------------------------------------------------
+# Materials -- File topics (stub row created eagerly at /toc time, so /file
+# always has an existing row to update in place -- see upsert_file_material
+# below for the fetch-time half)
+# --------------------------------------------------------------------------
+
+
+def upsert_file_stub_material(
+    session: Session, course_id: int, entry: TocEntry, module_id: int | None = None
+) -> Material:
+    """Ensure a materials row exists for a File-type ToC entry.
+
+    Only refreshes metadata that's safe to touch without clobbering fetch
+    state (module, title, source_url) -- sha256/mime/size_bytes/status/
+    summary/error are left exactly as they are for a row that's already
+    been fetched via /file. For a genuinely new row, sha256 stays NULL
+    until /file uploads it; `compute_needed`'s "stored d2l_updated_at is
+    null" rule already treats that as needed, so this doesn't change
+    diff behavior.
+    """
+    material = session.execute(
+        select(Material).where(Material.course_id == course_id, Material.d2l_topic_id == entry.topic_id)
+    ).scalar_one_or_none()
+    if material is None:
+        material = Material(
+            course_id=course_id,
+            d2l_topic_id=entry.topic_id,
+            module_id=module_id,
+            kind=infer_kind(entry.title, entry.url),
+            title=entry.title,
+            source_url=entry.url,
+            status="fetched",
+        )
+        session.add(material)
+    else:
+        material.module_id = module_id
+        material.title = entry.title
+        material.source_url = entry.url
     session.flush()
     return material
 
@@ -163,7 +222,12 @@ def upsert_text_material(
 
 
 # --------------------------------------------------------------------------
-# Materials -- File topics (created/updated on /file upload)
+# Materials -- File topics, fetch-time half: /file upserts the byte-level
+# fields onto the row `upsert_file_stub_material` already created at /toc
+# time. `material is None` should no longer fire in the normal flow (a stub
+# always exists by the time /file runs), but the create branch is kept for
+# robustness -- e.g. a /file call against a course that predates this stub
+# behavior, or any other path that reaches /file without a prior /toc.
 # --------------------------------------------------------------------------
 
 

@@ -248,12 +248,30 @@ def test_toc_happy_path_modules_materials_and_needed(client, auth_headers, db_se
         assert link_material.kind == "link"
         assert link_material.status == "fetched"
         assert link_material.source_url == "https://en.wikipedia.org/wiki/Big_O_notation"
+        assert link_material.module_id == modules[100].id  # Link topic 1003 lives in Week 1
 
-        # File topics are NOT materialized until /file upload happens.
-        file_material = session.execute(
-            select(Material).where(Material.course_id == course_id, Material.d2l_topic_id == 1001)
-        ).scalar_one_or_none()
-        assert file_material is None
+        # File topics get a stub material row at /toc time too (module_id
+        # set, sha256 still NULL until /file uploads it), so /file can
+        # always update in place instead of inserting a second row.
+        file_materials = {
+            m.d2l_topic_id: m
+            for m in session.execute(
+                select(Material).where(
+                    Material.course_id == course_id, Material.d2l_topic_id.in_(ALL_FILE_TOPIC_IDS)
+                )
+            ).scalars()
+        }
+        assert file_materials.keys() == ALL_FILE_TOPIC_IDS
+        for material in file_materials.values():
+            assert material.sha256 is None
+            assert material.status == "fetched"
+
+        assert file_materials[1001].module_id == modules[100].id  # syllabus.pdf, Week 1
+        assert file_materials[1001].kind == "syllabus"
+        assert file_materials[1004].module_id == modules[200].id  # lecture2.pptx, Week 2
+        assert file_materials[1004].kind == "slides"
+        assert file_materials[1005].module_id == modules[210].id  # lab1.pdf, Labs
+        assert file_materials[1005].kind == "document"
 
 
 # --------------------------------------------------------------------------
@@ -336,6 +354,34 @@ def test_file_upload_stores_blob_and_material(client, auth_headers, db_session_f
     assert resp2.status_code == 200
     assert resp2.json()["deduped"] is True
     assert resp2.json()["materialId"] == body["materialId"]
+
+
+def test_file_upload_fills_in_toc_time_stub_without_duplicate_row(client, auth_headers, db_session_factory):
+    course_id = handshake(client, auth_headers)
+    sync_run_id = post_toc(client, auth_headers, load_toc()).json()["syncRunId"]
+
+    with db_session_factory() as session:
+        stub = session.execute(
+            select(Material).where(Material.course_id == course_id, Material.d2l_topic_id == 1001)
+        ).scalar_one()
+        stub_id = stub.id
+        assert stub.sha256 is None
+        assert stub.module_id is not None
+
+    data = b"the actual syllabus bytes"
+    resp = upload_file(client, auth_headers, sync_run_id, 1001, data, title="Course Syllabus")
+    assert resp.status_code == 200
+    assert resp.json()["deduped"] is False
+    assert resp.json()["materialId"] == stub_id  # updated in place, not a new row
+
+    with db_session_factory() as session:
+        rows = session.execute(
+            select(Material).where(Material.course_id == course_id, Material.d2l_topic_id == 1001)
+        ).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].id == stub_id
+        assert rows[0].sha256 == hashlib.sha256(data).hexdigest()
+        assert rows[0].module_id is not None
 
 
 def test_file_upload_decodes_percent_encoded_title(client, auth_headers, db_session_factory):

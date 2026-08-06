@@ -146,11 +146,18 @@ def ingest_toc(
     course.last_synced_at = repo.now_iso()
 
     entries = parse_toc(payload.toc)
-    repo.upsert_modules_from_entries(session, course.id, entries)
+    modules_by_d2l_id = repo.upsert_modules_from_entries(session, course.id, entries)
 
     for entry in entries:
+        module_id = repo.resolve_module_id(entry, modules_by_d2l_id)
         if entry.type_identifier == "Link":
-            repo.upsert_link_material(session, course.id, entry)
+            repo.upsert_link_material(session, course.id, entry, module_id)
+        elif is_file_topic(entry):
+            # Stub the material row now (module/title/source_url; sha256
+            # stays NULL until /file uploads it) so the upload endpoint
+            # always updates an existing row instead of creating one, and
+            # so File materials carry module_id like Link materials do.
+            repo.upsert_file_stub_material(session, course.id, entry, module_id)
 
     file_topic_count = sum(1 for e in entries if is_file_topic(e))
     needed_entries = compute_needed(session, course.id, entries)
