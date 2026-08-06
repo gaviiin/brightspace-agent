@@ -41,9 +41,9 @@ export class RateLimitError extends Error {
 export interface RateLimitedFetcherOptions {
   /** Max in-flight requests at once. Default 2. */
   maxConcurrent?: number;
-  /** Total attempts per request (initial try + retries) before giving up on
-   * repeated 429s. Default 3. */
-  maxRetries?: number;
+  /** Total HTTP attempts per request (including the first try) before
+   * giving up on repeated 429s. Default 3. */
+  maxAttempts?: number;
   /** X-Rate-Limit-Remaining below this triggers a shared cooldown. Default 20. */
   minRemainingThreshold?: number;
   /** Base delay (ms) for the cooldown and the exponential backoff. Default 1000. */
@@ -66,7 +66,7 @@ const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => set
  */
 export class RateLimitedFetcher {
   private readonly maxConcurrent: number;
-  private readonly maxRetries: number;
+  private readonly maxAttempts: number;
   private readonly minRemainingThreshold: number;
   private readonly baseBackoffMs: number;
   private readonly fetchImpl: typeof fetch;
@@ -82,7 +82,7 @@ export class RateLimitedFetcher {
 
   constructor(options: RateLimitedFetcherOptions = {}) {
     this.maxConcurrent = options.maxConcurrent ?? 2;
-    this.maxRetries = options.maxRetries ?? 3;
+    this.maxAttempts = options.maxAttempts ?? 3;
     this.minRemainingThreshold = options.minRemainingThreshold ?? 20;
     this.baseBackoffMs = options.baseBackoffMs ?? 1000;
     this.fetchImpl = options.fetchImpl ?? fetch;
@@ -118,7 +118,7 @@ export class RateLimitedFetcher {
   }
 
   private async requestWithRetry(input: string, init: RequestInit | undefined): Promise<Response> {
-    for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+    for (let attempt = 0; attempt < this.maxAttempts; attempt++) {
       if (this.cooldown) {
         await this.cooldown;
       }
@@ -135,7 +135,7 @@ export class RateLimitedFetcher {
         return response;
       }
 
-      const isLastAttempt = attempt === this.maxRetries - 1;
+      const isLastAttempt = attempt === this.maxAttempts - 1;
       if (isLastAttempt) {
         break;
       }
@@ -146,7 +146,7 @@ export class RateLimitedFetcher {
       await this.sleepImpl(delayMs);
     }
 
-    throw new RateLimitError(`D2L rate limit exceeded after ${this.maxRetries} attempts`);
+    throw new RateLimitError(`D2L rate limit exceeded after ${this.maxAttempts} attempts`);
   }
 
   private maybeStartCooldown(response: Response): void {

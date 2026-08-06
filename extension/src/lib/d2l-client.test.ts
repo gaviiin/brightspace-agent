@@ -36,6 +36,15 @@ async function waitUntil(predicate: () => boolean, maxTicks = 200): Promise<void
   }
 }
 
+/** Flush a fixed number of microtask ticks — no real timers — to give a
+ * (possibly broken) gate every reasonable chance to advance before we
+ * assert it didn't. */
+async function flushMicrotasks(ticks = 20): Promise<void> {
+  for (let i = 0; i < ticks; i++) {
+    await Promise.resolve();
+  }
+}
+
 function courseEnrollment(id: number, typeCode = "Course Offering"): D2LEnrollmentItem {
   return {
     OrgUnit: {
@@ -179,20 +188,20 @@ describe("RateLimitedFetcher retry/backoff", () => {
     expect(sleepImpl).toHaveBeenCalledWith(2000);
   });
 
-  it("uses jittered exponential backoff without Retry-After, throwing RateLimitError once maxRetries is exhausted", async () => {
+  it("uses jittered exponential backoff without Retry-After, throwing RateLimitError once maxAttempts is exhausted", async () => {
     const sleepImpl = vi.fn().mockResolvedValue(undefined);
     const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 429 }));
     const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
     const fetcher = new RateLimitedFetcher({
       fetchImpl,
       sleepImpl,
-      maxRetries: 3,
+      maxAttempts: 3,
       baseBackoffMs: 1000,
     });
 
     await expect(fetcher.fetch("https://x.example/y")).rejects.toBeInstanceOf(RateLimitError);
 
-    // 3 attempts total (maxRetries), 2 backoff sleeps between them.
+    // 3 HTTP attempts total (maxAttempts, including the first try), 2 backoff sleeps between them.
     expect(fetchImpl).toHaveBeenCalledTimes(3);
     expect(sleepImpl).toHaveBeenCalledTimes(2);
     expect(sleepImpl).toHaveBeenNthCalledWith(1, 500); // 0.5 * 1000 * 2^0
@@ -265,8 +274,17 @@ describe("RateLimitedFetcher concurrency cap", () => {
 });
 
 describe("RateLimitedFetcher rate-limit cooldown", () => {
-  it("delays subsequent requests once, sharing a single cooldown, when X-Rate-Limit-Remaining is low", async () => {
-    const sleepImpl = vi.fn().mockResolvedValue(undefined);
+  it("blocks the next request until the cooldown resolves, sharing one cooldown across requests", async () => {
+    // A controllable (non-auto-resolving) sleepImpl: fetchImpl for a queued
+    // request must NOT be called while this promise is still pending, which
+    // is the actual safety property the cooldown provides. An
+    // auto-resolving sleepImpl can't prove that — it can't distinguish
+    // "waited for the cooldown" from "the gate was never there".
+    let resolveCooldown!: () => void;
+    const cooldownPromise = new Promise<void>((resolve) => {
+      resolveCooldown = resolve;
+    });
+    const sleepImpl = vi.fn().mockReturnValue(cooldownPromise);
     const fetchImpl = vi
       .fn()
       .mockResolvedValueOnce(
@@ -281,12 +299,26 @@ describe("RateLimitedFetcher rate-limit cooldown", () => {
       baseBackoffMs: 1000,
     });
 
+    // Request 1 reports low remaining and completes normally — the cooldown
+    // delays *subsequent* requests, not the one that reported it.
     await fetcher.fetch("https://x.example/1");
-    await fetcher.fetch("https://x.example/2");
-    await fetcher.fetch("https://x.example/3");
-
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(sleepImpl).toHaveBeenCalledWith(1000);
-    // Shared cooldown, not per-request: only one cooldown sleep for the two
+
+    // Requests 2 and 3 start while the cooldown is still pending.
+    const request2 = fetcher.fetch("https://x.example/2");
+    const request3 = fetcher.fetch("https://x.example/3");
+    await flushMicrotasks(50);
+
+    // The cooldown must still be gating them: if `await this.cooldown` were
+    // missing (or a no-op), fetchImpl would already have been called here.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+    resolveCooldown();
+    await Promise.all([request2, request3]);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    // Shared cooldown, not per-request: only one cooldown sleep for both
     // requests that came after the low-remaining response.
     expect(sleepImpl).toHaveBeenCalledTimes(1);
   });
