@@ -246,6 +246,40 @@ describe("syncCourse", () => {
       extras: { news: newsItems, dropbox: dropboxItems },
     });
   });
+
+  it("SessionExpiredError from discoverVersions (session already dead before /toc) pauses instead of throwing", async () => {
+    const d2l = makeFakeD2L({
+      discoverVersions: vi.fn().mockRejectedValue(new SessionExpiredError("dead on arrival")),
+    });
+    const backend = makeFakeBackend();
+    const { deps, saveState } = makeDeps(d2l, backend);
+
+    const state = await syncCourse(deps, "https://tenant.example", 555);
+
+    expect(state.phase).toBe("needs-login");
+    expect(state.syncRunId).toBeNull();
+    expect(state.orgUnitId).toBe(555);
+    expect(backend.toc).not.toHaveBeenCalled();
+    expect(backend.complete).not.toHaveBeenCalled();
+    expect(saveState).toHaveBeenLastCalledWith(
+      expect.objectContaining({ phase: "needs-login", syncRunId: null, orgUnitId: 555 }),
+    );
+  });
+
+  it("SessionExpiredError from courseToc (session dies after discoverVersions but before /toc) pauses instead of throwing", async () => {
+    const d2l = makeFakeD2L({
+      courseToc: vi.fn().mockRejectedValue(new SessionExpiredError("expired mid-toc")),
+    });
+    const backend = makeFakeBackend();
+    const { deps } = makeDeps(d2l, backend);
+
+    const state = await syncCourse(deps, "https://tenant.example", 42);
+
+    expect(state.phase).toBe("needs-login");
+    expect(state.syncRunId).toBeNull();
+    expect(backend.toc).not.toHaveBeenCalled();
+    expect(backend.complete).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -283,5 +317,59 @@ describe("resume", () => {
     expect(state.done).toBe(3);
     expect(state.total).toBe(3);
     expect(state.queue).toEqual([]);
+  });
+
+  it("SessionExpiredError from discoverVersions pauses again without throwing: queue intact, no uploads attempted", async () => {
+    const remaining = [makeItem(2), makeItem(3)];
+    const priorState: SyncState = {
+      syncRunId: 9,
+      orgUnitId: 1,
+      queue: remaining,
+      done: 1,
+      total: 3,
+      errors: [],
+      phase: "needs-login",
+    };
+    const d2l = makeFakeD2L({
+      discoverVersions: vi.fn().mockRejectedValue(new SessionExpiredError("still expired")),
+    });
+    const backend = makeFakeBackend();
+    const { deps, saveState } = makeDeps(d2l, backend);
+
+    const state = await resume(deps, "https://tenant.example", priorState);
+
+    expect(state.phase).toBe("needs-login");
+    expect(state.syncRunId).toBe(9);
+    expect(state.queue).toEqual(remaining);
+    expect(d2l.fetchTopicFile).not.toHaveBeenCalled();
+    expect(backend.uploadFile).not.toHaveBeenCalled();
+    expect(backend.toc).not.toHaveBeenCalled();
+    expect(backend.complete).not.toHaveBeenCalled();
+    expect(saveState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: "needs-login", syncRunId: 9 }));
+  });
+
+  it("with syncRunId null (never established), retries syncCourse from scratch instead of draining an empty queue", async () => {
+    const priorState: SyncState = {
+      syncRunId: null,
+      orgUnitId: 7,
+      queue: [],
+      done: 0,
+      total: 0,
+      errors: [],
+      phase: "needs-login",
+    };
+    const items = [makeItem(1)];
+    const d2l = makeFakeD2L();
+    const backend = makeFakeBackend({ toc: vi.fn().mockResolvedValue({ syncRunId: 100, needed: items }) });
+    const { deps } = makeDeps(d2l, backend);
+
+    const state = await resume(deps, "https://tenant.example", priorState);
+
+    // A full syncCourse pipeline ran (courseToc/toc, not just a drain of
+    // the empty persisted queue) and got a real syncRunId this time.
+    expect(backend.toc).toHaveBeenCalledWith(expect.objectContaining({ orgUnitId: 7 }));
+    expect(state.syncRunId).toBe(100);
+    expect(state.phase).toBe("complete");
+    expect(backend.complete).toHaveBeenCalledWith({ syncRunId: 100, errors: [] });
   });
 });
