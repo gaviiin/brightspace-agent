@@ -452,6 +452,29 @@ def test_rerun_with_unchanged_inputs_reuses_cache_and_writes_a_new_version(
     assert len(cache_rows_after) == 1  # the hit did not insert a duplicate
 
 
+def test_unparseable_cache_row_is_replaced_rather_than_wedging_the_stage(
+    session_factory, blob_store, backend, course_id
+):
+    _seed_course_content(session_factory, blob_store, course_id)
+    counting = _CountingBackend(backend)
+    _run(session_factory, counting, course_id, blob_store)
+
+    with session_factory() as session:
+        row = session.execute(select(LlmCache).where(LlmCache.stage == "taxonomy")).scalar_one()
+        row.output_json = "{not json at all"
+        session.commit()
+
+    stats = _run(session_factory, counting, course_id, blob_store)
+
+    assert counting.calls == 2  # treated as a miss, not an unrecoverable error
+    assert stats.cached_hits == 0
+    assert stats.topics == 4
+    with session_factory() as session:
+        rows = list(session.execute(select(LlmCache).where(LlmCache.stage == "taxonomy")).scalars().all())
+    assert len(rows) == 1  # the poisoned row was overwritten, not duplicated
+    assert json.loads(rows[0].output_json)["topics"]
+
+
 def test_changed_inputs_miss_the_cache(session_factory, blob_store, backend, course_id):
     _seed_course_content(session_factory, blob_store, course_id)
     counting = _CountingBackend(backend)

@@ -150,6 +150,8 @@ def _run_sync(
             # `on_conflict_do_update`, not a plain insert: reaching here with a
             # row already present means the stored proposal was unparseable
             # (see `_parse_cached`), so the fresh one should replace it.
+            output_json = json.dumps(proposal.model_dump())
+            created_at = _now_iso()
             session.execute(
                 sqlite_insert(LlmCache)
                 .values(
@@ -157,12 +159,12 @@ def _run_sync(
                     stage=_STAGE,
                     prompt_version=PROMPT_VERSION,
                     model=model,
-                    output_json=json.dumps(proposal.model_dump()),
-                    created_at=_now_iso(),
+                    output_json=output_json,
+                    created_at=created_at,
                 )
                 .on_conflict_do_update(
                     index_elements=["sha256", "stage", "prompt_version", "model"],
-                    set_={"output_json": json.dumps(proposal.model_dump()), "created_at": _now_iso()},
+                    set_={"output_json": output_json, "created_at": created_at},
                 )
             )
         session.commit()
