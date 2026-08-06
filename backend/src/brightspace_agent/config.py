@@ -6,17 +6,29 @@ import tomllib
 from pathlib import Path
 
 import tomli_w
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 CONFIG_FILENAME = "config.toml"
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="BSA_")
+    model_config = SettingsConfigDict(env_prefix="BSA_", populate_by_name=True)
 
     data_dir: Path = Path("~/.brightspace-agent").expanduser()
     host: str = "127.0.0.1"
     port: int = 8730
+
+    # LLM layer (agents/llm.py). `anthropic_api_key` also honors the plain
+    # `ANTHROPIC_API_KEY` env var (the SDK/CLI convention), with the
+    # `BSA_`-prefixed name taking precedence if both are set.
+    anthropic_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("BSA_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+    )
+    fast_model: str = "claude-haiku-4-5-20251001"
+    smart_model: str = "claude-sonnet-5"
+    mock_llm: bool = False
 
     @property
     def db_path(self) -> Path:
