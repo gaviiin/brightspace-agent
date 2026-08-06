@@ -1,0 +1,545 @@
+"""Tests for the extension-facing ingest API: handshake, toc/diff, streamed
+file upload, and completion, all gated behind the pairing-token dependency.
+"""
+
+import copy
+import hashlib
+import json
+import tomllib
+from pathlib import Path
+from urllib.parse import quote
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+
+from brightspace_agent.db.models import Course, Material, Module, SyncRun
+from brightspace_agent.ingest.diff import infer_kind
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures" / "d2l"
+
+ORG_UNIT_ID = 555
+ALL_FILE_TOPIC_IDS = {1001, 1002, 1004, 1005, 1006}
+LINK_TOPIC_ID = 1003
+
+
+def load_toc() -> dict:
+    return json.loads((FIXTURES_DIR / "toc_sample.json").read_text())
+
+
+def find_topic(toc: dict, topic_id: int) -> dict:
+    """Recursively find a topic dict by TopicId within a ToC fixture."""
+    for module in toc.get("Modules", []):
+        for topic in module.get("Topics", []):
+            if topic.get("TopicId") == topic_id:
+                return topic
+        found = find_topic(module, topic_id)
+        if found is not None:
+            return found
+    return None
+
+
+# --------------------------------------------------------------------------
+# Fixtures
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def data_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("BSA_DATA_DIR", str(tmp_path))
+    return tmp_path
+
+
+@pytest.fixture
+def app(data_dir):
+    from brightspace_agent.main import create_app
+
+    return create_app()
+
+
+@pytest.fixture
+def client(app):
+    return TestClient(app)
+
+
+@pytest.fixture
+def pairing_token(data_dir):
+    config = tomllib.loads((data_dir / "config.toml").read_text())
+    return config["pairing_token"]
+
+
+@pytest.fixture
+def auth_headers(pairing_token):
+    return {"Authorization": f"Bearer {pairing_token}"}
+
+
+@pytest.fixture
+def db_session_factory(data_dir):
+    from brightspace_agent.db.session import init_db
+
+    _, session_factory = init_db(data_dir / "brightspace.db")
+    return session_factory
+
+
+def handshake(client, auth_headers, org_unit_id=ORG_UNIT_ID, name="Intro to CS", code="CS101"):
+    resp = client.post(
+        "/api/ingest/handshake",
+        headers=auth_headers,
+        json={
+            "tenantOrigin": "https://school.d2l.com",
+            "apiVersions": {"le": "1.79", "lp": "1.35"},
+            "whoami": {"Identifier": "999", "UniqueName": "gavin"},
+            "enrollments": [{"orgUnitId": org_unit_id, "name": name, "code": code}],
+        },
+    )
+    assert resp.status_code == 200
+    return resp.json()["knownCourses"][0]["courseId"]
+
+
+def post_toc(client, auth_headers, toc, org_unit_id=ORG_UNIT_ID, extras=None):
+    return client.post(
+        "/api/ingest/toc",
+        headers=auth_headers,
+        json={"orgUnitId": org_unit_id, "toc": toc, "extras": extras},
+    )
+
+
+def upload_file(client, auth_headers, sync_run_id, d2l_topic_id, data, *, source_url="https://x/f.pdf",
+                 title="A File", content_type="application/pdf", d2l_updated=None):
+    headers = {**auth_headers, "X-Source-Url": source_url, "X-Title": title, "Content-Type": content_type}
+    if d2l_updated is not None:
+        headers["X-D2L-Updated"] = d2l_updated
+    return client.post(
+        f"/api/ingest/file?syncRunId={sync_run_id}&d2lTopicId={d2l_topic_id}",
+        headers=headers,
+        content=data,
+    )
+
+
+# --------------------------------------------------------------------------
+# 1. Auth
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path,body_kwargs",
+    [
+        ("/api/ingest/handshake", {"json": {"tenantOrigin": "x", "apiVersions": {}, "whoami": {}, "enrollments": []}}),
+        ("/api/ingest/toc", {"json": {"orgUnitId": 1, "toc": {}, "extras": None}}),
+        ("/api/ingest/file?syncRunId=1&d2lTopicId=1", {"content": b"data"}),
+        ("/api/ingest/complete", {"json": {"syncRunId": 1, "errors": []}}),
+    ],
+)
+def test_ingest_routes_require_pairing_token(client, path, body_kwargs):
+    no_auth = client.post(path, **body_kwargs)
+    assert no_auth.status_code == 401
+    assert no_auth.json()["detail"] == "invalid pairing token"
+
+    wrong_auth = client.post(path, headers={"Authorization": "Bearer wrong-token"}, **body_kwargs)
+    assert wrong_auth.status_code == 401
+    assert wrong_auth.json()["detail"] == "invalid pairing token"
+
+
+# --------------------------------------------------------------------------
+# 2. Handshake
+# --------------------------------------------------------------------------
+
+
+def test_handshake_upserts_courses_and_updates_names_on_repeat(client, auth_headers, db_session_factory):
+    resp = client.post(
+        "/api/ingest/handshake",
+        headers=auth_headers,
+        json={
+            "tenantOrigin": "https://school.d2l.com",
+            "apiVersions": {"le": "1.79"},
+            "whoami": {"Identifier": "1"},
+            "enrollments": [
+                {"orgUnitId": 100, "name": "Course A", "code": "CS100"},
+                {"orgUnitId": 200, "name": "Course B", "code": None},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["knownCourses"]) == 2
+    ids_first = {c["orgUnitId"]: c["courseId"] for c in body["knownCourses"]}
+
+    with db_session_factory() as session:
+        assert session.execute(select(Course)).scalars().all().__len__() == 2
+
+    resp2 = client.post(
+        "/api/ingest/handshake",
+        headers=auth_headers,
+        json={
+            "tenantOrigin": "https://school.d2l.com",
+            "apiVersions": {},
+            "whoami": {},
+            "enrollments": [
+                {"orgUnitId": 100, "name": "Course A Renamed", "code": "CS100"},
+                {"orgUnitId": 200, "name": "Course B", "code": "BIO200"},
+            ],
+        },
+    )
+    assert resp2.status_code == 200
+    body2 = resp2.json()
+    assert len(body2["knownCourses"]) == 2
+    ids_second = {c["orgUnitId"]: c["courseId"] for c in body2["knownCourses"]}
+    assert ids_second == ids_first  # upsert, not duplicate rows
+
+    names = {c["orgUnitId"]: c["name"] for c in body2["knownCourses"]}
+    assert names[100] == "Course A Renamed"
+
+    with db_session_factory() as session:
+        assert session.execute(select(Course)).scalars().all().__len__() == 2
+
+
+# --------------------------------------------------------------------------
+# 3. toc on unknown course
+# --------------------------------------------------------------------------
+
+
+def test_toc_unknown_org_unit_returns_404(client, auth_headers):
+    resp = post_toc(client, auth_headers, {"Modules": []}, org_unit_id=99999)
+    assert resp.status_code == 404
+
+
+# --------------------------------------------------------------------------
+# 4. toc happy path
+# --------------------------------------------------------------------------
+
+
+def test_toc_happy_path_modules_materials_and_needed(client, auth_headers, db_session_factory):
+    course_id = handshake(client, auth_headers)
+
+    resp = post_toc(client, auth_headers, load_toc())
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert "syncRunId" in body
+    assert isinstance(body["syncRunId"], int)
+
+    needed = body["needed"]
+    needed_ids = {item["d2lTopicId"] for item in needed}
+    assert needed_ids == ALL_FILE_TOPIC_IDS  # fresh course: every File topic is needed
+
+    for item in needed:
+        assert set(item.keys()) == {"d2lTopicId", "url", "title", "sizeHint"}
+
+    with db_session_factory() as session:
+        modules = {m.d2l_module_id: m for m in session.execute(
+            select(Module).where(Module.course_id == course_id)
+        ).scalars()}
+
+        assert modules.keys() == {100, 200, 210}
+        assert modules[100].parent_id is None
+        assert modules[100].sort_order == 0
+        assert modules[100].title == "Week 1 — Intro"
+
+        assert modules[200].parent_id is None
+        assert modules[200].sort_order == 1
+
+        assert modules[210].parent_id == modules[200].id
+        assert modules[210].sort_order == 0
+        assert modules[210].title == "Labs"
+
+        link_material = session.execute(
+            select(Material).where(Material.course_id == course_id, Material.d2l_topic_id == LINK_TOPIC_ID)
+        ).scalar_one()
+        assert link_material.kind == "link"
+        assert link_material.status == "fetched"
+        assert link_material.source_url == "https://en.wikipedia.org/wiki/Big_O_notation"
+
+        # File topics are NOT materialized until /file upload happens.
+        file_material = session.execute(
+            select(Material).where(Material.course_id == course_id, Material.d2l_topic_id == 1001)
+        ).scalar_one_or_none()
+        assert file_material is None
+
+
+# --------------------------------------------------------------------------
+# 5. diff behavior
+# --------------------------------------------------------------------------
+
+
+def test_diff_excludes_unchanged_and_includes_bumped_material(client, auth_headers, db_session_factory):
+    course_id = handshake(client, auth_headers)
+    toc = load_toc()
+    lecture1_last_modified = find_topic(toc, 1002)["LastModifiedDate"]
+
+    with db_session_factory() as session:
+        session.add(Material(
+            course_id=course_id,
+            d2l_topic_id=1002,
+            kind="document",
+            title="Lecture 1 — Overview",
+            d2l_updated_at=lecture1_last_modified,
+        ))
+        session.commit()
+
+    resp = post_toc(client, auth_headers, toc)
+    needed_ids = {item["d2lTopicId"] for item in resp.json()["needed"]}
+    assert 1002 not in needed_ids
+    assert needed_ids == ALL_FILE_TOPIC_IDS - {1002}
+
+    with db_session_factory() as session:
+        sync_run = session.get(SyncRun, resp.json()["syncRunId"])
+        assert json.loads(sync_run.stats_json)["notNeeded"] == 1  # lecture1 skipped
+
+    bumped_toc = copy.deepcopy(toc)
+    find_topic(bumped_toc, 1002)["LastModifiedDate"] = "2026-02-01T00:00:00.000Z"
+
+    resp2 = post_toc(client, auth_headers, bumped_toc)
+    needed_ids2 = {item["d2lTopicId"] for item in resp2.json()["needed"]}
+    assert 1002 in needed_ids2
+
+
+# --------------------------------------------------------------------------
+# 6. file upload
+# --------------------------------------------------------------------------
+
+
+def test_file_upload_stores_blob_and_material(client, auth_headers, db_session_factory, data_dir):
+    handshake(client, auth_headers)
+    sync_run_id = post_toc(client, auth_headers, load_toc()).json()["syncRunId"]
+
+    data = b"%PDF-1.4 fake syllabus content"
+    resp = upload_file(
+        client, auth_headers, sync_run_id, 1001, data,
+        source_url="https://school.d2l.com/.../syllabus.pdf",
+        title="Course Syllabus",
+        content_type="application/pdf",
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deduped"] is False
+    expected_sha = hashlib.sha256(data).hexdigest()
+    assert body["sha256"] == expected_sha
+
+    blob_path = data_dir / "blobs" / expected_sha[:2] / expected_sha
+    assert blob_path.exists()
+    assert blob_path.read_bytes() == data
+
+    with db_session_factory() as session:
+        material = session.get(Material, body["materialId"])
+        assert material.sha256 == expected_sha
+        assert material.mime == "application/pdf"
+        assert material.size_bytes == len(data)
+        assert material.title == "Course Syllabus"
+        assert material.source_url == "https://school.d2l.com/.../syllabus.pdf"
+        assert material.d2l_topic_id == 1001
+
+    # Re-upload identical bytes -> deduped.
+    resp2 = upload_file(
+        client, auth_headers, sync_run_id, 1001, data,
+        source_url="https://school.d2l.com/.../syllabus.pdf", title="Course Syllabus",
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["deduped"] is True
+    assert resp2.json()["materialId"] == body["materialId"]
+
+
+def test_file_upload_decodes_percent_encoded_title(client, auth_headers, db_session_factory):
+    handshake(client, auth_headers)
+    sync_run_id = post_toc(client, auth_headers, load_toc()).json()["syncRunId"]
+
+    title = "Café Notes.pdf"
+    resp = upload_file(
+        client, auth_headers, sync_run_id, 1001, b"bytes",
+        title=quote(title),
+    )
+    assert resp.status_code == 200
+
+    with db_session_factory() as session:
+        material = session.get(Material, resp.json()["materialId"])
+        assert material.title == title
+
+
+def test_file_upload_unknown_sync_run_404(client, auth_headers):
+    resp = upload_file(client, auth_headers, 999999, 1001, b"data")
+    assert resp.status_code == 404
+
+
+def test_file_upload_completed_sync_run_409(client, auth_headers):
+    handshake(client, auth_headers)
+    sync_run_id = post_toc(client, auth_headers, load_toc()).json()["syncRunId"]
+    client.post("/api/ingest/complete", headers=auth_headers, json={"syncRunId": sync_run_id, "errors": []})
+
+    resp = upload_file(client, auth_headers, sync_run_id, 1001, b"data")
+    assert resp.status_code == 409
+
+
+# --------------------------------------------------------------------------
+# 7. status rule
+# --------------------------------------------------------------------------
+
+
+def test_file_upload_status_rule_preserves_progress_unless_bytes_change(client, auth_headers, db_session_factory):
+    handshake(client, auth_headers)
+    sync_run_id = post_toc(client, auth_headers, load_toc()).json()["syncRunId"]
+
+    data = b"original bytes"
+    resp = upload_file(client, auth_headers, sync_run_id, 1001, data)
+    material_id = resp.json()["materialId"]
+
+    with db_session_factory() as session:
+        material = session.get(Material, material_id)
+        material.status = "summarized"
+        material.summary = "a summary"
+        session.commit()
+
+    # Same bytes re-uploaded: status/summary untouched.
+    upload_file(client, auth_headers, sync_run_id, 1001, data)
+    with db_session_factory() as session:
+        material = session.get(Material, material_id)
+        assert material.status == "summarized"
+        assert material.summary == "a summary"
+
+    # Different bytes: status resets, summary cleared.
+    upload_file(client, auth_headers, sync_run_id, 1001, b"different bytes")
+    with db_session_factory() as session:
+        material = session.get(Material, material_id)
+        assert material.status == "fetched"
+        assert material.summary is None
+
+
+# --------------------------------------------------------------------------
+# 8. complete
+# --------------------------------------------------------------------------
+
+
+def test_complete_finalizes_with_stats_and_is_idempotent(client, auth_headers):
+    handshake(client, auth_headers)
+    sync_run_id = post_toc(client, auth_headers, load_toc()).json()["syncRunId"]
+
+    data1 = b"file one bytes"
+    data2 = b"file two bytes longer"
+    upload_file(client, auth_headers, sync_run_id, 1001, data1)
+    upload_file(client, auth_headers, sync_run_id, 1002, data2)
+
+    resp = client.post("/api/ingest/complete", headers=auth_headers, json={"syncRunId": sync_run_id, "errors": []})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "complete"
+    assert body["stats"]["files"] == 2
+    assert body["stats"]["bytes"] == len(data1) + len(data2)
+    assert body["stats"]["errors"] == []
+    assert body["stats"]["notNeeded"] == 0  # fresh course: nothing was already up to date
+
+    resp2 = client.post(
+        "/api/ingest/complete",
+        headers=auth_headers,
+        json={"syncRunId": sync_run_id, "errors": [{"d2lTopicId": 1, "message": "ignored, run already finished"}]},
+    )
+    assert resp2.status_code == 200
+    assert resp2.json() == body  # second call is a no-op, returns existing finalized state
+
+
+def test_complete_with_errors_marks_failed(client, auth_headers):
+    handshake(client, auth_headers)
+    sync_run_id = post_toc(client, auth_headers, load_toc()).json()["syncRunId"]
+
+    resp = client.post(
+        "/api/ingest/complete",
+        headers=auth_headers,
+        json={"syncRunId": sync_run_id, "errors": [{"d2lTopicId": 1001, "message": "boom"}]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "failed"
+    assert body["stats"]["errors"] == [{"d2lTopicId": 1001, "message": "boom"}]
+
+
+def test_complete_unknown_sync_run_404(client, auth_headers):
+    resp = client.post("/api/ingest/complete", headers=auth_headers, json={"syncRunId": 999999, "errors": []})
+    assert resp.status_code == 404
+
+
+# --------------------------------------------------------------------------
+# 9. extras
+# --------------------------------------------------------------------------
+
+
+def test_toc_extras_create_announcement_and_assignment_materials(client, auth_headers, db_session_factory, data_dir):
+    course_id = handshake(client, auth_headers)
+    resp = post_toc(
+        client, auth_headers, load_toc(),
+        extras={
+            "news": [{"id": 1, "title": "Midterm moved", "html": "<p>Midterm moved to Friday</p>"}],
+            "dropbox": [{"id": 2, "name": "Homework 1", "instructionsText": "Submit as a single PDF."}],
+        },
+    )
+    assert resp.status_code == 200
+
+    with db_session_factory() as session:
+        announcement = session.execute(
+            select(Material).where(Material.course_id == course_id, Material.source_url == "d2l:news:1")
+        ).scalar_one()
+        assert announcement.kind == "announcement"
+        assert announcement.status == "extracted"
+        assert announcement.title == "Midterm moved"
+        assert announcement.d2l_topic_id is None
+        announcement_sha = announcement.sha256
+
+        assignment = session.execute(
+            select(Material).where(Material.course_id == course_id, Material.source_url == "d2l:dropbox:2")
+        ).scalar_one()
+        assert assignment.kind == "assignment"
+        assert assignment.status == "extracted"
+        assert assignment.title == "Homework 1"
+        assignment_sha = assignment.sha256
+
+    from brightspace_agent.ingest.store import BlobStore
+
+    store = BlobStore(blobs_dir=data_dir / "blobs", text_dir=data_dir / "text")
+    announcement_text = store.read_text(announcement_sha)
+    assert announcement_text is not None
+    assert "Midterm moved to Friday" in announcement_text
+
+    assignment_text = store.read_text(assignment_sha)
+    assert assignment_text == "Submit as a single PDF."
+
+
+def test_toc_extras_upsert_on_repeat_call(client, auth_headers, db_session_factory):
+    course_id = handshake(client, auth_headers)
+    extras = {"news": [{"id": 1, "title": "Original", "html": "<p>Original</p>"}], "dropbox": None}
+    post_toc(client, auth_headers, load_toc(), extras=extras)
+
+    extras["news"][0]["title"] = "Updated"
+    extras["news"][0]["html"] = "<p>Updated</p>"
+    post_toc(client, auth_headers, load_toc(), extras=extras)
+
+    with db_session_factory() as session:
+        materials = session.execute(
+            select(Material).where(Material.course_id == course_id, Material.source_url == "d2l:news:1")
+        ).scalars().all()
+        assert len(materials) == 1
+        assert materials[0].title == "Updated"
+
+
+# --------------------------------------------------------------------------
+# 10. infer_kind unit cases
+# --------------------------------------------------------------------------
+
+
+def test_infer_kind_syllabus_title_overrides_extension():
+    assert infer_kind("Course Syllabus", "https://x/y/syllabus.docx") == "syllabus"
+
+
+def test_infer_kind_pptx_is_slides():
+    assert infer_kind("Lecture 2 Slides", "https://x/y/lecture2.pptx") == "slides"
+
+
+def test_infer_kind_vtt_is_transcript():
+    assert infer_kind("Lecture 1 Captions", "https://x/y/lecture1.vtt") == "transcript"
+
+
+def test_infer_kind_pdf_is_document():
+    assert infer_kind("Reading Packet", "https://x/y/packet.pdf") == "document"
+
+
+def test_infer_kind_mp4_is_video():
+    assert infer_kind("Lecture Recording", "https://x/y/lecture.mp4") == "video"
+
+
+def test_infer_kind_unknown_extension_is_other():
+    assert infer_kind("Mystery File", "https://x/y/file.xyz") == "other"

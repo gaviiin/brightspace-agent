@@ -1,0 +1,122 @@
+{
+  "Modules": [
+    {
+      "ModuleId": 100,
+      "Title": "Week 1 — Intro",
+      "ShortTitle": "Week 1",
+      "Type": 0,
+      "IsHidden": false,
+      "Description": {"Text": "Course introduction", "Html": "<p>Course introduction</p>"},
+      "Modules": [],
+      "Topics": [
+        {
+          "Identifier": "TOPIC-1001",
+          "TopicId": 1001,
+          "Title": "Course Syllabus",
+          "ShortTitle": null,
+          "Type": 1,
+          "TypeIdentifier": "File",
+          "Url": "/d2l/le/content/555/topics/1001/download/syllabus.pdf",
+          "StartDate": null,
+          "EndDate": null,
+          "IsHidden": false,
+          "LastModifiedDate": "2026-01-05T12:00:00.000Z",
+          "SizeBytes": 234000
+        },
+        {
+          "Identifier": "TOPIC-1002",
+          "TopicId": 1002,
+          "Title": "Lecture 1 — Overview",
+          "ShortTitle": null,
+          "Type": 1,
+          "TypeIdentifier": "File",
+          "Url": "/d2l/le/content/555/topics/1002/download/lecture1.pdf",
+          "StartDate": null,
+          "EndDate": null,
+          "IsHidden": false,
+          "LastModifiedDate": "2026-01-06T09:00:00.000Z",
+          "SizeBytes": 512000
+        },
+        {
+          "Identifier": "TOPIC-1003",
+          "TopicId": 1003,
+          "Title": "Recommended Reading: Big-O Notation",
+          "ShortTitle": null,
+          "Type": 3,
+          "TypeIdentifier": "Link",
+          "Url": "https://en.wikipedia.org/wiki/Big_O_notation",
+          "StartDate": null,
+          "EndDate": null,
+          "IsHidden": false,
+          "LastModifiedDate": null,
+          "SizeBytes": null
+        }
+      ]
+    },
+    {
+      "ModuleId": 200,
+      "Title": "Week 2 — Sorting",
+      "ShortTitle": "Week 2",
+      "Type": 0,
+      "IsHidden": false,
+      "Description": null,
+      "Topics": [
+        {
+          "Identifier": "TOPIC-1004",
+          "TopicId": 1004,
+          "Title": "Lecture 2 — Sorting Algorithms",
+          "ShortTitle": null,
+          "Type": 1,
+          "TypeIdentifier": "File",
+          "Url": "/d2l/le/content/555/topics/1004/download/lecture2.pptx",
+          "StartDate": null,
+          "EndDate": null,
+          "IsHidden": false,
+          "LastModifiedDate": "2026-01-10T09:00:00.000Z",
+          "SizeBytes": 3000000
+        }
+      ],
+      "Modules": [
+        {
+          "ModuleId": 210,
+          "Title": "Labs",
+          "ShortTitle": "Labs",
+          "Type": 0,
+          "IsHidden": false,
+          "Description": null,
+          "Modules": [],
+          "Topics": [
+            {
+              "Identifier": "TOPIC-1005",
+              "TopicId": 1005,
+              "Title": "Lab 1 — Bubble Sort",
+              "ShortTitle": null,
+              "Type": 1,
+              "TypeIdentifier": "File",
+              "Url": "/d2l/le/content/555/topics/1005/download/lab1.pdf",
+              "StartDate": null,
+              "EndDate": null,
+              "IsHidden": false,
+              "LastModifiedDate": "2026-01-12T09:00:00.000Z",
+              "SizeBytes": 150000
+            },
+            {
+              "Identifier": "TOPIC-1006",
+              "TopicId": 1006,
+              "Title": "Lab 1 Starter Notes",
+              "ShortTitle": null,
+              "Type": 1,
+              "TypeIdentifier": "File",
+              "Url": "/d2l/le/content/555/topics/1006/download/notes.pdf",
+              "StartDate": null,
+              "EndDate": null,
+              "IsHidden": false,
+              "LastModifiedDate": null,
+              "SizeBytes": null
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
