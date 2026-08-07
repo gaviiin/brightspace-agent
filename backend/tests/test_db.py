@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from brightspace_agent.db.migrate import MIGRATIONS, migrate
-from brightspace_agent.db.models import Course, Material, Module
+from brightspace_agent.db.models import Course, EnrichmentResource, Material, Module, Topic
 from brightspace_agent.db.session import init_db
 
 EXPECTED_TABLES = {
@@ -155,3 +155,90 @@ def test_materials_partial_unique_index_on_course_and_topic(db_path):
             {"cid": course_id},
         ).scalar_one()
         assert count == 2
+
+
+# --------------------------------------------------------------------------
+# M3.2 folded-in hardening: migration 2 (enrichment_resources(topic_id, url)
+# unique index) must dedup existing duplicate rows BEFORE creating the
+# index, so a database that somehow already has a duplicate (topic_id, url)
+# row -- e.g. one written before the M3.2 runner made this table's write
+# path live -- migrates cleanly instead of raising IntegrityError and
+# aborting startup.
+# --------------------------------------------------------------------------
+
+
+def test_migration_2_dedups_duplicate_topic_url_rows_before_creating_unique_index(db_path):
+    # Simulate a v1 database (pre-M3.1: enrichment_resources exists, but
+    # without the unique index) that already has a duplicate (topic_id, url)
+    # pair -- built from raw SQL, not schema.sql, since schema.sql (as of
+    # M3.1) already creates the index for a fresh database and so can't be
+    # used to reproduce the pre-hardening scenario this test targets.
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            BEGIN;
+            CREATE TABLE enrichment_resources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT
+            );
+            INSERT INTO enrichment_resources (topic_id, url, title)
+                VALUES (1, 'https://example.com/a', 'first');
+            INSERT INTO enrichment_resources (topic_id, url, title)
+                VALUES (1, 'https://example.com/a', 'duplicate');
+            INSERT INTO enrichment_resources (topic_id, url, title)
+                VALUES (1, 'https://example.com/b', 'other');
+            PRAGMA user_version = 1;
+            COMMIT;
+            """
+        )
+
+        migrate(conn)  # applies migration 2+ on top of this v1 db
+
+        rows = conn.execute(
+            "SELECT id, title FROM enrichment_resources WHERE topic_id = 1 AND url = 'https://example.com/a'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][1] == "first"  # lowest id survives
+
+        total = conn.execute("SELECT COUNT(*) FROM enrichment_resources").fetchone()[0]
+        assert total == 2  # the duplicate was removed; the distinct url kept
+
+        index_row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'ux_enrichment_topic_url'"
+        ).fetchone()
+        assert index_row is not None
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == MIGRATIONS[-1][0]
+    finally:
+        conn.close()
+
+
+def test_enrichment_resources_unique_index_on_topic_and_url(db_path):
+    """Mirrors test_materials_partial_unique_index_on_course_and_topic: a
+    raw duplicate (topic_id, url) insert must raise IntegrityError now that
+    migration 2's index is live."""
+    _, Session = init_db(db_path)
+
+    with Session() as session:
+        course = _make_course()
+        session.add(course)
+        session.commit()
+        course_id = course.id
+
+    with Session() as session:
+        topic = Topic(course_id=course_id, taxonomy_version=1, slug="intro", name="Intro")
+        session.add(topic)
+        session.commit()
+        topic_id = topic.id
+
+    with Session() as session:
+        session.add(EnrichmentResource(topic_id=topic_id, url="https://example.com/a"))
+        session.commit()
+
+    with Session() as session:
+        session.add(EnrichmentResource(topic_id=topic_id, url="https://example.com/a"))
+        with pytest.raises(IntegrityError):
+            session.commit()
