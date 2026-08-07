@@ -950,6 +950,35 @@ def test_dedup_leaves_a_dismissed_duplicate_alone(session_factory, course_id):
     assert first  # sanity
 
 
+def test_a_dismissal_on_one_topic_does_not_hide_the_link_on_another(session_factory, course_id):
+    """Dismissing a shared link on topic B must not delete the live suggestion
+    on topic A: a dismissal means "not here", not "nowhere"."""
+    first, second = _seed_two_topics_sharing_a_url(session_factory, course_id)
+    asyncio.run(run_enrich_stage(session_factory, _ScoringLLM({_SHARED_URL: 0.9}), _shared_url_web(), course_id))
+
+    # After the first run the shared URL lives (suggested) on `first` only.
+    # The student dismisses a copy of it on `second`.
+    with session_factory() as session:
+        session.add(
+            EnrichmentResource(
+                topic_id=second, url=_SHARED_URL, title="Shared", resource_type="notes",
+                intent="university_notes", rationale="student said no on this topic",
+                scores_json=json.dumps({"relevance": 0.9}), verification_json="{}", rank=1, status="dismissed",
+            )
+        )
+        session.execute(delete(LlmCache).where(LlmCache.stage == "enrich"))
+        session.commit()
+
+    asyncio.run(run_enrich_stage(session_factory, _ScoringLLM({_SHARED_URL: 0.9}), _shared_url_web(), course_id))
+
+    shared_rows = [row for row in _rows_for_course(session_factory, course_id) if row.url == _SHARED_URL]
+    statuses = {(row.topic_id, row.status) for row in shared_rows}
+    # The live suggestion on `first` survives the dismissal on `second`...
+    assert (first, "suggested") in statuses
+    # ...and the dismissal itself is untouched.
+    assert (second, "dismissed") in statuses
+
+
 def test_single_topic_run_never_marks_anything_shared(session_factory, topic_id):
     stats = _run_topic(session_factory, MockBackend(), MockWebBackend(), topic_id)
 

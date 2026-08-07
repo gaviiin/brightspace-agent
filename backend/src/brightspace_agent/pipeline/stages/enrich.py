@@ -873,12 +873,14 @@ def _dedupe_across_topics(session_factory: sessionmaker[Session], course_id: int
     on its best-fit topic, mark it `shared`, and delete the duplicates.
     Best-fit is:
 
-      1. a row the student has already ACTIONED (kept/dismissed) wins outright
-         -- their decision anchors the URL to that topic, and no ranking of
-         ours gets to overrule it;
-      2. then highest mean rubric score (what produced `rank` in the first
-         place);
-      3. then lowest topic id, purely so the result is deterministic.
+      1. a row the student KEPT wins outright -- their decision anchors the
+         URL to that topic, and no ranking of ours gets to overrule it;
+      2. then live rows ('suggested'), by highest mean rubric score (what
+         produced `rank` in the first place);
+      3. a DISMISSED row ranks last: a dismissal means "not on this topic",
+         never "hide this link everywhere", so it must not win over -- and
+         thereby delete -- a live suggestion on another topic;
+      4. then lowest topic id, purely so the result is deterministic.
 
     Only un-actioned 'suggested' duplicates are ever deleted. A kept or
     dismissed row on a losing topic stays exactly as it is (it is just also
@@ -905,31 +907,35 @@ def _dedupe_across_topics(session_factory: sessionmaker[Session], course_id: int
             if len({row.topic_id for row in group}) < 2:
                 continue
             winner = min(group, key=_best_fit_key)
+            removed_here = 0
             for row in group:
                 row.shared = 1
                 if row is winner or row.status != "suggested":
                     continue
                 session.delete(row)
-                removed += 1
+                removed_here += 1
+            removed += removed_here
             logger.info(
                 "enrich: %s appeared under %d topics; kept on topic %s (%d duplicate(s) removed)",
-                url, len(group), winner.topic_id, removed,
+                url, len(group), winner.topic_id, removed_here,
             )
         session.commit()
     return removed
 
 
 def _best_fit_key(row: EnrichmentResource) -> tuple[int, float, int]:
-    """Sort key for `_dedupe_across_topics` (lower wins): student-actioned
-    first, then best mean rubric score, then lowest topic id as the
-    deterministic tie-break."""
+    """Sort key for `_dedupe_across_topics` (lower wins): kept first, then
+    live suggestions by best mean rubric score, dismissed last (so a
+    dismissal never deletes a live suggestion on another topic), then lowest
+    topic id as the deterministic tie-break."""
     try:
         scores = json.loads(row.scores_json) if row.scores_json else {}
         values = [float(value) for value in scores.values()]
     except (json.JSONDecodeError, TypeError, ValueError):
         values = []
     mean = sum(values) / len(values) if values else 0.0
-    return (0 if row.status in ("kept", "dismissed") else 1, -mean, row.topic_id)
+    priority = {"kept": 0, "dismissed": 2}.get(row.status, 1)
+    return (priority, -mean, row.topic_id)
 
 
 def _merge_stats(into: StageStats, other: StageStats) -> None:
