@@ -453,7 +453,7 @@ def test_usage_accumulates_across_both_calls_and_charges_per_search():
     assert usage["est_cost_usd"] == pytest.approx(token_cost + 2 * WEB_SEARCH_COST_PER_SEARCH_USD)
 
 
-def test_unknowable_search_count_charges_the_conservative_max_uses():
+def test_unknowable_search_count_charges_the_conservative_max_uses(caplog):
     # A plain-string response tells us nothing about how many searches ran;
     # the cap must assume the worst rather than silently under-count.
     chat = _StubChat(
@@ -462,10 +462,27 @@ def test_unknowable_search_count_charges_the_conservative_max_uses():
     )
     backend = _backend_with(chat)
 
-    _, usage = backend.find(system="sys", user="usr", tier="smart")
+    with caplog.at_level(logging.WARNING, logger="brightspace_agent.agents.web"):
+        _, usage = backend.find(system="sys", user="usr", tier="smart")
 
     assert web_search_max_uses("smart") == 8
     assert usage["est_cost_usd"] == pytest.approx(8 * WEB_SEARCH_COST_PER_SEARCH_USD)
+    # The guess must be observable: silence here is what made the fallback
+    # impossible to calibrate against real traffic.
+    assert any("max_uses" in record.message for record in caplog.records if record.levelno == logging.WARNING)
+
+
+def test_exact_search_count_does_not_warn(caplog):
+    chat = _StubChat(
+        tool_turn=AIMessage(content=_TOOL_TURN_BLOCKS),
+        coercion_results=[{"parsed": _CANDIDATES, "parsing_error": None, "raw": _Usage(0, 0)}],
+    )
+    backend = _backend_with(chat)
+
+    with caplog.at_level(logging.WARNING, logger="brightspace_agent.agents.web"):
+        backend.find(system="sys", user="usr", tier="smart")
+
+    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
 
 
 # --------------------------------------------------------------------------

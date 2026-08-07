@@ -300,7 +300,13 @@ def _count_searches(message: object, tools: list[dict], tier: Tier) -> int:
         return 0
     blocks = _content_blocks(message)
     if not blocks:
-        return web_search_max_uses(tier)
+        charged = web_search_max_uses(tier)
+        logger.warning(
+            "web: response content was a plain string, so the real search count "
+            "is unknowable; conservatively charging max_uses=%d",
+            charged,
+        )
+        return charged
     return sum(
         1
         for block in blocks
