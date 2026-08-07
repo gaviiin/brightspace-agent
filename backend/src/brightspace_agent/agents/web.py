@@ -18,7 +18,17 @@ Two things this module owns that are easy to get wrong elsewhere:
   runnable can't also carry server tools cleanly, so `find`/`verify` use a
   two-call shape: first let the model run the search/fetch loop with tools
   bound, then coerce the result to the schema on the same tier -- accumulating
-  usage from *both* calls.
+  usage from *both* calls. Crucially the *second* call carries only the tool
+  turn's TEXT (see `_text_blocks_only`), never the raw `server_tool_use` /
+  `web_search_tool_result` blocks: a request whose history contains
+  server-tool blocks must still declare those tools, and the coercion call
+  binds only the schema tool, so replaying the raw turn would be a 400 on
+  every real find/verify. `tests/test_web_backend.py` pins that contract
+  against a stub chat model, offline.
+- **Per-search billing.** `web_search` is billed per search on top of tokens
+  (`agents/llm.py`'s `WEB_SEARCH_COST_PER_SEARCH_USD`), so `_usage_info`
+  folds that surcharge into the `est_cost_usd` the enrich stage's cost cap
+  reads -- otherwise the dominant cost of this stage is invisible to the cap.
 """
 
 from __future__ import annotations
@@ -32,6 +42,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from brightspace_agent.agents.llm import (
+    WEB_SEARCH_COST_PER_SEARCH_USD,
     LLMCallError,
     Tier,
     UsageInfo,
@@ -95,6 +106,18 @@ def _web_tools(tier: Tier) -> list[dict]:
     """The `[web_search, web_fetch]` server-tool specs whose versions match
     `tier`'s model. `verify` slices out just `web_fetch` from this."""
     return [dict(tool) for tool in _WEB_TOOLS_BY_TIER[tier]]
+
+
+def web_search_max_uses(tier: Tier) -> int:
+    """The upper bound on searches ONE finder call can run at `tier` -- the
+    `web_search` spec's `max_uses`. This is what the runtime charges when a
+    response doesn't tell us how many searches actually happened, and what
+    api/enrichment.py's dry-run assumes per finder, so the estimate and the
+    cap agree on the same conservative number instead of drifting apart."""
+    return max(
+        (tool.get("max_uses", 0) for tool in _WEB_TOOLS_BY_TIER[tier] if tool["name"] == "web_search"),
+        default=0,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -171,10 +194,19 @@ class AnthropicWebBackend:
         # (1) Let the server run the search/fetch loop inside one invoke.
         ai_msg: AIMessage = chat.bind_tools(tools).invoke(base)
         tokens = _add_tokens({"input_tokens": 0, "output_tokens": 0}, ai_msg)
+        searches = _count_searches(ai_msg, tools, tier)
 
-        # (2) Coerce to the schema on the same tier, carrying the tool turn.
+        # (2) Coerce to the schema on the same tier, carrying forward only the
+        # tool turn's TEXT -- the model's own drafted findings -- as a plain
+        # assistant message. The raw AIMessage must NOT be replayed: it holds
+        # `server_tool_use`/`web_search_tool_result` blocks, and the API
+        # requires a request whose history contains those to still declare the
+        # server tools, while `with_structured_output` binds only the schema
+        # tool. Text-only sidesteps the constraint entirely; the findings are
+        # what the coercion step actually needs.
+        findings = _text_blocks_only(ai_msg) or "(the tools returned nothing usable)"
         structured = chat.with_structured_output(schema, include_raw=True)
-        messages = [*base, ai_msg, HumanMessage(content=coerce_instruction)]
+        messages = [*base, AIMessage(content=findings), HumanMessage(content=coerce_instruction)]
         result = structured.invoke(messages)
         parsed, error = result.get("parsed"), result.get("parsing_error")
         tokens = _add_tokens(tokens, result.get("raw"))
@@ -196,16 +228,24 @@ class AnthropicWebBackend:
         if parsed is None or error is not None:
             raise LLMCallError(f"{schema.__name__} web call failed after one retry: {error!r}")
 
-        return parsed, self._usage_info(tier, tokens)
+        return parsed, self._usage_info(tier, tokens, searches)
 
-    def _usage_info(self, tier: Tier, tokens: dict[str, int]) -> UsageInfo:
+    def _usage_info(self, tier: Tier, tokens: dict[str, int], searches: int = 0) -> UsageInfo:
+        """Token cost for this call PLUS `searches` x the per-search web-search
+        fee (agents/llm.py's `WEB_SEARCH_COST_PER_SEARCH_USD`). The surcharge
+        rides in `est_cost_usd` rather than a separate field so every existing
+        consumer -- the cost cap, `StageStats.usage_total`, the pipeline_runs
+        usage row, the UI -- counts it without changing shape."""
         model = self.model_for_tier(tier)
         input_tokens, output_tokens = tokens["input_tokens"], tokens["output_tokens"]
         return UsageInfo(
             model=model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            est_cost_usd=_estimate_cost_usd(model, input_tokens, output_tokens),
+            est_cost_usd=(
+                _estimate_cost_usd(model, input_tokens, output_tokens)
+                + searches * WEB_SEARCH_COST_PER_SEARCH_USD
+            ),
         )
 
 
@@ -214,6 +254,53 @@ def _add_tokens(acc: dict[str, int], raw: object) -> dict[str, int]:
     acc["input_tokens"] += usage_metadata.get("input_tokens", 0)
     acc["output_tokens"] += usage_metadata.get("output_tokens", 0)
     return acc
+
+
+def _content_blocks(message: object) -> list[dict]:
+    """The dict content blocks of an AIMessage, or [] when its content is a
+    plain string (LangChain normalizes simple text responses to `str`)."""
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
+        return []
+    return [block for block in content if isinstance(block, dict)]
+
+
+def _text_blocks_only(message: object) -> str:
+    """Just the model's prose from a tool-loop turn: the `text` of every text
+    block, joined. Server-tool blocks (`server_tool_use`,
+    `web_search_tool_result`, `web_fetch_tool_result`, ...) are dropped -- see
+    `_tools_then_structured` for why they must never reach the second call."""
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content.strip()
+    parts = [
+        str(block.get("text", ""))
+        for block in _content_blocks(message)
+        if block.get("type") == "text"
+    ]
+    return "\n\n".join(part for part in parts if part.strip()).strip()
+
+
+def _count_searches(message: object, tools: list[dict], tier: Tier) -> int:
+    """How many billable `web_search` calls this turn made.
+
+    Preferred source is the response itself: one `server_tool_use` block per
+    search. If the response carries no structured blocks at all (content came
+    back as a plain string, so we cannot tell), fall back to charging the
+    tool's `max_uses` -- deliberately CONSERVATIVE: over-charging the cap
+    stops a run early, under-charging lets real spend sail past the cap the
+    UI displayed. Returns 0 when `web_search` wasn't even bound (the verifier
+    binds `web_fetch` only, which has no per-use fee)."""
+    if not any(tool["name"] == "web_search" for tool in tools):
+        return 0
+    blocks = _content_blocks(message)
+    if not blocks:
+        return web_search_max_uses(tier)
+    return sum(
+        1
+        for block in blocks
+        if block.get("type") == "server_tool_use" and block.get("name") == "web_search"
+    )
 
 
 # --------------------------------------------------------------------------
