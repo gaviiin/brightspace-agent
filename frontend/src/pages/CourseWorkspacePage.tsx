@@ -15,6 +15,7 @@ import type { BsaEvent, DryRunResponse, TaxonomyApplyResponse } from "../api/typ
 import { GraphView } from "../graph/GraphView";
 import { DetailPanel } from "../panels/DetailPanel";
 import { OutlinePanel } from "../panels/OutlinePanel";
+import { RunsDrawer } from "../panels/RunsDrawer";
 import { TaxonomyEditor } from "../panels/TaxonomyEditor";
 import { useUiStore } from "../state/uiStore";
 
@@ -31,6 +32,7 @@ export function CourseWorkspacePage() {
 
   const [confirmDryRun, setConfirmDryRun] = useState(false);
   const [taxonomyEditorOpen, setTaxonomyEditorOpen] = useState(false);
+  const [runsOpen, setRunsOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
   const courseQuery = useQuery({
@@ -177,6 +179,14 @@ export function CourseWorkspacePage() {
         </Link>
         <button
           type="button"
+          disabled={!courseIdValid}
+          onClick={() => setRunsOpen(true)}
+          className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800"
+        >
+          Runs
+        </button>
+        <button
+          type="button"
           disabled={!graphQuery.data}
           onClick={() => setTaxonomyEditorOpen(true)}
           className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800"
@@ -234,6 +244,8 @@ export function CourseWorkspacePage() {
           onConfirm={() => runMutation.mutate()}
         />
       )}
+
+      {runsOpen && <RunsDrawer courseId={courseId} onClose={() => setRunsOpen(false)} />}
 
       {taxonomyEditorOpen && graphQuery.data && (
         <TaxonomyEditor
