@@ -635,8 +635,9 @@ def _is_safe_url(url: str) -> bool:
     React-escaped surface. The Pydantic schema rejects these on the way in
     (agents/schemas.py's `Candidate.url`); this is the last line, and it also
     covers rows replayed from a cache row written before that validator
-    existed."""
-    return url.lower().startswith(("http://", "https://"))
+    existed (which is also why this tolerates a non-string: cache payloads are
+    whatever JSON happens to be in the row)."""
+    return isinstance(url, str) and url.lower().startswith(("http://", "https://"))
 
 
 def _write_resources(session: Session, topic_id: int, resources: list[dict], *, prune: bool = True) -> int:
@@ -657,7 +658,7 @@ def _write_resources(session: Session, topic_id: int, resources: list[dict], *, 
     for resource in resources:
         if not _is_safe_url(resource["url"]):
             logger.warning(
-                "enrich: dropping non-http(s) URL for topic %s (%r)", topic_id, resource["url"][:80]
+                "enrich: dropping non-http(s) URL for topic %s (%s)", topic_id, repr(resource["url"])[:80]
             )
             continue
         kept_urls.add(resource["url"])
