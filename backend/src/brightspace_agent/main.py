@@ -1,5 +1,6 @@
 """FastAPI app factory and CLI entry point."""
 
+import logging
 import secrets
 from pathlib import Path
 
@@ -176,5 +177,10 @@ def _is_paired(request: Request, pairing_token: str) -> bool:
 
 
 def cli() -> None:
+    # Uvicorn only configures its own loggers; without a root handler the
+    # app's INFO logs (pipeline progress, web-search cost accounting) are
+    # silently dropped. basicConfig is a no-op if a handler already exists,
+    # and uvicorn's loggers don't propagate, so nothing is double-printed.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     settings = Settings()
     uvicorn.run(create_app(), host=settings.host, port=settings.port)
