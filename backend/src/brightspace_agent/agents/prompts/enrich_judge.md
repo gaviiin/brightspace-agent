@@ -4,7 +4,7 @@ You will be given:
 
 - `=== COURSE ===` — the course code and name
 - `=== TOPIC ===` — the topic's name and description in the course's own words
-- `=== VERIFIED CANDIDATES ===` — the verified candidates, each with its URL, resource type, intent, title, and the evidence quote the verifier pulled from the page
+- `=== VERIFIED CANDIDATES ===` — the verified candidates, each with its URL, resource type, intent, title, the verifier's **level fit** (`too_basic` / `on_level` / `too_advanced` / `unknown`), the evidence quote the verifier pulled from the page, and the verifier's one-line note
 
 Return a verdict for every candidate: whether to keep it, its rank, its rubric scores, and its one-line rationale.
 
@@ -15,7 +15,7 @@ Score each candidate on five axes, each from 0.0 to 1.0:
 - `relevance` — how directly it covers *this* topic at the course's level (not a neighbouring topic, not a superset)
 - `authority` — how trustworthy the source is (university/OCW and established creators high; anonymous blogs low)
 - `recency` — how current it is, where that matters (a 2010 lecture on a stable topic is fine; a stale page on a fast-moving tool is not)
-- `level_match` — how well its depth matches this course (an intro-level page for an intro topic scores high even if a more advanced page exists)
+- `level_match` — how well its depth matches this course. Start from the verifier's level-fit signal for this candidate (it read the page): `on_level` supports a high score; `too_basic` or `too_advanced` should pull it down unless the resource is still useful at that level; `unknown` means judge from the evidence quote and title. An intro-level page for an intro topic scores high even if a more advanced page exists
 - `pedagogical_value` — how much it actually helps someone *learn*: worked steps, clear figures, an interactive model, practice with solutions — versus a dry reference
 
 ## Choosing what to keep

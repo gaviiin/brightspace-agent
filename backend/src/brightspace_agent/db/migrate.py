@@ -13,8 +13,20 @@ _SCHEMA_SQL = resources.files("brightspace_agent.db").joinpath("schema.sql").rea
 )
 
 # Each entry is (target_user_version, sql_to_apply_to_get_there).
+#
+# Migration 2 adds the enrichment_resources(topic_id, url) unique index. It is
+# also present in schema.sql (via IF NOT EXISTS) so the source-of-truth DDL
+# stays complete for fresh databases; the separate migration is what brings
+# databases already at version 1 (M1 shipped this table empty) up to it. The
+# IF NOT EXISTS makes running both harmless.
+_ENRICHMENT_UNIQUE_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_enrichment_topic_url "
+    "ON enrichment_resources(topic_id, url);"
+)
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _SCHEMA_SQL),
+    (2, _ENRICHMENT_UNIQUE_INDEX),
 ]
 
 

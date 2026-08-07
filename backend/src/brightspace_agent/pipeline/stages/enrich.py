@@ -217,11 +217,16 @@ def _judge_user(context: _TopicContext, survivors: list[_Survivor]) -> str:
     lines = []
     for index, survivor in enumerate(survivors, start=1):
         candidate = survivor.candidate
+        verification = survivor.verification
+        # Forward the verifier's fetched-page signals -- `level` (its level-fit
+        # verdict) and its `reason` -- so the judge scores level_match against
+        # what the verifier actually saw on the page, not blind.
         lines.append(
             f"{index}. url: {candidate.url} | type: {candidate.resource_type} | "
-            f"intent: {candidate.intent} | title: {candidate.title}"
+            f"intent: {candidate.intent} | level: {verification.level_fit} | "
+            f"title: {candidate.title}"
         )
-        lines.append(f'   evidence: "{survivor.verification.evidence_quote}"')
+        lines.append(f'   evidence: "{verification.evidence_quote}" | verifier: {verification.reason}')
     return (
         f"{_course_and_topic_block(context)}\n"
         f"{SECTION_VERIFIED_CANDIDATES}\n" + "\n".join(lines) + "\n"
@@ -442,8 +447,15 @@ async def _find_and_verify(
         if pair is None:
             continue
         candidate, verification = pair
-        if verification.ok:
+        # A survivor must clear the gate AND carry the fetched-page evidence the
+        # gate exists to enforce: an ok=True verdict with an empty evidence
+        # quote hasn't actually established on-topic, so it is rejected here
+        # rather than written. (The brief: the verifier gates on FETCHED
+        # evidence, not the search snippet.)
+        if verification.ok and verification.evidence_quote.strip():
             state.survivors.append(_Survivor(candidate=candidate, verification=verification))
+        elif verification.ok:
+            state.reject_reasons.append(f"{candidate.intent}: verified but produced no evidence quote")
         elif verification.reason:
             state.reject_reasons.append(f"{candidate.intent}: {verification.reason}")
 
@@ -531,20 +543,24 @@ def _apply_bias(session: Session, url: str, scores: dict) -> tuple[dict[str, flo
 
 
 def _select_diverse(scored: list[_Scored], target_max: int) -> list[_Scored]:
-    """Pick up to `target_max`, favouring a mix of resource types: one pass
-    takes the best of each not-yet-seen type (in score order), a second fills
-    any remaining slots by score. The final list is ordered by biased score so
-    the student leads with the strongest resource."""
+    """Pick up to `target_max`, favouring a mix of intents: one pass takes the
+    best of each not-yet-seen intent (in score order), a second fills any
+    remaining slots by score. The final list is ordered by biased score so the
+    student leads with the strongest resource.
+
+    Diversity keys on `intent` (a closed IntentType literal) rather than
+    `resource_type` (model-authored free text -- "notes" vs "lecture_notes"
+    would defeat the backstop)."""
     ordered = sorted(scored, key=lambda item: (-item.biased_score, item.url))
 
     selected: list[_Scored] = []
-    seen_types: set[str] = set()
+    seen_intents: set[str] = set()
     for item in ordered:
         if len(selected) >= target_max:
             break
-        if item.resource_type not in seen_types:
+        if item.intent not in seen_intents:
             selected.append(item)
-            seen_types.add(item.resource_type)
+            seen_intents.add(item.intent)
 
     if len(selected) < target_max:
         chosen = {id(item) for item in selected}

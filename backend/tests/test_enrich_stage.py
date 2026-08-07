@@ -10,7 +10,7 @@ import asyncio
 import json
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from brightspace_agent.agents.llm import MockBackend
 from brightspace_agent.agents.schemas import (
@@ -23,7 +23,14 @@ from brightspace_agent.agents.schemas import (
     Verification,
 )
 from brightspace_agent.agents.web import MockWebBackend
-from brightspace_agent.db.models import Course, EnrichmentResource, Material, MaterialTopic, Topic
+from brightspace_agent.db.models import (
+    Course,
+    EnrichmentResource,
+    LlmCache,
+    Material,
+    MaterialTopic,
+    Topic,
+)
 from brightspace_agent.db.session import init_db
 from brightspace_agent.pipeline.reputation import record_feedback
 from brightspace_agent.pipeline.stages.enrich import run_enrich_stage, run_topic_enrichment
@@ -298,6 +305,30 @@ def test_paywall_candidate_never_lands_in_results(session_factory, topic_id):
     assert all("paywall" not in row.url for row in rows)
 
 
+def test_ok_verdict_without_evidence_quote_is_not_written(session_factory, topic_id):
+    # The verifier gates on FETCHED evidence: an ok=True verdict that produced
+    # no evidence quote has not actually established on-topic and must not land.
+    candidates = CandidateList(
+        candidates=[
+            Candidate(
+                url="https://ocw.mit.edu/bfs-notes", title="MIT Notes",
+                resource_type="notes", intent="university_notes",
+                claimed_coverage="bfs", why="mit",
+            )
+        ]
+    )
+    ok_but_no_evidence = Verification(
+        ok=True, accessible=True, on_topic=True, level_fit="on_level",
+        evidence_quote="   ", reason="looked fine but quoted nothing from the page",
+    )
+    web = _StubWeb(find=candidates, verify=ok_but_no_evidence)
+
+    stats = _run_topic(session_factory, MockBackend(), web, topic_id)
+
+    assert _rows(session_factory, topic_id) == []
+    assert stats.enriched == 0
+
+
 # --------------------------------------------------------------------------
 # (3) Cache reuse: second run on an unchanged topic makes 0 new calls, no dupes
 # --------------------------------------------------------------------------
@@ -320,6 +351,27 @@ def test_second_run_reuses_cache_no_new_calls_no_dupes(session_factory, topic_id
     assert calls_after == calls_before  # no new LLM or web calls
     assert stats2.cached_hits == 1
     assert len(_rows(session_factory, topic_id)) == first_count  # no duplicate rows
+
+
+def test_rerun_after_cache_miss_never_duplicates_urls(session_factory, topic_id):
+    _run_topic(session_factory, MockBackend(), MockWebBackend(), topic_id)
+    first = _rows(session_factory, topic_id)
+    urls_first = sorted(row.url for row in first)
+    assert urls_first  # something was written
+
+    # Force a cache miss so the full pipeline -- and its upsert-by-(topic,url) --
+    # runs a second time rather than replaying the cached payload.
+    with session_factory() as session:
+        session.execute(delete(LlmCache).where(LlmCache.stage == "enrich"))
+        session.commit()
+
+    _run_topic(session_factory, MockBackend(), MockWebBackend(), topic_id)
+    second = _rows(session_factory, topic_id)
+    urls_second = sorted(row.url for row in second)
+
+    assert urls_second == urls_first  # same URLs, updated in place
+    assert len(urls_second) == len(set(urls_second))  # no duplicate URLs
+    assert len(second) == len(first)  # no new rows
 
 
 # --------------------------------------------------------------------------

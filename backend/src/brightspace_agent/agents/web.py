@@ -383,10 +383,11 @@ def _mock_search_plan(user: str) -> SearchPlan:
     )
 
 
-# "1. url: https://x | type: notes | intent: university_notes | title: ..."
+# "1. url: https://x | type: notes | intent: university_notes | level: on_level | title: ..."
 _JUDGE_LINE_RE = re.compile(
     r"^\s*\d+\.\s*url:\s*(?P<url>\S+)\s*\|\s*type:\s*(?P<type>[^|]+?)\s*\|\s*"
-    r"intent:\s*(?P<intent>[^|]+?)\s*\|\s*title:\s*(?P<title>.+?)\s*$"
+    r"intent:\s*(?P<intent>[^|]+?)\s*\|\s*level:\s*(?P<level>[^|]+?)\s*\|\s*"
+    r"title:\s*(?P<title>.+?)\s*$"
 )
 _UNIFORM_SCORES = {
     "relevance": 0.8,

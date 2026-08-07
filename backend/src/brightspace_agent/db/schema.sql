@@ -95,6 +95,12 @@ CREATE TABLE enrichment_resources (
     status TEXT NOT NULL CHECK(status IN ('suggested','kept','dismissed')) DEFAULT 'suggested'
 );
 
+-- One row per (topic, url): the enrich stage upserts by this pair, and the
+-- index makes "never duplicated" structural rather than a promise the upsert
+-- has to keep on its own. IF NOT EXISTS so this DDL is safe both here (fresh
+-- db, migration 1) and as migration 2 for already-migrated databases.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_enrichment_topic_url ON enrichment_resources(topic_id, url);
+
 CREATE TABLE domain_reputation (
     domain TEXT PRIMARY KEY,
     kept_count INTEGER NOT NULL DEFAULT 0,
