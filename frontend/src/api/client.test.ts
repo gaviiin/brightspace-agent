@@ -127,6 +127,7 @@ describe("enrichDryRun", () => {
       callsPerTopic: 12,
       estCostPerTopicUsd: 0.05,
       totalEstCostUsd: 0.2,
+      webSearchesPerTopic: 40,
     };
     fetchMock.mockResolvedValue(jsonResponse(body));
 

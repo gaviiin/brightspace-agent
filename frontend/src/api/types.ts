@@ -242,6 +242,11 @@ export interface EnrichDryRunResponse {
   callsPerTopic: number;
   estCostPerTopicUsd: number;
   totalEstCostUsd: number;
+  /** Upper bound on billable web searches per topic. `web_search` is billed
+   * per search (~$0.01) on top of tokens, and at that rate it dominates
+   * `estCostPerTopicUsd` -- so the confirm dialog shows it rather than
+   * leaving the number unexplained. */
+  webSearchesPerTopic: number;
 }
 
 // ---------------------------------------------------------------------------

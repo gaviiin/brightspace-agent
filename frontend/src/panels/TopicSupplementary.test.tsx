@@ -55,6 +55,7 @@ function dryRunFixture(overrides: Partial<EnrichDryRunResponse> = {}): EnrichDry
     callsPerTopic: 12,
     estCostPerTopicUsd: 0.05,
     totalEstCostUsd: 0.15,
+    webSearchesPerTopic: 40,
     ...overrides,
   };
 }

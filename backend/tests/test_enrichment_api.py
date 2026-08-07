@@ -420,6 +420,27 @@ def test_dry_run_counts_match_db_state_no_backend_calls(client, app, db_session_
     assert needs_enrichment  # sanity: fixture used
 
 
+def test_dry_run_includes_the_per_search_web_search_fee(client, db_session_factory):
+    # web_search is billed per search (~$0.01) on top of tokens, and at up to
+    # max_uses searches per finder it dominates the token cost -- an estimate
+    # that hides it under-states a real run by an order of magnitude.
+    from brightspace_agent.agents.llm import WEB_SEARCH_COST_PER_SEARCH_USD
+    from brightspace_agent.agents.web import web_search_max_uses
+    from brightspace_agent.api.enrichment import _ASSUMED_INTENTS_PER_TOPIC
+
+    course_id = _add_course(db_session_factory)
+    _add_topic(db_session_factory, course_id)
+
+    body = client.get(f"/api/courses/{course_id}/enrich/dry-run").json()
+
+    expected_searches = _ASSUMED_INTENTS_PER_TOPIC * web_search_max_uses("smart")
+    assert body["webSearchesPerTopic"] == expected_searches
+    search_cost = expected_searches * WEB_SEARCH_COST_PER_SEARCH_USD
+    assert search_cost > 0
+    assert body["estCostPerTopicUsd"] > search_cost  # tokens on top of the fees
+    assert body["totalEstCostUsd"] == pytest.approx(body["estCostPerTopicUsd"])
+
+
 def test_dry_run_zero_for_a_fully_enriched_course(client, db_session_factory):
     course_id = _add_course(db_session_factory)
     topic_id = _add_topic(db_session_factory, course_id)

@@ -321,6 +321,12 @@ function EnrichDryRunConfirmDialog({ dryRun, mockLlm, confirming, onCancel, onCo
             <span>Estimated calls</span>
             <span className="tabular-nums text-neutral-500 dark:text-neutral-400">{dryRun.callsPerTopic}</span>
           </li>
+          <li className="flex items-center justify-between">
+            <span>Web searches (max)</span>
+            <span className="tabular-nums text-neutral-500 dark:text-neutral-400">
+              {dryRun.webSearchesPerTopic}
+            </span>
+          </li>
           <li className="flex items-center justify-between font-medium text-neutral-900 dark:text-neutral-100">
             <span>Estimated cost</span>
             <span className="tabular-nums">{formatUsd(dryRun.estCostPerTopicUsd)}</span>
