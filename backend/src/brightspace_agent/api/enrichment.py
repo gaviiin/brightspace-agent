@@ -26,7 +26,7 @@ from brightspace_agent.agents.web import web_search_max_uses
 from brightspace_agent.api.deps import get_runner, get_session
 from brightspace_agent.db.models import Course, EnrichmentResource, Topic
 from brightspace_agent.pipeline.reputation import domain_of, record_feedback
-from brightspace_agent.pipeline.stages.enrich import ENRICH_TIER
+from brightspace_agent.pipeline.stages.enrich import ENRICH_TIER, enrichment_model, topic_state
 from brightspace_agent.pipeline.runner import PipelineRunner, RunActiveError, TopicNotFoundError
 
 router = APIRouter(tags=["enrichment"])
@@ -73,6 +73,15 @@ class EnrichmentMetaOut(CamelModel):
     suggested: int
     kept: int
     dismissed: int
+    # Has enrichment actually COMPLETED for this topic's current content
+    # (pipeline/stages/enrich.py's `topic_state`), and did it come back with
+    # nothing good? Without these, an empty list is ambiguous -- never
+    # searched, searched and found nothing, or searched and the student
+    # dismissed everything all render identically -- and the UI has to
+    # pretend it doesn't know which. `thin` is only meaningful when
+    # `searched` is true.
+    searched: bool = False
+    thin: bool = False
 
 
 class TopicEnrichmentOut(CamelModel):
@@ -98,7 +107,9 @@ def _resource_out(row: EnrichmentResource) -> EnrichmentResourceOut:
 
 
 @router.get("/api/topics/{topic_id}/enrichment", response_model=TopicEnrichmentOut)
-def get_topic_enrichment(topic_id: int, session: Session = Depends(get_session)) -> TopicEnrichmentOut:
+def get_topic_enrichment(
+    topic_id: int, session: Session = Depends(get_session), runner: PipelineRunner = Depends(get_runner)
+) -> TopicEnrichmentOut:
     _get_topic_or_404(session, topic_id)
     rows = list(
         session.execute(
@@ -108,10 +119,15 @@ def get_topic_enrichment(topic_id: int, session: Session = Depends(get_session))
         ).scalars().all()
     )
     resources = [_resource_out(row) for row in rows]
+    # The model id comes from the runner's own backend (not Settings) so this
+    # matches the key the stage wrote -- 'mock-smart' in mock mode.
+    state = topic_state(session, topic_id, enrichment_model(runner.backend))
     meta = EnrichmentMetaOut(
         suggested=sum(1 for row in rows if row.status == "suggested"),
         kept=sum(1 for row in rows if row.status == "kept"),
         dismissed=sum(1 for row in rows if row.status == "dismissed"),
+        searched=state["searched"],
+        thin=state["thin"],
     )
     return TopicEnrichmentOut(topic_id=topic_id, resources=resources, meta=meta)
 

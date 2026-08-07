@@ -52,7 +52,7 @@ describe("getTopicEnrichment", () => {
           status: "suggested",
         },
       ],
-      meta: { suggested: 1, kept: 0, dismissed: 0 },
+      meta: { suggested: 1, kept: 0, dismissed: 0, searched: true, thin: false },
     };
     fetchMock.mockResolvedValue(jsonResponse(body));
 

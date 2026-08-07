@@ -18,6 +18,13 @@ import { OutlinePanel } from "../panels/OutlinePanel";
 import { TaxonomyEditor } from "../panels/TaxonomyEditor";
 import { useUiStore } from "../state/uiStore";
 
+/** Every status an enrichment run can END on (runner.py's
+ * `_execute_enrichment` / `_EnrichmentRunHooks.on_finish`). A run that
+ * aborted on the cost cap or failed still wrote rows for whatever it got
+ * through, so the read models must be refreshed for all of these -- not just
+ * the happy one. */
+const ENRICHMENT_TERMINAL_STATUSES = new Set(["complete", "aborted", "failed"]);
+
 export function CourseWorkspacePage() {
   const { courseId: courseIdParam } = useParams<{ courseId: string }>();
   const courseId = Number(courseIdParam);
@@ -115,7 +122,11 @@ export function CourseWorkspacePage() {
   // Find/Refresh button in TopicSupplementary -- plus the affected
   // topic-enrichment read model(s): just this topic's when the event
   // carries one, every mounted topic's on a finished course-wide batch
-  // (no topicId). Enrichment never changes the graph payload (it only
+  // (no topicId). "Finished" means ANY terminal status, not just
+  // 'complete': a batch that aborted on the cost cap or failed partway
+  // still wrote rows for the topics it got through, and treating those
+  // runs as non-events left the panels showing stale data with nothing to
+  // trigger a refetch. Enrichment never changes the graph payload (it only
   // writes enrichment_resources), so no graph/course refetch here.
   useEffect(() => {
     if (!courseIdValid) return;
@@ -131,7 +142,7 @@ export function CourseWorkspacePage() {
         queryClient.invalidateQueries({ queryKey: ["pipeline-status", courseId] });
         if (event.topicId !== undefined) {
           queryClient.invalidateQueries({ queryKey: ["topic-enrichment", event.topicId] });
-        } else if (event.status === "complete") {
+        } else if (ENRICHMENT_TERMINAL_STATUSES.has(event.status)) {
           queryClient.invalidateQueries({ queryKey: ["topic-enrichment"] });
         }
       }

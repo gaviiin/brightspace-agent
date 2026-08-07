@@ -138,11 +138,7 @@ export function TopicSupplementary({ topicId, courseId, mockLlm, runActive }: To
     <div>
       <SectionHeading meta={hasAny ? meta : undefined} />
 
-      {!hasAny && (
-        <p className="mb-2 text-sm text-neutral-500 dark:text-neutral-400">
-          No supplementary materials yet. BrightSpace Agent can search the web for resources that fit this topic.
-        </p>
-      )}
+      {!hasAny && <EmptyState searched={meta.searched} thin={meta.thin} /> }
 
       {hasAny && (
         <ul className="mb-2 space-y-1.5">
@@ -184,11 +180,45 @@ export function TopicSupplementary({ topicId, courseId, mockLlm, runActive }: To
           dryRun={dryRunMutation.data}
           mockLlm={mockLlm}
           confirming={enrichMutation.isPending}
+          error={enrichMutation.isError ? enrichMutation.error : null}
           onCancel={() => setConfirmOpen(false)}
           onConfirm={() => enrichMutation.mutate()}
         />
       )}
     </div>
+  );
+}
+
+/** Three honestly different empty states. Showing one line for all of them
+ * ("No supplementary materials yet") quietly implies nobody has looked, even
+ * when the agent has searched twice and come back with nothing -- which is a
+ * real answer the student is entitled to, and the difference between "press
+ * this button" and "pressing it again probably won't help". `searched`/`thin`
+ * come from the backend's own record of the last completed run for this
+ * topic's current content (api/enrichment.py's `EnrichmentMetaOut`). */
+function EmptyState({ searched, thin }: { searched: boolean; thin: boolean }) {
+  if (!searched) {
+    return (
+      <p className="mb-2 text-sm text-neutral-500 dark:text-neutral-400">
+        Not searched yet. BrightSpace Agent can look for web resources that fit this topic.
+      </p>
+    );
+  }
+  if (thin) {
+    return (
+      <p className="mb-2 text-sm text-neutral-500 dark:text-neutral-400">
+        Searched, but nothing good enough was found for this topic. Adding more course materials — or
+        refreshing later — may help.
+      </p>
+    );
+  }
+  // Searched, not thin, yet nothing is listed: the resources it found now
+  // live somewhere else -- most often the course batch's cross-topic dedup
+  // kept a shared URL on a better-fitting topic.
+  return (
+    <p className="mb-2 text-sm text-neutral-500 dark:text-neutral-400">
+      Searched, but nothing is listed for this topic right now.
+    </p>
   );
 }
 
@@ -288,6 +318,10 @@ interface EnrichDryRunConfirmDialogProps {
   dryRun: EnrichDryRunResponse;
   mockLlm: boolean;
   confirming: boolean;
+  /** A failed `enrichTopic` call (409 while another run is active, say).
+   * Without this the dialog just stops saying "Starting…" and nothing else
+   * happens, which reads as the app ignoring the click. */
+  error: unknown;
   onCancel: () => void;
   onConfirm: () => void;
 }
@@ -296,11 +330,25 @@ function formatUsd(amount: number): string {
   return `$${amount.toFixed(4)}`;
 }
 
+/** api/client.ts throws an Error carrying the backend's status/detail; keep
+ * anything else readable rather than rendering "[object Object]". */
+function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  return "unexpected error";
+}
+
 /** Same shape as CourseWorkspacePage's `DryRunConfirmDialog` (same
  * dry-run -> confirm pattern, same styling) but for the enrichment
  * dry-run's own response shape, which has no `byStage` breakdown -- just a
  * calls/cost-per-topic estimate (api/enrichment.py's `EnrichDryRunResponse`). */
-function EnrichDryRunConfirmDialog({ dryRun, mockLlm, confirming, onCancel, onConfirm }: EnrichDryRunConfirmDialogProps) {
+function EnrichDryRunConfirmDialog({
+  dryRun,
+  mockLlm,
+  confirming,
+  error,
+  onCancel,
+  onConfirm,
+}: EnrichDryRunConfirmDialogProps) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
       <div
@@ -336,6 +384,12 @@ function EnrichDryRunConfirmDialog({ dryRun, mockLlm, confirming, onCancel, onCo
         {mockLlm && (
           <p className="mt-2 rounded-md bg-amber-50 px-2 py-1.5 text-xs text-amber-700 dark:bg-amber-950 dark:text-amber-300">
             Mock mode — free. No real LLM calls will be made or billed.
+          </p>
+        )}
+
+        {error != null && (
+          <p role="alert" className="mt-2 text-xs text-red-600 dark:text-red-400">
+            Couldn't start the search: {errorMessage(error)}
           </p>
         )}
 

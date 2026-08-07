@@ -715,6 +715,36 @@ def _write_resources(session: Session, topic_id: int, resources: list[dict], *, 
     return written
 
 
+def enrichment_model(backend: LLMBackend) -> str:
+    """The model id this stage's `llm_cache` rows are keyed on. Public so the
+    API can look a topic's enrichment state up (see `topic_state`) against the
+    same key the stage writes -- including in mock mode, where it is
+    'mock-smart' rather than the configured smart model."""
+    return backend.model_for_tier(_TIER)
+
+
+def topic_state(session: Session, topic_id: int, model: str) -> dict:
+    """`{"searched": bool, "thin": bool}` for `topic_id` AS IT IS NOW.
+
+    This is what lets the UI tell "we haven't looked yet" apart from "we
+    looked and there genuinely isn't anything good" -- two states that
+    otherwise render as the same empty list. It's derived from this stage's
+    own cache row rather than a new column because the cache row already
+    answers exactly the right question: it exists only if a run COMPLETED
+    (an aborted run deliberately writes none), it is keyed on a hash of the
+    topic's current content, so it stops applying the moment the topic
+    changes -- which is precisely when "we already searched this" stops being
+    true -- and it carries the run's own `thin` verdict.
+    """
+    context = _gather_context(session, topic_id)
+    if context is None:
+        return {"searched": False, "thin": False}
+    payload = _read_cache(session, context.cache_sha(), model)
+    if payload is None:
+        return {"searched": False, "thin": False}
+    return {"searched": True, "thin": bool(payload.get("thin"))}
+
+
 def _read_cache(session: Session, context_sha: str, model: str) -> dict | None:
     """The cached enrichment payload ({"resources": [...], "thin": bool}), or
     None if there is no usable row. As in summarize/classify, an unparseable or

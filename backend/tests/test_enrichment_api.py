@@ -158,8 +158,68 @@ def test_get_topic_enrichment_empty_before_any_run(client, db_session_factory):
     assert body == {
         "topicId": topic_id,
         "resources": [],
-        "meta": {"suggested": 0, "kept": 0, "dismissed": 0},
+        # searched=False: nobody has run enrichment for this topic, which the
+        # UI must be able to tell apart from "ran and found nothing".
+        "meta": {"suggested": 0, "kept": 0, "dismissed": 0, "searched": False, "thin": False},
     }
+
+
+def test_meta_reports_searched_and_thin_after_a_run_that_found_nothing(client, db_session_factory, app):
+    """A completed run that surfaced nothing is reported honestly -- searched,
+    thin -- so the panel can say so instead of showing the same 'nothing yet'
+    copy it shows a topic nobody has looked at."""
+    from brightspace_agent.agents.schemas import Verification
+
+    course_id = _add_course(db_session_factory)
+    topic_id = _add_topic(db_session_factory, course_id)
+
+    class _RejectEverythingWeb:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def find(self, *, system, user, tier):
+            return self._inner.find(system=system, user=user, tier=tier)
+
+        def verify(self, *, system, user, tier):
+            _, usage = self._inner.verify(system=system, user=user, tier=tier)
+            return (
+                Verification(
+                    ok=False, accessible=False, on_topic=False, level_fit="unknown",
+                    evidence_quote="", reason="dead link",
+                ),
+                usage,
+            )
+
+    app.state.runner.web_backend = _RejectEverythingWeb(app.state.runner.web_backend)
+
+    assert client.post(f"/api/topics/{topic_id}/enrich", headers=CSRF_HEADERS).status_code == 200
+    _wait_for_enrichment_idle(client, topic_id)
+
+    body = client.get(f"/api/topics/{topic_id}/enrichment").json()
+    assert body["resources"] == []
+    assert body["meta"]["searched"] is True
+    assert body["meta"]["thin"] is True
+
+
+def test_meta_reports_not_searched_again_once_the_topic_changes(client, db_session_factory):
+    """`searched` tracks the topic's CURRENT content: edit the topic and the
+    honest answer is "not searched yet" again."""
+    course_id = _add_course(db_session_factory)
+    topic_id = _add_topic(db_session_factory, course_id)
+    _attach_material(
+        db_session_factory, course_id, topic_id,
+        title="Lecture 7 BFS", summary="Covers BFS on unweighted graphs, queue frontier, shortest paths.",
+    )
+
+    assert client.post(f"/api/topics/{topic_id}/enrich", headers=CSRF_HEADERS).status_code == 200
+    _wait_for_enrichment_idle(client, topic_id)
+    assert client.get(f"/api/topics/{topic_id}/enrichment").json()["meta"]["searched"] is True
+
+    with db_session_factory() as session:
+        session.get(Topic, topic_id).description = "A completely rewritten description of this topic."
+        session.commit()
+
+    assert client.get(f"/api/topics/{topic_id}/enrichment").json()["meta"]["searched"] is False
 
 
 def test_get_topic_enrichment_shape_after_a_real_run(client, db_session_factory):
@@ -189,7 +249,10 @@ def test_get_topic_enrichment_shape_after_a_real_run(client, db_session_factory)
         assert isinstance(resource["scores"], dict)
         assert isinstance(resource["verification"], dict)
         assert resource["shared"] is False
-    assert body["meta"] == {"suggested": len(body["resources"]), "kept": 0, "dismissed": 0}
+    assert body["meta"] == {
+        "suggested": len(body["resources"]), "kept": 0, "dismissed": 0,
+        "searched": True, "thin": False,  # it ran, and it found enough
+    }
 
 
 # --------------------------------------------------------------------------

@@ -225,6 +225,14 @@ export interface EnrichmentMeta {
   suggested: number;
   kept: number;
   dismissed: number;
+  /** True once an enrichment run has COMPLETED for this topic's current
+   * content (api/enrichment.py derives it from the enrich stage's cache
+   * row). Lets the empty state say "not searched yet" or "searched, found
+   * nothing" instead of one line that could mean either. */
+  searched: boolean;
+  /** The completed run found fewer good resources than it aimed for. Only
+   * meaningful when `searched` is true. */
+  thin: boolean;
 }
 
 export interface TopicEnrichment {

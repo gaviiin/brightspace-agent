@@ -63,7 +63,7 @@ beforeEach(() => {
   mockedGetTopicEnrichment.mockResolvedValue({
     topicId: 1,
     resources: [],
-    meta: { suggested: 0, kept: 0, dismissed: 0 },
+    meta: { suggested: 0, kept: 0, dismissed: 0, searched: false, thin: false },
   });
 });
 
@@ -110,7 +110,7 @@ describe("DetailPanel: topic selected", () => {
     useUiStore.setState({ selection: { type: "topic", id: 1 } });
     renderDetailPanel(fixturePayload());
 
-    expect(await screen.findByText(/no supplementary materials yet/i)).toBeTruthy();
+    expect(await screen.findByText(/not searched yet/i)).toBeTruthy();
     expect(mockedGetTopicEnrichment).toHaveBeenCalledWith(1);
   });
 });
