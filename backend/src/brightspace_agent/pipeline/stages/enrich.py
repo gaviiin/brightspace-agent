@@ -17,6 +17,12 @@ The per-topic pipeline is five steps:
    to the relevance/authority axes, pick a diverse top `target_max`, and
    upsert the rows (existing URLs updated in place, never duplicated).
 
+The course-batch entry point (`run_enrich_stage`) adds a sixth step after
+every topic finishes: a **cross-topic dedup pass**. Topics research
+independently, so one genuinely good page often lands under several of them;
+the pass keeps it on its best-fit topic (marking that row `shared`) and
+deletes the un-actioned duplicates elsewhere. See `_dedupe_across_topics`.
+
 Nothing the model returns is trusted as-is: the verifier re-checks every URL,
 the judge's rank is advisory (the stage re-ranks after bias), and the kept set
 is capped in code. If fewer than `target_min` survive, the planner is
@@ -819,12 +825,86 @@ async def run_enrich_stage(
             stats.failed += 1
         else:
             _merge_stats(stats, result)
+
+    stats.deduped += _dedupe_across_topics(session_factory, course_id, version)
     return stats
+
+
+def _dedupe_across_topics(session_factory: sessionmaker[Session], course_id: int, version: int) -> int:
+    """Cross-topic dedup, the batch path's closing pass.
+
+    Each topic researches independently, so a genuinely good page (an OCW
+    lecture, say) is routinely found under several topics of the same course.
+    Left alone the student sees the same link five times and `shared` -- a
+    column, an API field and a frontend type -- is constitutively false.
+
+    For every URL present under more than one topic at `version`, keep the row
+    on its best-fit topic, mark it `shared`, and delete the duplicates.
+    Best-fit is:
+
+      1. a row the student has already ACTIONED (kept/dismissed) wins outright
+         -- their decision anchors the URL to that topic, and no ranking of
+         ours gets to overrule it;
+      2. then highest mean rubric score (what produced `rank` in the first
+         place);
+      3. then lowest topic id, purely so the result is deterministic.
+
+    Only un-actioned 'suggested' duplicates are ever deleted. A kept or
+    dismissed row on a losing topic stays exactly as it is (it is just also
+    marked `shared`) -- pruning must never destroy a student decision. Note
+    `shared` is only ever set, never cleared: it records "this URL was
+    contested across topics", which stays true after the losers are gone.
+
+    Returns the number of duplicate rows removed.
+    """
+    removed = 0
+    with session_factory() as session:
+        rows = list(
+            session.execute(
+                select(EnrichmentResource)
+                .join(Topic, Topic.id == EnrichmentResource.topic_id)
+                .where(Topic.course_id == course_id, Topic.taxonomy_version == version)
+            ).scalars().all()
+        )
+        by_url: dict[str, list[EnrichmentResource]] = {}
+        for row in rows:
+            by_url.setdefault(row.url, []).append(row)
+
+        for url, group in by_url.items():
+            if len({row.topic_id for row in group}) < 2:
+                continue
+            winner = min(group, key=_best_fit_key)
+            for row in group:
+                row.shared = 1
+                if row is winner or row.status != "suggested":
+                    continue
+                session.delete(row)
+                removed += 1
+            logger.info(
+                "enrich: %s appeared under %d topics; kept on topic %s (%d duplicate(s) removed)",
+                url, len(group), winner.topic_id, removed,
+            )
+        session.commit()
+    return removed
+
+
+def _best_fit_key(row: EnrichmentResource) -> tuple[int, float, int]:
+    """Sort key for `_dedupe_across_topics` (lower wins): student-actioned
+    first, then best mean rubric score, then lowest topic id as the
+    deterministic tie-break."""
+    try:
+        scores = json.loads(row.scores_json) if row.scores_json else {}
+        values = [float(value) for value in scores.values()]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        values = []
+    mean = sum(values) / len(values) if values else 0.0
+    return (0 if row.status in ("kept", "dismissed") else 1, -mean, row.topic_id)
 
 
 def _merge_stats(into: StageStats, other: StageStats) -> None:
     into.enriched += other.enriched
     into.thin_topics += other.thin_topics
+    into.deduped += other.deduped
     into.cached_hits += other.cached_hits
     into.failed += other.failed
     into.aborted = into.aborted or other.aborted

@@ -814,3 +814,144 @@ def test_a_run_that_finds_nothing_clears_stale_suggestions(session_factory, topi
 
     assert stats.thin_topics == 1
     assert _rows(session_factory, topic_id) == []
+
+
+# --------------------------------------------------------------------------
+# (10) Cross-topic dedup: one URL, one topic, `shared` actually means something
+# --------------------------------------------------------------------------
+
+
+def _rows_for_course(session_factory, course_id) -> list[EnrichmentResource]:
+    with session_factory() as session:
+        rows = list(
+            session.execute(
+                select(EnrichmentResource)
+                .join(Topic, Topic.id == EnrichmentResource.topic_id)
+                .where(Topic.course_id == course_id)
+                .order_by(EnrichmentResource.url, EnrichmentResource.topic_id)
+            ).scalars().all()
+        )
+        for row in rows:
+            session.expunge(row)
+        return rows
+
+
+class _ScoringLLM:
+    """MockBackend's planner, but a judge that scores each URL from a supplied
+    table -- so a cross-topic duplicate can be made to score better on one
+    topic than the other."""
+
+    def __init__(self, scores_by_url: dict[str, float]) -> None:
+        self._inner = MockBackend()
+        self._scores = scores_by_url
+
+    def structured_call(self, schema, *, system, user, tier):
+        if schema is not JudgeResult:
+            return self._inner.structured_call(schema, system=system, user=user, tier=tier)
+        judged, usage = self._inner.structured_call(schema, system=system, user=user, tier=tier)
+        for resource in judged.resources:
+            value = self._scores.get(resource.url, 0.5)
+            resource.scores = {axis: value for axis in
+                               ("relevance", "authority", "recency", "level_match", "pedagogical_value")}
+        return judged, usage
+
+    def model_for_tier(self, tier):
+        return self._inner.model_for_tier(tier)
+
+
+_SHARED_URL = "https://ocw.mit.edu/shared-lecture"
+
+
+def _seed_two_topics_sharing_a_url(session_factory, course_id):
+    first = _seed_topic(session_factory, course_id, slug="bfs", name="Breadth-First Search")
+    second = _seed_topic(session_factory, course_id, slug="dfs", name="Depth-First Search", order_index=1)
+    return first, second
+
+
+def _shared_url_web():
+    """Every topic's finder proposes the same shared URL plus a topic-specific
+    one, so exactly one URL is contested."""
+
+    def _find(user):
+        topic = "bfs" if "Breadth" in user else "dfs"
+        return _candidates(_SHARED_URL, f"https://ocw.mit.edu/{topic}-only")
+
+    return _StubWeb(find=_find, verify=_OK_VERIFICATION)
+
+
+def test_batch_keeps_a_shared_url_on_its_best_fit_topic_only(session_factory, course_id):
+    first, second = _seed_two_topics_sharing_a_url(session_factory, course_id)
+    # The shared URL scores better while judging the SECOND topic's prompt --
+    # emulated here by scoring per URL and giving the loser topic's own URL a
+    # lower score, so the tie-break is exercised by topic id rather than luck.
+    llm = _ScoringLLM({_SHARED_URL: 0.9})
+
+    stats = asyncio.run(run_enrich_stage(session_factory, llm, _shared_url_web(), course_id))
+
+    shared_rows = [row for row in _rows_for_course(session_factory, course_id) if row.url == _SHARED_URL]
+    assert len(shared_rows) == 1  # exactly one survivor across the course
+    assert shared_rows[0].topic_id == min(first, second)  # deterministic tie-break
+    assert shared_rows[0].shared == 1  # and it says so
+    assert stats.deduped == 1
+    # The topic-specific URLs are untouched.
+    other_urls = {row.url for row in _rows_for_course(session_factory, course_id)} - {_SHARED_URL}
+    assert other_urls == {"https://ocw.mit.edu/bfs-only", "https://ocw.mit.edu/dfs-only"}
+
+
+def test_dedup_never_destroys_a_student_decision(session_factory, course_id):
+    first, second = _seed_two_topics_sharing_a_url(session_factory, course_id)
+    asyncio.run(run_enrich_stage(session_factory, _ScoringLLM({_SHARED_URL: 0.9}), _shared_url_web(), course_id))
+
+    # Re-seed the duplicate by hand and mark the SECOND topic's copy kept: the
+    # student has decided this link belongs there.
+    with session_factory() as session:
+        session.add(
+            EnrichmentResource(
+                topic_id=second, url=_SHARED_URL, title="Shared", resource_type="notes",
+                intent="university_notes", rationale="student kept this here",
+                scores_json=json.dumps({"relevance": 0.1}), verification_json="{}", rank=1, status="kept",
+            )
+        )
+        session.commit()
+
+    with session_factory() as session:
+        session.execute(delete(LlmCache).where(LlmCache.stage == "enrich"))
+        session.commit()
+    asyncio.run(run_enrich_stage(session_factory, _ScoringLLM({_SHARED_URL: 0.9}), _shared_url_web(), course_id))
+
+    shared_rows = [row for row in _rows_for_course(session_factory, course_id) if row.url == _SHARED_URL]
+    # The kept row wins outright despite its far worse scores, and survives.
+    assert [(row.topic_id, row.status) for row in shared_rows] == [(second, "kept")]
+    assert shared_rows[0].shared == 1
+    assert first  # sanity: the other topic existed and lost its suggested copy
+
+
+def test_dedup_leaves_a_dismissed_duplicate_alone(session_factory, course_id):
+    first, second = _seed_two_topics_sharing_a_url(session_factory, course_id)
+    asyncio.run(run_enrich_stage(session_factory, _ScoringLLM({_SHARED_URL: 0.9}), _shared_url_web(), course_id))
+
+    with session_factory() as session:
+        session.add(
+            EnrichmentResource(
+                topic_id=second, url=_SHARED_URL, title="Shared", resource_type="notes",
+                intent="university_notes", rationale="student said no",
+                scores_json=json.dumps({"relevance": 0.9}), verification_json="{}", rank=1, status="dismissed",
+            )
+        )
+        session.execute(delete(LlmCache).where(LlmCache.stage == "enrich"))
+        session.commit()
+
+    asyncio.run(run_enrich_stage(session_factory, _ScoringLLM({_SHARED_URL: 0.9}), _shared_url_web(), course_id))
+
+    shared_rows = [row for row in _rows_for_course(session_factory, course_id) if row.url == _SHARED_URL]
+    statuses = {(row.topic_id, row.status) for row in shared_rows}
+    assert (second, "dismissed") in statuses  # never deleted, never flipped
+    assert all(row.shared == 1 for row in shared_rows)
+    assert first  # sanity
+
+
+def test_single_topic_run_never_marks_anything_shared(session_factory, topic_id):
+    stats = _run_topic(session_factory, MockBackend(), MockWebBackend(), topic_id)
+
+    assert stats.deduped == 0
+    assert all(row.shared == 0 for row in _rows(session_factory, topic_id))

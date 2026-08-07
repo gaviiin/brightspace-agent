@@ -45,6 +45,11 @@ class StageStats:
     # can say "we couldn't find much for this one" instead of showing filler.
     enriched: int = 0
     thin_topics: int = 0
+    # Duplicate rows removed by the course-batch's cross-topic dedup pass: a
+    # URL found under several topics is kept on its best-fit topic (marked
+    # `shared`) and dropped from the rest. Always 0 on a single-topic run,
+    # which has nothing to dedup against.
+    deduped: int = 0
 
     # Every stage
     cached_hits: int = 0
