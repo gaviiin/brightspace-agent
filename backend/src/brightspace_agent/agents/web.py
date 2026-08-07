@@ -307,11 +307,13 @@ def _count_searches(message: object, tools: list[dict], tier: Tier) -> int:
             charged,
         )
         return charged
-    return sum(
+    counted = sum(
         1
         for block in blocks
         if block.get("type") == "server_tool_use" and block.get("name") == "web_search"
     )
+    logger.info("web: counted %d web_search use(s) from response blocks", counted)
+    return counted
 
 
 # --------------------------------------------------------------------------

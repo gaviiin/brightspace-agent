@@ -472,17 +472,19 @@ def test_unknowable_search_count_charges_the_conservative_max_uses(caplog):
     assert any("max_uses" in record.message for record in caplog.records if record.levelno == logging.WARNING)
 
 
-def test_exact_search_count_does_not_warn(caplog):
+def test_exact_search_count_logs_info_not_warning(caplog):
     chat = _StubChat(
         tool_turn=AIMessage(content=_TOOL_TURN_BLOCKS),
         coercion_results=[{"parsed": _CANDIDATES, "parsing_error": None, "raw": _Usage(0, 0)}],
     )
     backend = _backend_with(chat)
 
-    with caplog.at_level(logging.WARNING, logger="brightspace_agent.agents.web"):
+    with caplog.at_level(logging.INFO, logger="brightspace_agent.agents.web"):
         backend.find(system="sys", user="usr", tier="smart")
 
     assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+    # The exact count is visible at INFO, so a live run shows its arithmetic.
+    assert any("counted 2 web_search" in record.getMessage() for record in caplog.records)
 
 
 # --------------------------------------------------------------------------
