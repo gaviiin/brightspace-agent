@@ -204,8 +204,6 @@ def test_web_tools_smart_tier_versions():
 
     assert by_name["web_search"]["type"] == "web_search_20260209"
     assert by_name["web_fetch"]["type"] == "web_fetch_20260209"
-    assert by_name["web_search"]["max_uses"] == 8
-    assert by_name["web_fetch"]["max_uses"] == 8
 
 
 def test_web_tools_fast_tier_versions():
@@ -214,6 +212,20 @@ def test_web_tools_fast_tier_versions():
 
     assert by_name["web_search"]["type"] == "web_search_20250305"
     assert by_name["web_fetch"]["type"] == "web_fetch_20250910"
+
+
+def test_web_tools_bound_the_tool_loop_on_every_tier():
+    """The 2026-08-07 live run: 8 uncapped searches + 8 uncapped page fetches
+    per finder billed ~700k input tokens PER CALL (the whole accumulated
+    context re-bills every internal iteration) -- $11.96 for one topic before
+    the cap aborted it. These bounds are what make a finder call affordable;
+    loosening them is a cost decision, not a tuning knob."""
+    for tier in ("fast", "smart"):
+        by_name = {tool["name"]: tool for tool in _web_tools(tier)}
+        assert by_name["web_search"]["max_uses"] == 4
+        assert by_name["web_fetch"]["max_uses"] == 3
+        assert by_name["web_fetch"]["max_content_tokens"] == 12_000
+        assert "max_content_tokens" not in by_name["web_search"]
 
 
 def test_web_tools_has_exactly_search_and_fetch():
@@ -465,8 +477,8 @@ def test_unknowable_search_count_charges_the_conservative_max_uses(caplog):
     with caplog.at_level(logging.WARNING, logger="brightspace_agent.agents.web"):
         _, usage = backend.find(system="sys", user="usr", tier="smart")
 
-    assert web_search_max_uses("smart") == 8
-    assert usage["est_cost_usd"] == pytest.approx(8 * WEB_SEARCH_COST_PER_SEARCH_USD)
+    assert web_search_max_uses("smart") == 4
+    assert usage["est_cost_usd"] == pytest.approx(4 * WEB_SEARCH_COST_PER_SEARCH_USD)
     # The guess must be observable: silence here is what made the fallback
     # impossible to calibrate against real traffic.
     assert any("max_uses" in record.message for record in caplog.records if record.levelno == logging.WARNING)

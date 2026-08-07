@@ -483,6 +483,23 @@ def test_dry_run_counts_match_db_state_no_backend_calls(client, app, db_session_
     assert needs_enrichment  # sanity: fixture used
 
 
+def test_per_topic_estimate_prices_the_tool_loop_realistically():
+    """The 2026-08-07 live run measured ~700k input tokens per uncapped
+    smart-tier finder call ($11.96/topic); the old estimate assumed 3k. The
+    estimate must model the bounded tool loop at the tiers the stage actually
+    uses: finders/verifiers on the fast model, plan/judge on smart."""
+    from brightspace_agent.api.enrichment import _FINDER_TOKENS, _per_topic_estimate
+
+    calls, cost, searches = _per_topic_estimate("claude-sonnet-5", "claude-haiku-4-5-20251001")
+
+    assert _FINDER_TOKENS[0] >= 100_000  # tool loops re-bill context; 3k was fantasy
+    assert searches == 20  # 5 intents x web_search max_uses 4
+    assert calls == 12  # planner + 5 finders + 5 verifiers + judge
+    # Honest band: dominated by finder input tokens at fast-model pricing,
+    # bounded well below the $5 per-topic cap.
+    assert 0.8 <= cost <= 3.0
+
+
 def test_dry_run_includes_the_per_search_web_search_fee(client, db_session_factory):
     # web_search is billed per search (~$0.01) on top of tokens, and at up to
     # max_uses searches per finder it dominates the token cost -- an estimate

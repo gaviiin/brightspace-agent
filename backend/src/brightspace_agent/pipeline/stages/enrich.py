@@ -81,31 +81,33 @@ from brightspace_agent.pipeline.stats import StageStats
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "s5.v1"
+# v2: tier split (fast finders/verifiers) + bounded tool loops -- results
+# from the all-smart configuration must not replay from cache as if
+# equivalent.
+PROMPT_VERSION = "s5.v2"
 _STAGE = "enrich"
 
-# TIER DECISION (deviates from the plan, deliberately, and recorded here so
-# the deviation isn't silent). The plan put the finders/verifiers on the fast
-# (haiku) tier and only the planner/judge on smart. Everything runs smart:
+# TIER DECISION. The plan put finders/verifiers on the fast (haiku) tier and
+# only the planner/judge on smart. M3.1 deviated and ran everything smart,
+# betting that Sonnet's dynamic-filtering web tools would be worth it. The
+# 2026-08-07 live run settled the bet the other way: a server-side tool loop
+# re-bills the accumulated context (dominated by fetched pages) on every
+# internal iteration, so ONE smart-tier finder call billed ~700k input
+# tokens, and one topic committed ~$12 before the cost cap could abort it.
 #
-#  - Finder: it drives Anthropic's dynamic-filtering server web tools, which
-#    need a Sonnet-4.6-or-newer model to be used well; a haiku finder either
-#    can't use them or uses them badly, and the finder is where a bad call
-#    costs the most (garbage candidates burn verifier calls downstream).
-#  - Verifier: it *could* run fast-tier -- it binds only the basic web_fetch
-#    tool and answers one narrow question (is this page live, accessible,
-#    on-topic, at the right level?). It is on smart today only because
-#    splitting the tiers is a quality/cost experiment we haven't run: haiku
-#    reading a fetched page and quoting real evidence from it is exactly the
-#    kind of judgement that degrades quietly, and a bad verifier verdict is
-#    invisible (a wrong link the student then trusts) rather than loud.
-#
-# `_WEB_TOOLS_BY_TIER['fast']` in agents/web.py is kept for that split -- it
-# is the versioned tool spec a fast-tier verifier would need, NOT dead code
-# to delete. The experiment worth running: verifiers on fast, measure kept/
-# dismissed rates per tier via domain_reputation before making it the default.
+# So the plan's tiering is restored, with the loop bounds in agents/web.py
+# (`max_uses`, `max_content_tokens`) doing the heavy lifting on cost:
+#  - Planner + judge: smart. One call each per topic, no tools, and they are
+#    where quality is concentrated (grounded queries in, final ranking out).
+#  - Finder + verifier: fast. They use the basic (non-dynamic-filtering)
+#    web tool variants, which is what the plan intended. If fast-tier
+#    verification degrades link quality, keep/dismiss rates in
+#    domain_reputation will show it -- that experiment now runs in reverse.
 ENRICH_TIER: Tier = "smart"
-_TIER: Tier = ENRICH_TIER
+PLAN_TIER: Tier = "smart"
+JUDGE_TIER: Tier = "smart"
+FIND_TIER: Tier = "fast"
+VERIFY_TIER: Tier = "fast"
 
 _MAX_CONTEXT_MATERIALS = 15
 _FANOUT_CONCURRENCY = 4
@@ -337,7 +339,7 @@ async def run_topic_enrichment(
             logger.warning("enrich: topic %s not found; skipping", topic_id)
             return stats
 
-    model = backend.model_for_tier(_TIER)
+    model = backend.model_for_tier(ENRICH_TIER)
     context_sha = context.cache_sha()
 
     # Cache: a hit replays the stored resources with no LLM/web calls.
@@ -422,7 +424,7 @@ async def _plan(
         SearchPlan,
         system=_PLANNER_PROMPT,
         user=_planner_user(context, failures),
-        tier=_TIER,
+        tier=PLAN_TIER,
     )
     _record_usage(stats, usage, lock)
     return plan
@@ -459,7 +461,7 @@ async def _find_and_verify(
                 web_backend.find,
                 system=_FINDER_PROMPT,
                 user=_finder_user(context, intent.intent, intent.query, intent.rationale),
-                tier=_TIER,
+                tier=FIND_TIER,
             )
             _record_usage(stats, usage, lock)
             return list(result.candidates)
@@ -483,7 +485,7 @@ async def _find_and_verify(
                 web_backend.verify,
                 system=_VERIFIER_PROMPT,
                 user=_verifier_user(context, candidate),
-                tier=_TIER,
+                tier=VERIFY_TIER,
             )
             _record_usage(stats, usage, lock)
             return candidate, verification
@@ -528,7 +530,7 @@ async def _judge_and_rank(
         JudgeResult,
         system=_JUDGE_PROMPT,
         user=_judge_user(context, survivors),
-        tier=_TIER,
+        tier=JUDGE_TIER,
     )
     _record_usage(stats, usage, lock)
 
@@ -721,7 +723,7 @@ def enrichment_model(backend: LLMBackend) -> str:
     API can look a topic's enrichment state up (see `topic_state`) against the
     same key the stage writes -- including in mock mode, where it is
     'mock-smart' rather than the configured smart model."""
-    return backend.model_for_tier(_TIER)
+    return backend.model_for_tier(ENRICH_TIER)
 
 
 def topic_state(session: Session, topic_id: int, model: str) -> dict:

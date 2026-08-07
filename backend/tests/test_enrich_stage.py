@@ -979,6 +979,44 @@ def test_a_dismissal_on_one_topic_does_not_hide_the_link_on_another(session_fact
     assert (second, "dismissed") in statuses
 
 
+def test_tiers_plan_and_judge_smart_find_and_verify_fast(session_factory, topic_id):
+    """The plan's tiering, restored after the 2026-08-07 live run: the web
+    tool loop's token amplification makes smart-tier finders/verifiers
+    unaffordable (~$12/topic), while plan and judge stay on the strong model."""
+    llm_tiers: dict[str, set] = {"SearchPlan": set(), "JudgeResult": set()}
+    web_tiers: dict[str, set] = {"find": set(), "verify": set()}
+
+    class _TierSpyLLM:
+        def __init__(self):
+            self._inner = MockBackend()
+
+        def structured_call(self, schema, *, system, user, tier):
+            llm_tiers.setdefault(schema.__name__, set()).add(tier)
+            return self._inner.structured_call(schema, system=system, user=user, tier=tier)
+
+        def model_for_tier(self, tier):
+            return self._inner.model_for_tier(tier)
+
+    class _TierSpyWeb:
+        def __init__(self):
+            self._inner = MockWebBackend()
+
+        def find(self, *, system, user, tier):
+            web_tiers["find"].add(tier)
+            return self._inner.find(system=system, user=user, tier=tier)
+
+        def verify(self, *, system, user, tier):
+            web_tiers["verify"].add(tier)
+            return self._inner.verify(system=system, user=user, tier=tier)
+
+    _run_topic(session_factory, _TierSpyLLM(), _TierSpyWeb(), topic_id)
+
+    assert llm_tiers["SearchPlan"] == {"smart"}
+    assert llm_tiers["JudgeResult"] == {"smart"}
+    assert web_tiers["find"] == {"fast"}
+    assert web_tiers["verify"] == {"fast"}
+
+
 def test_single_topic_run_never_marks_anything_shared(session_factory, topic_id):
     stats = _run_topic(session_factory, MockBackend(), MockWebBackend(), topic_id)
 

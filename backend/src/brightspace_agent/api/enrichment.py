@@ -21,12 +21,12 @@ from pydantic.alias_generators import to_camel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from brightspace_agent.agents.llm import WEB_SEARCH_COST_PER_SEARCH_USD, Tier, _estimate_cost_usd
+from brightspace_agent.agents.llm import WEB_SEARCH_COST_PER_SEARCH_USD, _estimate_cost_usd
 from brightspace_agent.agents.web import web_search_max_uses
 from brightspace_agent.api.deps import get_runner, get_session
 from brightspace_agent.db.models import Course, EnrichmentResource, Topic
 from brightspace_agent.pipeline.reputation import domain_of, record_feedback
-from brightspace_agent.pipeline.stages.enrich import ENRICH_TIER, enrichment_model, topic_state
+from brightspace_agent.pipeline.stages.enrich import FIND_TIER, enrichment_model, topic_state
 from brightspace_agent.pipeline.runner import PipelineRunner, RunActiveError, TopicNotFoundError
 
 router = APIRouter(tags=["enrichment"])
@@ -205,20 +205,27 @@ def update_enrichment_status(
 # GET /api/courses/{course_id}/enrich/dry-run
 # --------------------------------------------------------------------------
 
-# Token estimates for the dry-run cost estimate (see the M3.2 brief): rough
-# per-call (input, output) tokens, priced via agents.llm's cost table for the
-# configured SMART model -- planner, finder, verifier, and judge are all
-# "smart"-tier calls (pipeline/stages/enrich.py's `_TIER`). These are the
-# brief's own order-of-magnitude figures, not measured averages:
-#   - planner: ~2k in / ~1k out, one call per topic.
-#   - finder: ~3k in / ~500 out for the tool loop's own tokens, one call per
-#     search intent, PLUS the per-search web_search fee below.
-#   - verifier: ~2k in, one call per candidate -- approximated here as one
-#     per intent (i.e. every finder candidate gets verified), which is an
-#     upper bound since not every finder call necessarily proposes one.
-#     web_fetch (all the verifier binds) carries no per-use fee.
-#   - judge: ~4k in / ~2k out, one call per topic.
-# `_ASSUMED_INTENTS_PER_TOPIC` (5) is the brief's "assume ~5 intents/topic".
+# Token estimates for the dry-run cost estimate: rough per-call
+# (input, output) tokens, priced via agents.llm's cost table at the tier each
+# call actually runs on (pipeline/stages/enrich.py: plan/judge on the smart
+# model, find/verify on the fast model).
+#
+# RECALIBRATED from the 2026-08-07 live run. The original brief guessed a
+# finder at ~3k input tokens ("the tool loop's own tokens"); the live run
+# measured ~700k PER FINDER CALL, because a server-side tool loop re-bills
+# the entire accumulated context -- search results and fetched pages -- on
+# every internal iteration. One topic committed $11.96 before the cap fired.
+# With the loop now bounded (agents/web.py: 4 searches, 3 fetches at <=12k
+# tokens each) the modelled worst case per finder is ~150k input: final
+# context of ~40-50k re-billed across up to ~7 iterations, shrunk further
+# because early iterations carry only part of it. Verifier: one bounded
+# fetch re-billed a couple of times, ~25k.
+#   - planner: ~2k in / ~1k out, one smart call per topic, no tools.
+#   - finder: ~150k in / ~1.5k out, one fast call per intent, PLUS the
+#     per-search web_search fee below.
+#   - verifier: ~25k in / ~500 out, one fast call per candidate --
+#     approximated as one per intent.
+#   - judge: ~4k in / ~2k out, one smart call per topic, no tools.
 #
 # The per-search fee is the same constant the runtime cap charges
 # (agents/llm.py's WEB_SEARCH_COST_PER_SEARCH_USD), multiplied by the same
@@ -226,13 +233,13 @@ def update_enrichment_status(
 # own `max_uses` (agents/web.py). Both numbers deliberately come from one
 # place so this estimate and the cap it is supposed to preview cannot drift
 # apart. It IS an upper bound: a finder that answers after two searches is
-# billed for two, not eight, so a real run usually costs less than shown.
+# billed for two, not four, so a real run usually costs less than shown.
 #
 # This whole estimate reads the DB only -- no LLM or web call is made.
 _ASSUMED_INTENTS_PER_TOPIC = 5
 _PLANNER_TOKENS = (2_000, 1_000)
-_FINDER_TOKENS = (3_000, 500)
-_VERIFIER_TOKENS = (2_000, 300)
+_FINDER_TOKENS = (150_000, 1_500)
+_VERIFIER_TOKENS = (25_000, 500)
 _JUDGE_TOKENS = (4_000, 2_000)
 
 
@@ -264,15 +271,17 @@ def _topics_needing_enrichment(session: Session, course: Course) -> list[int]:
     return [tid for tid in topic_ids if tid not in already_enriched]
 
 
-def _per_topic_estimate(model: str, tier: Tier = ENRICH_TIER) -> tuple[int, float, int]:
-    """`(calls, est_cost_usd, web_searches)` for enriching one topic."""
+def _per_topic_estimate(smart_model: str, fast_model: str) -> tuple[int, float, int]:
+    """`(calls, est_cost_usd, web_searches)` for enriching one topic, priced
+    at the tier split the stage actually runs (plan/judge smart, find/verify
+    fast -- see enrich.py's TIER DECISION)."""
     calls = 1 + _ASSUMED_INTENTS_PER_TOPIC + _ASSUMED_INTENTS_PER_TOPIC + 1  # planner + finders + verifiers + judge
-    searches = _ASSUMED_INTENTS_PER_TOPIC * web_search_max_uses(tier)
+    searches = _ASSUMED_INTENTS_PER_TOPIC * web_search_max_uses(FIND_TIER)
     cost = (
-        _estimate_cost_usd(model, *_PLANNER_TOKENS)
-        + _ASSUMED_INTENTS_PER_TOPIC * _estimate_cost_usd(model, *_FINDER_TOKENS)
-        + _ASSUMED_INTENTS_PER_TOPIC * _estimate_cost_usd(model, *_VERIFIER_TOKENS)
-        + _estimate_cost_usd(model, *_JUDGE_TOKENS)
+        _estimate_cost_usd(smart_model, *_PLANNER_TOKENS)
+        + _ASSUMED_INTENTS_PER_TOPIC * _estimate_cost_usd(fast_model, *_FINDER_TOKENS)
+        + _ASSUMED_INTENTS_PER_TOPIC * _estimate_cost_usd(fast_model, *_VERIFIER_TOKENS)
+        + _estimate_cost_usd(smart_model, *_JUDGE_TOKENS)
         + searches * WEB_SEARCH_COST_PER_SEARCH_USD
     )
     return calls, cost, searches
@@ -295,7 +304,9 @@ def dry_run_enrichment(
 ) -> EnrichDryRunResponse:
     course = _get_course_or_404(session, course_id)
     topics = _topics_needing_enrichment(session, course)
-    calls_per_topic, est_cost_per_topic, searches_per_topic = _per_topic_estimate(runner.settings.smart_model)
+    calls_per_topic, est_cost_per_topic, searches_per_topic = _per_topic_estimate(
+        runner.settings.smart_model, runner.settings.fast_model
+    )
     return EnrichDryRunResponse(
         topics_needing_enrichment=len(topics),
         calls_per_topic=calls_per_topic,

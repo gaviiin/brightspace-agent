@@ -90,19 +90,22 @@ class WebBackend(Protocol):
 # No beta header is needed for any of these variants.
 # --------------------------------------------------------------------------
 
+# max_uses / max_content_tokens are COST bounds, not tuning knobs. The
+# 2026-08-07 live run proved why: with 8 uncapped searches + 8 uncapped page
+# fetches, one finder call billed ~700k input tokens (a server-tool loop
+# re-bills the whole accumulated context on every internal iteration, and
+# fetched pages dominate that context) -- five concurrent finders committed
+# ~$12 for one topic before the cost cap could abort. 4 searches + 3 fetches
+# at <=12k tokens per fetched page keeps a call's worst case around two
+# orders of magnitude smaller while still giving the finder several bites.
 _WEB_TOOLS_BY_TIER: dict[Tier, list[dict]] = {
     "smart": [
-        {"type": "web_search_20260209", "name": "web_search", "max_uses": 8},
-        {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 8},
+        {"type": "web_search_20260209", "name": "web_search", "max_uses": 4},
+        {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 3, "max_content_tokens": 12_000},
     ],
-    # The 'fast' entry is NOT dead code, even though the enrich stage runs
-    # everything on 'smart' today: it is the versioned tool spec a fast-tier
-    # verifier would need, and the tier split is a planned quality/cost
-    # experiment. See the TIER DECISION comment in
-    # pipeline/stages/enrich.py for why both agents are on smart for now.
     "fast": [
-        {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
-        {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 8},
+        {"type": "web_search_20250305", "name": "web_search", "max_uses": 4},
+        {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 3, "max_content_tokens": 12_000},
     ],
 }
 
