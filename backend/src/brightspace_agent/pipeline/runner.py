@@ -1,12 +1,15 @@
-"""`PipelineRunner`: runs the compiled pipeline graph as a managed background
-job per course, recording a `pipeline_runs` row per stage and publishing
-live progress on an in-process event bus that `GET /api/events` (SSE)
-subscribes to.
+"""`PipelineRunner`: runs the compiled pipeline graph (`start()`) as a
+managed background job per course, and (M3.2) the on-demand enrichment path
+(`start_enrichment()`) alongside it -- both record a `pipeline_runs` row
+(the enrichment path: one row, `stage='enrich'`, since it's a single async
+call rather than a graph of stage nodes) and publish live progress on an
+in-process event bus that `GET /api/events` (SSE) subscribes to.
 
 Constructed once at app startup (see `main.create_app`) and stashed on
 `app.state.runner`. One `PipelineRunner` instance can drive concurrent runs
 for *different* courses (each gets its own `asyncio.Task`); only one run per
-course may be active at a time (`RunActiveError` otherwise).
+course may be active at a time (`RunActiveError` otherwise) -- pipeline and
+enrichment share that guard, so the two kinds can never collide either.
 """
 
 from __future__ import annotations

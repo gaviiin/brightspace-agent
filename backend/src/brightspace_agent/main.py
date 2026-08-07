@@ -11,7 +11,9 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 
 from brightspace_agent import __version__
 from brightspace_agent.agents.llm import make_backend
+from brightspace_agent.agents.web import make_web_backend
 from brightspace_agent.api.courses import router as courses_router
+from brightspace_agent.api.enrichment import router as enrichment_router
 from brightspace_agent.api.events import router as events_router
 from brightspace_agent.api.graph import router as graph_router
 from brightspace_agent.api.ingest import router as ingest_router
@@ -65,8 +67,11 @@ def create_app() -> FastAPI:
     engine, session_factory = init_db(settings.db_path)
     blob_store = BlobStore(settings.blobs_dir, settings.text_dir)
     backend = make_backend(settings)
+    web_backend = make_web_backend(settings)
     event_bus = EventBus()
-    runner = PipelineRunner(session_factory, blob_store, backend, settings, event_bus=event_bus)
+    runner = PipelineRunner(
+        session_factory, blob_store, backend, settings, web_backend=web_backend, event_bus=event_bus
+    )
 
     app = FastAPI()
     app.state.pairing_token = pairing_token
@@ -115,6 +120,7 @@ def create_app() -> FastAPI:
     app.include_router(graph_router)
     app.include_router(materials_router)
     app.include_router(pipeline_router)
+    app.include_router(enrichment_router)
     app.include_router(events_router)
     app.include_router(settings_router)
     app.include_router(taxonomy_router)
