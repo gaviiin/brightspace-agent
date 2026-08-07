@@ -185,7 +185,64 @@ export interface SyncBsaEvent {
   status: string;
 }
 
-export type BsaEvent = PipelineBsaEvent | SyncBsaEvent;
+/** `topicId` is present for a single-topic enrichment run, absent for a
+ * course-wide batch (see runner.py's `_EnrichmentRunHooks` /
+ * api/enrichment.py's module docstring). `status` is
+ * "run-started" | "complete" | "aborted" | "failed" (typed as `string`
+ * here, matching PipelineBsaEvent's own looseness). */
+export interface EnrichmentBsaEvent {
+  type: "enrichment";
+  courseId: number;
+  runToken: number;
+  topicId?: number;
+  status: string;
+  stats?: Record<string, unknown>;
+}
+
+export type BsaEvent = PipelineBsaEvent | SyncBsaEvent | EnrichmentBsaEvent;
+
+// ---------------------------------------------------------------------------
+// Enrichment (api/enrichment.py) -- M3.3
+// ---------------------------------------------------------------------------
+
+export type EnrichmentStatus = "suggested" | "kept" | "dismissed";
+
+export interface EnrichmentResource {
+  id: number;
+  url: string;
+  title: string | null;
+  resourceType: string | null;
+  intent: string | null;
+  rationale: string | null;
+  scores: Record<string, number>;
+  verification: Record<string, unknown>;
+  rank: number | null;
+  shared: boolean;
+  status: EnrichmentStatus;
+}
+
+export interface EnrichmentMeta {
+  suggested: number;
+  kept: number;
+  dismissed: number;
+}
+
+export interface TopicEnrichment {
+  topicId: number;
+  resources: EnrichmentResource[];
+  meta: EnrichmentMeta;
+}
+
+export interface EnrichRunResponse {
+  runToken: number;
+}
+
+export interface EnrichDryRunResponse {
+  topicsNeedingEnrichment: number;
+  callsPerTopic: number;
+  estCostPerTopicUsd: number;
+  totalEstCostUsd: number;
+}
 
 // ---------------------------------------------------------------------------
 // GET /api/settings  (api/settings.py)

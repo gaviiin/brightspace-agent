@@ -6,6 +6,10 @@ import type {
   BsaEvent,
   CourseSummary,
   DryRunResponse,
+  EnrichDryRunResponse,
+  EnrichRunResponse,
+  EnrichmentResource,
+  EnrichmentStatus,
   GraphPayload,
   MaterialDetail,
   PipelineRunResponse,
@@ -13,6 +17,7 @@ import type {
   SettingsResponse,
   TaxonomyApplyResponse,
   TaxonomyEditRequest,
+  TopicEnrichment,
 } from "./types";
 
 // Mutating endpoints under /api/ (besides /api/ingest/*, which the
@@ -107,6 +112,43 @@ export function dryRun(courseId: number): Promise<DryRunResponse> {
 
 export function pipelineStatus(courseId: number): Promise<PipelineStatusResponse> {
   return request<PipelineStatusResponse>(`/api/courses/${courseId}/pipeline/status`);
+}
+
+// ---------------------------------------------------------------------------
+// Enrichment (api/enrichment.py) -- M3.3
+// ---------------------------------------------------------------------------
+
+export function getTopicEnrichment(topicId: number): Promise<TopicEnrichment> {
+  return request<TopicEnrichment>(`/api/topics/${topicId}/enrichment`);
+}
+
+export function enrichTopic(topicId: number): Promise<EnrichRunResponse> {
+  return request<EnrichRunResponse>(`/api/topics/${topicId}/enrich`, {
+    method: "POST",
+    headers: CSRF_HEADERS,
+  });
+}
+
+export function enrichCourse(courseId: number): Promise<EnrichRunResponse> {
+  return request<EnrichRunResponse>(`/api/courses/${courseId}/enrich`, {
+    method: "POST",
+    headers: CSRF_HEADERS,
+  });
+}
+
+export function setEnrichmentStatus(resourceId: number, status: EnrichmentStatus): Promise<EnrichmentResource> {
+  return request<EnrichmentResource>(`/api/enrichment/${resourceId}`, {
+    method: "PUT",
+    headers: { ...CSRF_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+}
+
+/** A GET, unlike the pipeline's own dry-run (a POST) -- api/enrichment.py's
+ * module docstring: it only reads the DB, so it stays open to the same
+ * browser+CORS rules as other GETs and doesn't need the CSRF header. */
+export function enrichDryRun(courseId: number): Promise<EnrichDryRunResponse> {
+  return request<EnrichDryRunResponse>(`/api/courses/${courseId}/enrich/dry-run`);
 }
 
 /** Subscribe to the backend's SSE event stream. Returns the EventSource so
