@@ -124,6 +124,21 @@ def test_runs_caps_the_error_list_but_reports_the_full_count(client, db_session_
     assert run["errors"][0]["d2lTopicId"] == 0
 
 
+def test_zip_import_errors_keep_their_path(client, db_session_factory, course_id):
+    """Zip-import errors carry `path` instead of `d2lTopicId`, and the message
+    alone ("path traversal") is useless without it -- fold it in."""
+    _add_sync_run(
+        db_session_factory, course_id, status="failed",
+        stats={"files": 1, "bytes": 10, "notNeeded": 0, "extrasSkipped": 0,
+               "errors": [{"path": "week3/huge-lecture.mp4", "message": "file too large"}]},
+    )
+
+    body = client.get(f"/api/courses/{course_id}/runs").json()
+
+    run = body["syncRuns"][0]
+    assert run["errors"] == [{"d2lTopicId": None, "message": "week3/huge-lecture.mp4: file too large"}]
+
+
 def test_runs_is_fail_soft_on_malformed_json(client, db_session_factory, course_id):
     _add_sync_run(db_session_factory, course_id, stats="{not json")
     _add_sync_run(db_session_factory, course_id, stats=None)

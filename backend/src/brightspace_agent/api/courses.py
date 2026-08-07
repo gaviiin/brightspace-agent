@@ -172,10 +172,16 @@ def _sync_run_out(run: SyncRun) -> SyncRunOut:
     for entry in errors[:_ERRORS_SHOWN]:
         if not isinstance(entry, dict):
             continue
+        message = str(entry.get("message", ""))
+        # Zip-import errors carry `path` instead of `d2lTopicId`, and their
+        # message alone ("path traversal") is useless without it.
+        path = entry.get("path")
+        if isinstance(path, str) and path:
+            message = f"{path}: {message}"
         parsed_errors.append(
             SyncErrorOut(
                 d2lTopicId=entry.get("d2lTopicId") if isinstance(entry.get("d2lTopicId"), int) else None,
-                message=str(entry.get("message", "")),
+                message=message,
             )
         )
     return SyncRunOut(
