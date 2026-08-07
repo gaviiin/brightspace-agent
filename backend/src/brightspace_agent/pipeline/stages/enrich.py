@@ -77,7 +77,29 @@ logger = logging.getLogger(__name__)
 
 PROMPT_VERSION = "s5.v1"
 _STAGE = "enrich"
-_TIER: Tier = "smart"
+
+# TIER DECISION (deviates from the plan, deliberately, and recorded here so
+# the deviation isn't silent). The plan put the finders/verifiers on the fast
+# (haiku) tier and only the planner/judge on smart. Everything runs smart:
+#
+#  - Finder: it drives Anthropic's dynamic-filtering server web tools, which
+#    need a Sonnet-4.6-or-newer model to be used well; a haiku finder either
+#    can't use them or uses them badly, and the finder is where a bad call
+#    costs the most (garbage candidates burn verifier calls downstream).
+#  - Verifier: it *could* run fast-tier -- it binds only the basic web_fetch
+#    tool and answers one narrow question (is this page live, accessible,
+#    on-topic, at the right level?). It is on smart today only because
+#    splitting the tiers is a quality/cost experiment we haven't run: haiku
+#    reading a fetched page and quoting real evidence from it is exactly the
+#    kind of judgement that degrades quietly, and a bad verifier verdict is
+#    invisible (a wrong link the student then trusts) rather than loud.
+#
+# `_WEB_TOOLS_BY_TIER['fast']` in agents/web.py is kept for that split -- it
+# is the versioned tool spec a fast-tier verifier would need, NOT dead code
+# to delete. The experiment worth running: verifiers on fast, measure kept/
+# dismissed rates per tier via domain_reputation before making it the default.
+ENRICH_TIER: Tier = "smart"
+_TIER: Tier = ENRICH_TIER
 
 _MAX_CONTEXT_MATERIALS = 15
 _FANOUT_CONCURRENCY = 4
@@ -346,12 +368,30 @@ async def run_topic_enrichment(
     )
 
     with session_factory() as session:
-        written = _write_resources(session, topic_id, final)
-        _write_cache(session, context_sha, model, {"resources": final, "thin": thin})
+        written = _write_resources(session, topic_id, final, prune=not stats.aborted)
+        # NEVER cache an aborted run. `final` after a cost-cap abort is a
+        # truncated (often empty) result, and caching it would make every
+        # later run a "successful" cache hit replaying that emptiness: raising
+        # the cap and pressing Refresh would silently do nothing until the
+        # topic's own content happened to change. An uncached abort simply
+        # re-runs next time, which is the whole point of the cap being
+        # advisory. Same reasoning for `prune` above: an aborted run must not
+        # delete last run's still-good suggestions on the strength of a
+        # partial result.
+        if not stats.aborted:
+            _write_cache(session, context_sha, model, {"resources": final, "thin": thin})
         session.commit()
 
     stats.enriched += written
-    if thin:
+    if stats.aborted:
+        logger.warning(
+            "enrich: topic %s hit the cost cap; result not cached so a later run re-enriches it",
+            topic_id,
+        )
+    # "Thin" means "we searched properly and this is genuinely all there is",
+    # so a run cut short by the cap is never reported thin -- it didn't finish
+    # searching.
+    if thin and not stats.aborted:
         stats.thin_topics += 1
         logger.info(
             "enrich: topic %s is thin (%d verified resource(s) after retry); reported honestly",
@@ -579,13 +619,42 @@ def _select_diverse(scored: list[_Scored], target_max: int) -> list[_Scored]:
 # --------------------------------------------------------------------------
 
 
-def _write_resources(session: Session, topic_id: int, resources: list[dict]) -> int:
+def _is_safe_url(url: str) -> bool:
+    """Only `http://` / `https://` URLs may ever be stored.
+
+    Everything in `EnrichmentResource.url` is model-authored, and the frontend
+    renders it as an `<a href>` (panels/TopicSupplementary.tsx). A page the
+    finder fetched could try to steer the model into emitting a
+    `javascript:` (or `data:`) URL -- the one XSS-shaped hole in an otherwise
+    React-escaped surface. The Pydantic schema rejects these on the way in
+    (agents/schemas.py's `Candidate.url`); this is the last line, and it also
+    covers rows replayed from a cache row written before that validator
+    existed."""
+    return url.lower().startswith(("http://", "https://"))
+
+
+def _write_resources(session: Session, topic_id: int, resources: list[dict], *, prune: bool = True) -> int:
     """Upsert the kept resources for a topic by (topic_id, url): existing rows
     are updated in place (never duplicated), new ones inserted as 'suggested'.
     A row a student has already kept/dismissed keeps that status -- re-running
-    enrichment must not silently undo their decision. Returns rows written."""
+    enrichment must not silently undo their decision. Returns rows written.
+
+    `prune=True` (the default) also deletes this topic's leftover 'suggested'
+    rows that the new result set does NOT contain: without it, a topic whose
+    content changed accumulates last run's stale suggestions interleaved with
+    the new ones at colliding ranks. Only un-actioned 'suggested' rows are
+    ever deleted -- a kept or dismissed row is a student decision and survives
+    regardless. Callers pass `prune=False` when the result set is untrustworthy
+    (a cost-cap abort's partial output)."""
     written = 0
+    kept_urls: set[str] = set()
     for resource in resources:
+        if not _is_safe_url(resource["url"]):
+            logger.warning(
+                "enrich: dropping non-http(s) URL for topic %s (%r)", topic_id, resource["url"][:80]
+            )
+            continue
+        kept_urls.add(resource["url"])
         existing = session.execute(
             select(EnrichmentResource).where(
                 EnrichmentResource.topic_id == topic_id,
@@ -620,6 +689,23 @@ def _write_resources(session: Session, topic_id: int, resources: list[dict]) -> 
             existing.rank = resource["rank"]
             # status preserved: don't reset a student's keep/dismiss to suggested.
         written += 1
+
+    if prune:
+        session.flush()  # so rows added above are visible to the delete below
+        stale = session.execute(
+            select(EnrichmentResource).where(
+                EnrichmentResource.topic_id == topic_id,
+                EnrichmentResource.status == "suggested",
+                # An empty `kept_urls` (a completed run that found nothing)
+                # correctly matches every suggested row: SQLAlchemy expands an
+                # empty NOT IN to a true predicate.
+                EnrichmentResource.url.notin_(kept_urls),
+            )
+        ).scalars().all()
+        for row in stale:
+            logger.debug("enrich: pruning stale suggestion %s for topic %s", row.url, topic_id)
+            session.delete(row)
+
     return written
 
 

@@ -95,6 +95,11 @@ _WEB_TOOLS_BY_TIER: dict[Tier, list[dict]] = {
         {"type": "web_search_20260209", "name": "web_search", "max_uses": 8},
         {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 8},
     ],
+    # The 'fast' entry is NOT dead code, even though the enrich stage runs
+    # everything on 'smart' today: it is the versioned tool spec a fast-tier
+    # verifier would need, and the tier split is a planned quality/cost
+    # experiment. See the TIER DECISION comment in
+    # pipeline/stages/enrich.py for why both agents are on smart for now.
     "fast": [
         {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
         {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 8},

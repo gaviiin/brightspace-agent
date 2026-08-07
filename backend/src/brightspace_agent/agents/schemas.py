@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class DocSummary(BaseModel):
@@ -125,6 +125,22 @@ class SearchPlan(BaseModel):
     intents: list[SearchIntent] = Field(min_length=1, max_length=6)
 
 
+def _require_http_url(value: str) -> str:
+    """A model-authored URL must be `http://` or `https://`.
+
+    These strings are stored verbatim and rendered as `<a href>` in the topic
+    panel, so a `javascript:` (or `data:`) URL -- which a prompt-injected
+    fetched page could try to steer a finder into emitting -- is the one
+    XSS-shaped hole in an otherwise React-escaped surface. Raising here means
+    the real backend's structured-output retry gets one chance to fix it;
+    pipeline/stages/enrich.py's `_is_safe_url` is the write-time backstop that
+    also covers rows replayed from older cache payloads.
+    """
+    if not value.lower().startswith(("http://", "https://")):
+        raise ValueError("url must start with http:// or https://")
+    return value
+
+
 class Candidate(BaseModel):
     """One resource a finder proposes for a single intent. Not trusted until a
     verifier fetches the URL -- `claimed_coverage`/`why` are the finder's
@@ -136,6 +152,11 @@ class Candidate(BaseModel):
     intent: IntentType
     claimed_coverage: str  # what the finder thinks it covers
     why: str  # one line
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, value: str) -> str:
+        return _require_http_url(value)
 
 
 class CandidateList(BaseModel):
@@ -173,6 +194,11 @@ class JudgedResource(BaseModel):
     # pedagogical_value. `dict` (not a fixed model) so the prompt can evolve
     # the rubric without a schema change; enrich.py reads axes defensively.
     scores: dict[str, float]
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, value: str) -> str:
+        return _require_http_url(value)
 
 
 class JudgeResult(BaseModel):

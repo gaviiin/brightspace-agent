@@ -493,3 +493,324 @@ def test_run_enrich_stage_isolates_a_failing_topic(session_factory, course_id):
 
     assert stats.failed == 1  # the boom topic
     assert _rows(session_factory, good)  # the healthy topic was still enriched
+
+
+# --------------------------------------------------------------------------
+# (7) Cost cap: an aborted run must not poison the cache (or prune)
+# --------------------------------------------------------------------------
+
+
+class _CostlyLLM:
+    """Delegates to `inner` but reports a real dollar cost per call, so the
+    optimistic cost cap actually trips. `model_for_tier` is `inner`'s, so the
+    llm_cache key matches what an uncapped `inner`-driven run would use."""
+
+    def __init__(self, inner, cost_per_call: float) -> None:
+        self._inner = inner
+        self._cost = cost_per_call
+        self.calls = 0
+
+    def structured_call(self, schema, *, system, user, tier):
+        self.calls += 1
+        parsed, _ = self._inner.structured_call(schema, system=system, user=user, tier=tier)
+        return parsed, {
+            "model": self.model_for_tier(tier),
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "est_cost_usd": self._cost,
+        }
+
+    def model_for_tier(self, tier):
+        return self._inner.model_for_tier(tier)
+
+
+class _CostlyWeb:
+    def __init__(self, inner, cost_per_call: float) -> None:
+        self._inner = inner
+        self._cost = cost_per_call
+        self.calls = 0
+
+    def _usage(self, tier):
+        return {
+            "model": f"mock-{tier}",
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "est_cost_usd": self._cost,
+        }
+
+    def find(self, *, system, user, tier):
+        self.calls += 1
+        result, _ = self._inner.find(system=system, user=user, tier=tier)
+        return result, self._usage(tier)
+
+    def verify(self, *, system, user, tier):
+        self.calls += 1
+        result, _ = self._inner.verify(system=system, user=user, tier=tier)
+        return result, self._usage(tier)
+
+
+def _enrich_cache_rows(session_factory) -> list[LlmCache]:
+    with session_factory() as session:
+        rows = list(
+            session.execute(select(LlmCache).where(LlmCache.stage == "enrich")).scalars().all()
+        )
+        for row in rows:
+            session.expunge(row)
+        return rows
+
+
+def test_cost_cap_abort_writes_no_cache_row(session_factory, topic_id):
+    # Each paid call costs $0.50 against a $0.60 cap: the planner alone
+    # exhausts it, so the run aborts partway and produces nothing usable.
+    llm = _CostlyLLM(MockBackend(), 0.5)
+    web = _CostlyWeb(MockWebBackend(), 0.5)
+
+    stats = _run_topic(session_factory, llm, web, topic_id, cost_cap_usd=0.6)
+
+    assert stats.aborted is True
+    # THE bug this guards: caching an aborted run makes every later run a
+    # "successful" cache hit replaying the empty result -- raising the cap and
+    # pressing Refresh would then silently do nothing.
+    assert _enrich_cache_rows(session_factory) == []
+    # An aborted run is not "we searched and there's nothing good".
+    assert stats.thin_topics == 0
+
+
+def test_uncapped_rerun_after_an_abort_actually_re_enriches(session_factory, topic_id):
+    llm = _CostlyLLM(MockBackend(), 0.5)
+    web = _CostlyWeb(MockWebBackend(), 0.5)
+    aborted = _run_topic(session_factory, llm, web, topic_id, cost_cap_usd=0.6)
+    assert aborted.aborted is True
+    assert _rows(session_factory, topic_id) == []
+
+    # Same models (so the same cache key), no cap this time.
+    second_llm = _CountingLLM(MockBackend())
+    second_web = _CountingWeb(MockWebBackend())
+    stats = _run_topic(session_factory, second_llm, second_web, topic_id)
+
+    assert stats.cached_hits == 0  # it really re-ran rather than replaying
+    assert second_web.find_calls > 0
+    rows = _rows(session_factory, topic_id)
+    assert rows
+    assert stats.enriched == len(rows)
+    assert len(_enrich_cache_rows(session_factory)) == 1  # now it's cached
+
+
+def test_cost_cap_abort_leaves_earlier_suggestions_alone(session_factory, topic_id):
+    # A good run first...
+    _run_topic(session_factory, MockBackend(), MockWebBackend(), topic_id)
+    before = {row.url for row in _rows(session_factory, topic_id)}
+    assert before
+
+    # ...then a capped run that aborts. Its (partial, empty) result must not
+    # be treated as "these suggestions are stale now".
+    with session_factory() as session:
+        session.execute(delete(LlmCache).where(LlmCache.stage == "enrich"))
+        session.commit()
+    stats = _run_topic(
+        session_factory,
+        _CostlyLLM(MockBackend(), 0.5),
+        _CostlyWeb(MockWebBackend(), 0.5),
+        topic_id,
+        cost_cap_usd=0.6,
+    )
+
+    assert stats.aborted is True
+    assert {row.url for row in _rows(session_factory, topic_id)} == before
+
+
+# --------------------------------------------------------------------------
+# (8) URL safety: only http(s) is ever stored or accepted
+# --------------------------------------------------------------------------
+
+
+_UNSAFE_URLS = ["javascript:alert(document.cookie)", "data:text/html,<script>x</script>", "file:///etc/passwd"]
+
+
+@pytest.mark.parametrize("bad_url", _UNSAFE_URLS)
+def test_schema_rejects_non_http_urls(bad_url):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Candidate(
+            url=bad_url, title="Evil", resource_type="article",
+            intent="alternative_explanation", claimed_coverage="x", why="y",
+        )
+    with pytest.raises(ValidationError):
+        JudgedResource(
+            url=bad_url, title="Evil", resource_type="article",
+            intent="alternative_explanation", keep=True, rank=1, rationale="x", scores={},
+        )
+
+
+def test_javascript_url_candidate_is_never_written(session_factory, topic_id):
+    # A prompt-injected page could steer a finder into emitting a javascript:
+    # URL. `model_construct` bypasses the schema validator on purpose here, so
+    # this exercises the WRITE-time backstop rather than re-testing the schema.
+    evil = Candidate.model_construct(
+        url="javascript:alert(1)", title="Totally Legit Notes", resource_type="notes",
+        intent="university_notes", claimed_coverage="bfs", why="trust me",
+    )
+    good = Candidate(
+        url="https://ocw.mit.edu/bfs-notes", title="MIT Notes", resource_type="notes",
+        intent="university_notes", claimed_coverage="bfs", why="mit",
+    )
+    ok = Verification(
+        ok=True, accessible=True, on_topic=True, level_fit="on_level",
+        evidence_quote="breadth first search", reason="good",
+    )
+
+    def _judge(_user):
+        return JudgeResult.model_construct(
+            resources=[
+                JudgedResource.model_construct(
+                    url=candidate.url, title=candidate.title, resource_type="notes",
+                    intent="university_notes", keep=True, rank=rank, rationale="ok",
+                    scores={"relevance": 0.9, "authority": 0.9, "recency": 0.9,
+                            "level_match": 0.9, "pedagogical_value": 0.9},
+                )
+                for rank, candidate in enumerate((evil, good), start=1)
+            ]
+        )
+
+    plan = SearchPlan(intents=[SearchIntent(intent="university_notes", query="bfs notes", rationale="notes")])
+    llm = _StubLLM(plan=plan, judge=_judge)
+    web = _StubWeb(find=CandidateList.model_construct(candidates=[evil, good]), verify=ok)
+
+    _run_topic(session_factory, llm, web, topic_id)
+
+    urls = [row.url for row in _rows(session_factory, topic_id)]
+    assert urls == ["https://ocw.mit.edu/bfs-notes"]
+    assert not any(url.startswith("javascript:") for url in urls)
+
+
+def test_unsafe_url_in_a_cached_payload_is_not_written(session_factory, topic_id):
+    # Covers a cache row written before the URL rules existed: the replay path
+    # goes through the same write-time guard.
+    _run_topic(session_factory, MockBackend(), MockWebBackend(), topic_id)
+    with session_factory() as session:
+        row = session.execute(select(LlmCache).where(LlmCache.stage == "enrich")).scalar_one()
+        payload = json.loads(row.output_json)
+        payload["resources"].append(
+            {
+                "url": "javascript:alert(1)", "title": "Evil", "resource_type": "notes",
+                "intent": "university_notes", "rationale": "evil",
+                "scores": {"relevance": 1.0}, "verification": {"ok": True}, "rank": 99,
+            }
+        )
+        row.output_json = json.dumps(payload)
+        session.commit()
+
+    with session_factory() as session:
+        session.execute(delete(EnrichmentResource).where(EnrichmentResource.topic_id == topic_id))
+        session.commit()
+
+    stats = _run_topic(session_factory, MockBackend(), MockWebBackend(), topic_id)
+
+    assert stats.cached_hits == 1
+    assert all(row.url.startswith("https://") for row in _rows(session_factory, topic_id))
+
+
+# --------------------------------------------------------------------------
+# (9) Stale 'suggested' rows are pruned; student decisions never are
+# --------------------------------------------------------------------------
+
+
+_OK_VERIFICATION = Verification(
+    ok=True, accessible=True, on_topic=True, level_fit="on_level",
+    evidence_quote="breadth first search", reason="good",
+)
+
+
+def _candidates(*urls) -> CandidateList:
+    return CandidateList(
+        candidates=[
+            Candidate(
+                url=url, title=f"Notes {index}", resource_type="notes",
+                intent="university_notes", claimed_coverage="bfs", why="edu",
+            )
+            for index, url in enumerate(urls, start=1)
+        ]
+    )
+
+
+def _force_cache_miss(session_factory):
+    with session_factory() as session:
+        session.execute(delete(LlmCache).where(LlmCache.stage == "enrich"))
+        session.commit()
+
+
+def test_stale_suggestions_are_pruned_on_the_next_run(session_factory, topic_id):
+    old = ("https://old-a.mit.edu/notes", "https://old-b.mit.edu/notes")
+    new = ("https://new-a.mit.edu/notes",)
+
+    _run_topic(
+        session_factory, MockBackend(), _StubWeb(find=_candidates(*old), verify=_OK_VERIFICATION), topic_id
+    )
+    assert sorted(row.url for row in _rows(session_factory, topic_id)) == sorted(old)
+
+    _force_cache_miss(session_factory)
+    _run_topic(
+        session_factory, MockBackend(), _StubWeb(find=_candidates(*new), verify=_OK_VERIFICATION), topic_id
+    )
+
+    rows = _rows(session_factory, topic_id)
+    assert [row.url for row in rows] == list(new)  # no stale rows interleaved
+    assert [row.rank for row in rows] == [1]
+
+
+def test_prune_never_deletes_kept_or_dismissed_rows(session_factory, topic_id):
+    old = ("https://old-a.mit.edu/notes", "https://old-b.mit.edu/notes", "https://old-c.mit.edu/notes")
+    _run_topic(
+        session_factory, MockBackend(), _StubWeb(find=_candidates(*old), verify=_OK_VERIFICATION), topic_id
+    )
+    with session_factory() as session:
+        rows = list(
+            session.execute(
+                select(EnrichmentResource).where(EnrichmentResource.topic_id == topic_id)
+                .order_by(EnrichmentResource.url)
+            ).scalars().all()
+        )
+        rows[0].status = "kept"
+        rows[1].status = "dismissed"
+        session.commit()
+
+    _force_cache_miss(session_factory)
+    _run_topic(
+        session_factory,
+        MockBackend(),
+        _StubWeb(find=_candidates("https://fresh.mit.edu/notes"), verify=_OK_VERIFICATION),
+        topic_id,
+    )
+
+    by_url = {row.url: row.status for row in _rows(session_factory, topic_id)}
+    assert by_url == {
+        "https://old-a.mit.edu/notes": "kept",  # student decision survives
+        "https://old-b.mit.edu/notes": "dismissed",  # so does this one
+        "https://fresh.mit.edu/notes": "suggested",
+    }
+    assert "https://old-c.mit.edu/notes" not in by_url  # un-actioned + stale -> pruned
+
+
+def test_a_run_that_finds_nothing_clears_stale_suggestions(session_factory, topic_id):
+    _run_topic(
+        session_factory,
+        MockBackend(),
+        _StubWeb(find=_candidates("https://old.mit.edu/notes"), verify=_OK_VERIFICATION),
+        topic_id,
+    )
+    assert _rows(session_factory, topic_id)
+
+    _force_cache_miss(session_factory)
+    rejected = Verification(
+        ok=False, accessible=False, on_topic=False, level_fit="unknown", evidence_quote="", reason="dead",
+    )
+    stats = _run_topic(
+        session_factory,
+        MockBackend(),
+        _StubWeb(find=_candidates("https://old.mit.edu/notes"), verify=rejected),
+        topic_id,
+    )
+
+    assert stats.thin_topics == 1
+    assert _rows(session_factory, topic_id) == []
