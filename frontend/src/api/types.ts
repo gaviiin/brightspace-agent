@@ -166,6 +166,46 @@ export interface DryRunResponse {
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/courses/{id}/runs  (api/courses.py)
+// ---------------------------------------------------------------------------
+
+export interface SyncRunError {
+  d2lTopicId: number | null;
+  message: string;
+}
+
+export interface SyncRunSummary {
+  id: number;
+  source: string;
+  status: string;
+  startedAt: string;
+  finishedAt: string | null;
+  files: number;
+  bytes: number;
+  notNeeded: number;
+  /** Full error total; `errors` itself is capped server-side at five. */
+  errorCount: number;
+  errors: SyncRunError[];
+}
+
+export interface PipelineRunSummary {
+  id: number;
+  stage: string;
+  status: string;
+  startedAt: string;
+  finishedAt: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  estCostUsd: number;
+  error: string | null;
+}
+
+export interface RunsResponse {
+  syncRuns: SyncRunSummary[];
+  pipelineRuns: PipelineRunSummary[];
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/events (SSE)  (api/events.py, pipeline/runner.py, api/ingest.py)
 // ---------------------------------------------------------------------------
 

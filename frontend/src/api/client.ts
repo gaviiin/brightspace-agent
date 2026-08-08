@@ -14,6 +14,7 @@ import type {
   MaterialDetail,
   PipelineRunResponse,
   PipelineStatusResponse,
+  RunsResponse,
   SettingsResponse,
   TaxonomyApplyResponse,
   TaxonomyEditRequest,
@@ -93,6 +94,10 @@ export function getMaterialFileUrl(materialId: number): string {
 
 export function getSettings(): Promise<SettingsResponse> {
   return request<SettingsResponse>("/api/settings");
+}
+
+export function getRuns(courseId: number): Promise<RunsResponse> {
+  return request<RunsResponse>(`/api/courses/${courseId}/runs`);
 }
 
 export function runPipeline(courseId: number, stages?: string[]): Promise<PipelineRunResponse> {
