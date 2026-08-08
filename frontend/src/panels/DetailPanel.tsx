@@ -6,9 +6,19 @@ import type { GraphAttachment, GraphPayload, GraphTopic } from "../api/types";
 import { KIND_ICON } from "../graph/nodes/MaterialNode";
 import { useUiStore } from "../state/uiStore";
 import { MaterialReader } from "./MaterialReader";
+import { TopicSupplementary } from "./TopicSupplementary";
 
 interface DetailPanelProps {
   payload: GraphPayload;
+  /** Threaded down to TopicSupplementary (M3.3) -- GraphPayload has no
+   * courseId of its own, and the enrichment dry-run/course-enrich
+   * endpoints are course-scoped. */
+  courseId: number;
+  mockLlm: boolean;
+  /** Mirrors TaxonomyEditor's `pipelineActive`: CourseWorkspacePage's
+   * `active` already reflects an enrichment run too (runner.py shares one
+   * `_active` guard per course between pipeline and enrichment runs). */
+  runActive: boolean;
 }
 
 /** The right-hand detail/reader panel: shows whatever is currently
@@ -19,7 +29,7 @@ interface DetailPanelProps {
  * outline use) -- the only extra network call is `getMaterial`, which
  * carries fields the graph payload doesn't (summary, key terms, sourceUrl,
  * mime), not a duplicate of it. */
-export function DetailPanel({ payload }: DetailPanelProps) {
+export function DetailPanel({ payload, courseId, mockLlm, runActive }: DetailPanelProps) {
   const selection = useUiStore((state) => state.selection);
   const selectTopic = useUiStore((state) => state.selectTopic);
   const selectMaterial = useUiStore((state) => state.selectMaterial);
@@ -37,6 +47,9 @@ export function DetailPanel({ payload }: DetailPanelProps) {
       <TopicDetail
         payload={payload}
         topicId={selection.id}
+        courseId={courseId}
+        mockLlm={mockLlm}
+        runActive={runActive}
         onSelectTopic={selectTopic}
         onSelectMaterial={selectMaterial}
       />
@@ -88,11 +101,14 @@ function edgeChipsForTopic(payload: GraphPayload, topicId: number): EdgeChip[] {
 interface TopicDetailProps {
   payload: GraphPayload;
   topicId: number;
+  courseId: number;
+  mockLlm: boolean;
+  runActive: boolean;
   onSelectTopic: (topicId: number) => void;
   onSelectMaterial: (materialId: number) => void;
 }
 
-function TopicDetail({ payload, topicId, onSelectTopic, onSelectMaterial }: TopicDetailProps) {
+function TopicDetail({ payload, topicId, courseId, mockLlm, runActive, onSelectTopic, onSelectMaterial }: TopicDetailProps) {
   const topic = payload.topics.find((t) => t.id === topicId);
   const edgeChips = useMemo(() => edgeChipsForTopic(payload, topicId), [payload, topicId]);
   const attachments = useMemo(
@@ -168,6 +184,8 @@ function TopicDetail({ payload, topicId, onSelectTopic, onSelectMaterial }: Topi
           </ul>
         )}
       </div>
+
+      <TopicSupplementary topicId={topicId} courseId={courseId} mockLlm={mockLlm} runActive={runActive} />
     </div>
   );
 }

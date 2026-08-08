@@ -37,6 +37,20 @@ class StageStats:
     assignments: int = 0  # material_topics rows written
     unassigned: int = 0  # materials the model (validly) placed nowhere
 
+    # M3 enrich. `enriched` counts enrichment_resources rows written (inserted
+    # or updated in place) across the run -- 0 when every topic was a clean
+    # cache hit with its rows already present. `thin_topics` counts topics that
+    # still had fewer than `target_min` verified resources after the one
+    # allowed planner retry: reported honestly rather than padded, so the UI
+    # can say "we couldn't find much for this one" instead of showing filler.
+    enriched: int = 0
+    thin_topics: int = 0
+    # Duplicate rows removed by the course-batch's cross-topic dedup pass: a
+    # URL found under several topics is kept on its best-fit topic (marked
+    # `shared`) and dropped from the rest. Always 0 on a single-topic run,
+    # which has nothing to dedup against.
+    deduped: int = 0
+
     # Every stage
     cached_hits: int = 0
     failed: int = 0

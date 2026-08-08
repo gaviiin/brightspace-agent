@@ -83,6 +83,21 @@ _COST_PER_MTOK_USD: dict[str, tuple[float, float]] = {
 }
 
 
+# Anthropic's server-side `web_search` tool is billed PER SEARCH on top of
+# the tokens the results consume: ~$10 per 1,000 searches at the time of
+# writing, i.e. $0.01 a search. Like the token table above this is an
+# ESTIMATE, not a bill -- update it here when pricing changes; agents/web.py
+# (runtime, per call) and api/enrichment.py (the dry-run estimate) are the
+# only readers. `web_fetch` carries no per-use fee, only tokens.
+#
+# This matters more than it looks: a finder may run up to `max_uses` (8)
+# searches, and a topic runs ~5-6 finders, so the per-search fee can dwarf
+# the token cost of the whole enrich stage. Before this constant existed the
+# cost cap counted tokens only and the "hard cap" it displayed could be
+# overshot by an order of magnitude.
+WEB_SEARCH_COST_PER_SEARCH_USD = 0.01
+
+
 def _estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
     rates = _COST_PER_MTOK_USD.get(model)
     if rates is None:

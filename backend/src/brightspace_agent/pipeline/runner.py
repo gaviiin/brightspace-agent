@@ -1,12 +1,15 @@
-"""`PipelineRunner`: runs the compiled pipeline graph as a managed background
-job per course, recording a `pipeline_runs` row per stage and publishing
-live progress on an in-process event bus that `GET /api/events` (SSE)
-subscribes to.
+"""`PipelineRunner`: runs the compiled pipeline graph (`start()`) as a
+managed background job per course, and (M3.2) the on-demand enrichment path
+(`start_enrichment()`) alongside it -- both record a `pipeline_runs` row
+(the enrichment path: one row, `stage='enrich'`, since it's a single async
+call rather than a graph of stage nodes) and publish live progress on an
+in-process event bus that `GET /api/events` (SSE) subscribes to.
 
 Constructed once at app startup (see `main.create_app`) and stashed on
 `app.state.runner`. One `PipelineRunner` instance can drive concurrent runs
 for *different* courses (each gets its own `asyncio.Task`); only one run per
-course may be active at a time (`RunActiveError` otherwise).
+course may be active at a time (`RunActiveError` otherwise) -- pipeline and
+enrichment share that guard, so the two kinds can never collide either.
 """
 
 from __future__ import annotations
@@ -15,16 +18,19 @@ import asyncio
 import itertools
 import json
 import logging
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from brightspace_agent.agents.llm import LLMBackend
+from brightspace_agent.agents.web import MockWebBackend, WebBackend
 from brightspace_agent.config import Settings
-from brightspace_agent.db.models import PipelineRun
+from brightspace_agent.db.models import Course, PipelineRun, Topic
 from brightspace_agent.ingest.store import BlobStore
 from brightspace_agent.pipeline.graph import PipelineDeps, PipelineState, build_pipeline_graph
+from brightspace_agent.pipeline.stages.enrich import run_enrich_stage, run_topic_enrichment
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +40,26 @@ def _now_iso() -> str:
 
 
 class RunActiveError(Exception):
-    """Raised by `PipelineRunner.start()` when a run is already active for
-    that course. The API layer maps this to a 409."""
+    """Raised by `PipelineRunner.start()`/`start_enrichment()` when a run
+    (pipeline OR enrichment -- they share one guard, see `start_enrichment`'s
+    docstring) is already active for that course. The API layer maps this to
+    a 409."""
 
     def __init__(self, course_id: int) -> None:
         super().__init__(f"a pipeline run is already active for course {course_id}")
         self.course_id = course_id
+
+
+class TopicNotFoundError(Exception):
+    """Raised by `PipelineRunner.start_enrichment(topic_id=...)` when
+    `topic_id` doesn't exist, doesn't belong to the given course, or isn't
+    part of that course's CURRENT taxonomy version (e.g. an id from a
+    version a structural taxonomy edit has since superseded). The API layer
+    maps this to a 404."""
+
+    def __init__(self, topic_id: int) -> None:
+        super().__init__(f"no topic {topic_id} at the course's current taxonomy version")
+        self.topic_id = topic_id
 
 
 # --------------------------------------------------------------------------
@@ -216,6 +236,98 @@ class _RunHooks:
 
 
 # --------------------------------------------------------------------------
+# Per-run hooks for the enrichment path (M3.2). Enrichment isn't a LangGraph
+# node -- `start_enrichment` drives `run_topic_enrichment`/`run_enrich_stage`
+# directly from one async task -- so there's exactly one `pipeline_runs` row
+# per run (stage='enrich'), not one per graph node. Mirrors `_RunHooks`'s
+# row + SSE bookkeeping and orphan-reconciliation shape, collapsed
+# accordingly, and publishes `type: "enrichment"` events instead of
+# `type: "pipeline"`.
+# --------------------------------------------------------------------------
+
+
+class _EnrichmentRunHooks:
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        event_bus: EventBus,
+        course_id: int,
+        run_token: int,
+        topic_id: int | None,
+    ) -> None:
+        self._session_factory = session_factory
+        self._event_bus = event_bus
+        self._course_id = course_id
+        self._run_token = run_token
+        self._topic_id = topic_id
+        self._row_id: int | None = None  # set by on_start; reconcile_orphaned_rows reads it
+
+    def on_start(self) -> None:
+        with self._session_factory() as session:
+            row = PipelineRun(course_id=self._course_id, stage="enrich", status="running", started_at=_now_iso())
+            session.add(row)
+            session.commit()
+            self._row_id = row.id
+        self._publish("run-started")
+
+    def on_finish(self, stats: dict, status: str, error: str | None) -> None:
+        if self._row_id is not None:
+            with self._session_factory() as session:
+                row = session.get(PipelineRun, self._row_id)
+                if row is not None:
+                    row.status = status
+                    row.finished_at = _now_iso()
+                    row.usage_json = json.dumps(stats.get("usage_total") or {})
+                    row.error = error
+                    session.commit()
+        self._publish(status, stats=stats)
+
+    def reconcile_orphaned_rows(self) -> None:
+        """Called from `PipelineRunner._execute_enrichment`'s `finally`
+        block on every exit -- see `_RunHooks.reconcile_orphaned_rows`'s
+        docstring for the full reasoning; identical here, just for this
+        run's single row instead of a per-stage dict of them."""
+        if self._row_id is None:
+            return
+        orphaned = False
+        try:
+            with self._session_factory() as session:
+                row = session.get(PipelineRun, self._row_id)
+                if row is not None and row.status == "running":
+                    row.status = "failed"
+                    row.finished_at = _now_iso()
+                    row.error = "orphaned"
+                    session.commit()
+                    orphaned = True
+        except Exception:
+            logger.exception(
+                "failed to reconcile orphaned enrichment pipeline_runs row for course %s (run %s)",
+                self._course_id, self._run_token,
+            )
+            return
+
+        if orphaned:
+            logger.warning(
+                "pipeline_runs row for course %s stage 'enrich' was left 'running' (run %s); marked orphaned",
+                self._course_id, self._run_token,
+            )
+            self._publish("failed", stats={})
+
+    def _publish(self, status: str, *, stats: dict | None = None) -> None:
+        event: dict = {
+            "type": "enrichment",
+            "courseId": self._course_id,
+            "runToken": self._run_token,
+            "status": status,
+        }
+        if self._topic_id is not None:
+            event["topicId"] = self._topic_id
+        if stats is not None:
+            event["stats"] = stats
+        self._event_bus.publish(event)
+
+
+# --------------------------------------------------------------------------
 # PipelineRunner
 # --------------------------------------------------------------------------
 
@@ -228,11 +340,18 @@ class PipelineRunner:
         backend: LLMBackend,
         settings: Settings,
         *,
+        web_backend: WebBackend | None = None,
         event_bus: EventBus | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._settings = settings
         self.backend = backend  # read by tests/callers that want to observe LLM traffic
+        # M3.2: enrichment's finder/verifier need the web-tool backend, not
+        # the plain LLMBackend above. Optional (defaults to the offline mock)
+        # so every existing caller/test that constructs a PipelineRunner
+        # without one -- there's no other kind of run that needs it -- keeps
+        # working unchanged; main.py's real app always passes the real one.
+        self.web_backend = web_backend if web_backend is not None else MockWebBackend()
         self.settings = settings  # read by the dry-run endpoint (configured model names)
         self.event_bus = event_bus if event_bus is not None else EventBus()
 
@@ -243,9 +362,14 @@ class PipelineRunner:
         # and per-run hooks travel through astream()'s state/config args).
         self._graph = build_pipeline_graph(deps)
 
+        # `_active` is shared between the pipeline path (start()) and the
+        # enrichment path (start_enrichment()) -- one course_id -> run_token
+        # map, so a pipeline run and an enrichment run can never both be
+        # active for the same course (see start_enrichment's docstring).
         self._active: dict[int, int] = {}  # course_id -> run_token, present only while running
-        self._tasks: dict[int, asyncio.Task] = {}  # course_id -> most recent run's task
+        self._tasks: dict[int, asyncio.Task] = {}  # course_id -> most recent pipeline run's task
         self._last_run_rows: dict[int, list[int]] = {}  # course_id -> pipeline_runs.id for the latest run
+        self._enrichment_tasks: dict[int, asyncio.Task] = {}  # course_id -> most recent enrichment run's task
         self._run_tokens = itertools.count(1)
 
         self._reconcile_orphaned_rows_from_previous_process()
@@ -399,3 +523,139 @@ class PipelineRunner:
                         }
                     )
         return {"active": active, "stages": stages}
+
+    # ----------------------------------------------------------------------
+    # M3.2: on-demand enrichment. Deliberately NOT a LangGraph node -- see
+    # the module docstring's framing and pipeline/stages/enrich.py's own
+    # docstring. `start()`/`_execute()` above drive the compiled S1-S4 graph;
+    # this drives run_topic_enrichment/run_enrich_stage directly from one
+    # background task, sharing only the `_active` guard, the `pipeline_runs`
+    # table (stage='enrich'), and the event bus with the pipeline path.
+    # ----------------------------------------------------------------------
+
+    def start_enrichment(
+        self, course_id: int, *, topic_id: int | None = None, cost_cap_usd: float | None = None
+    ) -> int:
+        """Launch a background enrichment run for `course_id`. `topic_id=None`
+        enriches every topic at the course's current taxonomy version
+        (`run_enrich_stage`); a given `topic_id` enriches just that one topic
+        (`run_topic_enrichment`) -- after validating it belongs to
+        `course_id` at the course's CURRENT taxonomy version, raising
+        `TopicNotFoundError` (API layer: 404) otherwise.
+
+        Reuses the exact `_active` guard `start()` does: `RunActiveError`
+        (API layer: 409) if a run of EITHER kind is already active for this
+        course, so a pipeline run and an enrichment run can never collide.
+        `cost_cap_usd` defaults to `Settings.max_cost_usd_per_run`, same as
+        the pipeline path; for the course-batch path it is passed straight
+        through to `run_enrich_stage` unchanged -- i.e. applied PER TOPIC,
+        not shared across the whole batch (an accepted M3.1 limitation; see
+        the M3.2 brief). Returns a run token.
+        """
+        if course_id in self._active:
+            raise RunActiveError(course_id)
+        if topic_id is not None:
+            self._validate_topic_for_enrichment(course_id, topic_id)
+
+        cap = cost_cap_usd if cost_cap_usd is not None else self._settings.max_cost_usd_per_run
+        run_token = next(self._run_tokens)
+        self._active[course_id] = run_token
+
+        hooks = _EnrichmentRunHooks(self._session_factory, self.event_bus, course_id, run_token, topic_id)
+        task = asyncio.create_task(self._execute_enrichment(course_id, run_token, topic_id, cap, hooks))
+        self._enrichment_tasks[course_id] = task
+        return run_token
+
+    def _validate_topic_for_enrichment(self, course_id: int, topic_id: int) -> None:
+        with self._session_factory() as session:
+            course = session.get(Course, course_id)
+            topic = session.get(Topic, topic_id)
+            if (
+                course is None
+                or topic is None
+                or topic.course_id != course_id
+                or topic.taxonomy_version != course.taxonomy_version
+            ):
+                raise TopicNotFoundError(topic_id)
+
+    async def _execute_enrichment(
+        self,
+        course_id: int,
+        run_token: int,
+        topic_id: int | None,
+        cost_cap_usd: float,
+        hooks: _EnrichmentRunHooks,
+    ) -> None:
+        try:
+            # `on_start` sits outside the inner try/except below, deliberately
+            # mirroring graph.py's per-node shape (hooks.on_start(stage) then
+            # a try/except around just the stage call): if on_start itself
+            # raises (e.g. its event-bus publish blows up right after the
+            # row was already committed), that's a bug in the hook, not a
+            # "the enrichment run failed" outcome -- there's no stats/error
+            # to report via on_finish, and reconcile_orphaned_rows() below is
+            # what catches the row it already created.
+            hooks.on_start()
+            try:
+                if topic_id is not None:
+                    stats = await run_topic_enrichment(
+                        self._session_factory, self.backend, self.web_backend, topic_id, cost_cap_usd=cost_cap_usd,
+                    )
+                else:
+                    stats = await run_enrich_stage(
+                        self._session_factory, self.backend, self.web_backend, course_id, cost_cap_usd=cost_cap_usd,
+                    )
+            except Exception as exc:  # noqa: BLE001 -- turned into a failed run row, not raised
+                logger.exception("enrichment run crashed for course %s (run %s)", course_id, run_token)
+                hooks.on_finish({}, "failed", f"{type(exc).__name__}: {exc}")
+            else:
+                stats_dict = asdict(stats)
+                status = "aborted" if stats_dict.get("aborted") else "complete"
+                hooks.on_finish(stats_dict, status, "cost-cap" if status == "aborted" else None)
+        except Exception:
+            logger.exception("enrichment on_start failed for course %s (run %s)", course_id, run_token)
+        finally:
+            # Same reasoning as _execute's finally: the one place guaranteed
+            # to run regardless of how the run ended (including this task
+            # being cancelled), so it's where a row left 'running' by a
+            # hook failure or cancellation gets reconciled.
+            hooks.reconcile_orphaned_rows()
+            self._active.pop(course_id, None)
+
+    async def wait_enrichment_idle(self, course_id: int) -> None:
+        """Await the most recently started enrichment run for `course_id`,
+        if any is tracked. Mirrors `wait_idle` for the pipeline path."""
+        task = self._enrichment_tasks.get(course_id)
+        if task is not None:
+            await task
+
+    def enrichment_status(self, course_id: int) -> dict:
+        """`{active, lastRun}` for `course_id`'s enrichment. `active` is
+        `is_active()` -- the guard is shared with the pipeline path, so this
+        answers "is anything blocking a new enrichment run right now",
+        accurately regardless of which kind is currently active. `lastRun`
+        is read straight from the DB (the latest stage='enrich'
+        `pipeline_runs` row for this course, across ALL processes/runs, not
+        just this one's in-memory state) -- `None` if enrichment has never
+        run for this course."""
+        active = self.is_active(course_id)
+        with self._session_factory() as session:
+            row = (
+                session.execute(
+                    select(PipelineRun)
+                    .where(PipelineRun.course_id == course_id, PipelineRun.stage == "enrich")
+                    .order_by(PipelineRun.id.desc())
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            last_run = None
+            if row is not None:
+                last_run = {
+                    "status": row.status,
+                    "startedAt": row.started_at,
+                    "finishedAt": row.finished_at,
+                    "usage": json.loads(row.usage_json) if row.usage_json else None,
+                }
+        return {"active": active, "lastRun": last_run}

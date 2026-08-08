@@ -19,6 +19,13 @@ import { RunsDrawer } from "../panels/RunsDrawer";
 import { TaxonomyEditor } from "../panels/TaxonomyEditor";
 import { useUiStore } from "../state/uiStore";
 
+/** Every status an enrichment run can END on (runner.py's
+ * `_execute_enrichment` / `_EnrichmentRunHooks.on_finish`). A run that
+ * aborted on the cost cap or failed still wrote rows for whatever it got
+ * through, so the read models must be refreshed for all of these -- not just
+ * the happy one. */
+const ENRICHMENT_TERMINAL_STATUSES = new Set(["complete", "aborted", "failed"]);
+
 export function CourseWorkspacePage() {
   const { courseId: courseIdParam } = useParams<{ courseId: string }>();
   const courseId = Number(courseIdParam);
@@ -109,15 +116,37 @@ export function CourseWorkspacePage() {
 
   // SSE: any pipeline event for this course refreshes its status; a
   // finished run also refreshes the graph (and course, for material
-  // counts) since that's when the data actually changed.
+  // counts) since that's when the data actually changed. An `enrichment`
+  // event (M3.3) refreshes the same pipeline-status query -- runner.py's
+  // `start()`/`start_enrichment()` share one `_active` guard per course, so
+  // `pipelineStatus`'s `active` already doubles as "is any course run
+  // (pipeline OR enrichment) active", which is what disables the
+  // Find/Refresh button in TopicSupplementary -- plus the affected
+  // topic-enrichment read model(s): just this topic's when the event
+  // carries one, every mounted topic's on a finished course-wide batch
+  // (no topicId). "Finished" means ANY terminal status, not just
+  // 'complete': a batch that aborted on the cost cap or failed partway
+  // still wrote rows for the topics it got through, and treating those
+  // runs as non-events left the panels showing stale data with nothing to
+  // trigger a refetch. Enrichment never changes the graph payload (it only
+  // writes enrichment_resources), so no graph/course refetch here.
   useEffect(() => {
     if (!courseIdValid) return;
     const source = openEvents((event: BsaEvent) => {
-      if (event.type !== "pipeline" || event.courseId !== courseId) return;
-      queryClient.invalidateQueries({ queryKey: ["pipeline-status", courseId] });
-      if (event.status === "run-finished") {
-        queryClient.invalidateQueries({ queryKey: ["graph", courseId] });
-        queryClient.invalidateQueries({ queryKey: ["course", courseId] });
+      if (event.type === "pipeline" && event.courseId === courseId) {
+        queryClient.invalidateQueries({ queryKey: ["pipeline-status", courseId] });
+        if (event.status === "run-finished") {
+          queryClient.invalidateQueries({ queryKey: ["graph", courseId] });
+          queryClient.invalidateQueries({ queryKey: ["course", courseId] });
+        }
+      }
+      if (event.type === "enrichment" && event.courseId === courseId) {
+        queryClient.invalidateQueries({ queryKey: ["pipeline-status", courseId] });
+        if (event.topicId !== undefined) {
+          queryClient.invalidateQueries({ queryKey: ["topic-enrichment", event.topicId] });
+        } else if (ENRICHMENT_TERMINAL_STATUSES.has(event.status)) {
+          queryClient.invalidateQueries({ queryKey: ["topic-enrichment"] });
+        }
       }
     });
     return () => source.close();
@@ -231,7 +260,14 @@ export function CourseWorkspacePage() {
           {graphQuery.isError && (
             <p className="text-sm text-red-600 dark:text-red-400">Couldn't load details.</p>
           )}
-          {graphQuery.data && <DetailPanel payload={graphQuery.data} />}
+          {graphQuery.data && (
+            <DetailPanel
+              payload={graphQuery.data}
+              courseId={courseId}
+              mockLlm={settingsQuery.data?.mockLlm ?? false}
+              runActive={active}
+            />
+          )}
         </aside>
       </div>
 

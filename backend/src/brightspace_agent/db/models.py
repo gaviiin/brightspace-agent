@@ -9,7 +9,7 @@ unique index on materials, which are not represented here).
 
 from __future__ import annotations
 
-from sqlalchemy import ForeignKey, UniqueConstraint, text
+from sqlalchemy import ForeignKey, Index, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -106,6 +106,9 @@ class MaterialTopic(Base):
 
 class EnrichmentResource(Base):
     __tablename__ = "enrichment_resources"
+    # Mirrors schema.sql's ux_enrichment_topic_url: one row per (topic, url),
+    # backing the enrich stage's upsert-by-(topic_id, url).
+    __table_args__ = (Index("ux_enrichment_topic_url", "topic_id", "url", unique=True),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id", ondelete="CASCADE"))
