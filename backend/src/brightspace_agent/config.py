@@ -48,6 +48,24 @@ class Settings(BaseSettings):
     # throughput (summarize/classify ran ~4x slower on a large course) for
     # a guarantee this background job, run by a single local user, doesn't
     # need to be exact about.
+    #
+    # Two more documented gaps between this number and a real bill (M3):
+    #
+    # 1. NON-TOKEN COSTS. Anthropic's `web_search` server tool is billed per
+    #    search (~$0.01) on top of tokens, and the M3 enrich stage runs up to
+    #    8 searches per finder, ~5 finders per topic. That fee IS counted
+    #    against this cap (agents/web.py's `_usage_info` folds it into
+    #    `est_cost_usd` -- from the response's own `server_tool_use` blocks
+    #    when they're available, otherwise charged at the `max_uses` upper
+    #    bound), and api/enrichment.py's dry-run shows it, both via
+    #    `WEB_SEARCH_COST_PER_SEARCH_USD` in agents/llm.py. But it is an
+    #    ESTIMATE from a hard-coded price, exactly like the token table:
+    #    if Anthropic's pricing moves and that constant doesn't, this cap
+    #    moves with it.
+    # 2. THE ENRICH BATCH APPLIES THIS CAP PER TOPIC, NOT PER RUN (an
+    #    accepted M3.1 limitation -- see pipeline/runner.py's
+    #    `start_enrichment` docstring): a course-wide enrichment of N topics
+    #    can therefore spend up to ~N x this cap.
     max_cost_usd_per_run: float = 5.0
 
     @property

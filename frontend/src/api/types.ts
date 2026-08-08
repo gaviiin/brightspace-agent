@@ -185,7 +185,77 @@ export interface SyncBsaEvent {
   status: string;
 }
 
-export type BsaEvent = PipelineBsaEvent | SyncBsaEvent;
+/** `topicId` is present for a single-topic enrichment run, absent for a
+ * course-wide batch (see runner.py's `_EnrichmentRunHooks` /
+ * api/enrichment.py's module docstring). `status` is
+ * "run-started" | "complete" | "aborted" | "failed" (typed as `string`
+ * here, matching PipelineBsaEvent's own looseness). */
+export interface EnrichmentBsaEvent {
+  type: "enrichment";
+  courseId: number;
+  runToken: number;
+  topicId?: number;
+  status: string;
+  stats?: Record<string, unknown>;
+}
+
+export type BsaEvent = PipelineBsaEvent | SyncBsaEvent | EnrichmentBsaEvent;
+
+// ---------------------------------------------------------------------------
+// Enrichment (api/enrichment.py) -- M3.3
+// ---------------------------------------------------------------------------
+
+export type EnrichmentStatus = "suggested" | "kept" | "dismissed";
+
+export interface EnrichmentResource {
+  id: number;
+  url: string;
+  title: string | null;
+  resourceType: string | null;
+  intent: string | null;
+  rationale: string | null;
+  scores: Record<string, number>;
+  verification: Record<string, unknown>;
+  rank: number | null;
+  shared: boolean;
+  status: EnrichmentStatus;
+}
+
+export interface EnrichmentMeta {
+  suggested: number;
+  kept: number;
+  dismissed: number;
+  /** True once an enrichment run has COMPLETED for this topic's current
+   * content (api/enrichment.py derives it from the enrich stage's cache
+   * row). Lets the empty state say "not searched yet" or "searched, found
+   * nothing" instead of one line that could mean either. */
+  searched: boolean;
+  /** The completed run found fewer good resources than it aimed for. Only
+   * meaningful when `searched` is true. */
+  thin: boolean;
+}
+
+export interface TopicEnrichment {
+  topicId: number;
+  resources: EnrichmentResource[];
+  meta: EnrichmentMeta;
+}
+
+export interface EnrichRunResponse {
+  runToken: number;
+}
+
+export interface EnrichDryRunResponse {
+  topicsNeedingEnrichment: number;
+  callsPerTopic: number;
+  estCostPerTopicUsd: number;
+  totalEstCostUsd: number;
+  /** Upper bound on billable web searches per topic. `web_search` is billed
+   * per search (~$0.01) on top of tokens, and at that rate it dominates
+   * `estCostPerTopicUsd` -- so the confirm dialog shows it rather than
+   * leaving the number unexplained. */
+  webSearchesPerTopic: number;
+}
 
 // ---------------------------------------------------------------------------
 // GET /api/settings  (api/settings.py)

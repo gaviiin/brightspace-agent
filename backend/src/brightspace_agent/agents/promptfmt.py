@@ -32,6 +32,18 @@ SECTION_MATERIAL_SUMMARIES = "=== MATERIAL SUMMARIES ==="
 SECTION_COURSE_TOPICS = "=== COURSE TOPICS ==="
 SECTION_MATERIAL = "=== MATERIAL ==="
 
+# Section markers -- enrich (M3). The enrich stage (pipeline/stages/enrich.py)
+# *writes* these into the planner/finder/verifier/judge user payloads; the
+# offline MockWebBackend and the SearchPlan/JudgeResult mock builders (both in
+# agents/web.py) *read* them back, so the two have to agree on the format --
+# exactly the reason this vocabulary lives here and not inside a stage.
+SECTION_TOPIC = "=== TOPIC ==="
+SECTION_ATTACHED_MATERIALS = "=== ATTACHED MATERIALS ==="
+SECTION_SEARCH_INTENT = "=== SEARCH INTENT ==="
+SECTION_CANDIDATE = "=== CANDIDATE ==="
+SECTION_VERIFIED_CANDIDATES = "=== VERIFIED CANDIDATES ==="
+SECTION_PRIOR_FAILURES = "=== PRIOR ROUND FAILURES ==="
+
 _SECTION_RE = re.compile(r"^===\s.*\s===$")
 _NON_ASCII_SLUG_CHARS = re.compile(r"[^a-zA-Z0-9]+")
 _WHITESPACE = re.compile(r"\s+")
@@ -74,6 +86,23 @@ def slugify(value: str) -> str:
     if slug:
         return slug
     return _WHITESPACE.sub("-", value.strip()).strip("-").lower()
+
+
+def labeled_value(text: str, label: str) -> str | None:
+    """The value of the first `label: value` line in `text`, or None.
+
+    A tiny counterpart to `section_body` for the enrich payloads, whose
+    sections carry `Name: ...` / `intent: ...` / `url: ...` lines. Matching is
+    case-insensitive on the label and tolerant of surrounding whitespace, so
+    the mock readers in agents/web.py stay decoupled from cosmetic spacing in
+    the stage's rendering.
+    """
+    pattern = re.compile(rf"^\s*{re.escape(label)}\s*:\s*(?P<value>.+?)\s*$", re.IGNORECASE)
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if match:
+            return match.group("value")
+    return None
 
 
 def section_body(prompt: str, header: str) -> str:

@@ -8,13 +8,14 @@ import { useUiStore } from "../state/uiStore";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
-  return { ...actual, getMaterial: vi.fn() };
+  return { ...actual, getMaterial: vi.fn(), getTopicEnrichment: vi.fn() };
 });
 
-import { getMaterial } from "../api/client";
+import { getMaterial, getTopicEnrichment } from "../api/client";
 import { DetailPanel } from "./DetailPanel";
 
 const mockedGetMaterial = vi.mocked(getMaterial);
+const mockedGetTopicEnrichment = vi.mocked(getTopicEnrichment);
 
 function fixturePayload(): GraphPayload {
   return {
@@ -42,16 +43,35 @@ function renderWithQueryClient(ui: ReactNode) {
   return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
 }
 
+/** Defaults the M3.3 props every test doesn't care about (courseId,
+ * mockLlm, runActive) so only the tests that do need to set them. */
+function renderDetailPanel(payload: GraphPayload, overrides: { runActive?: boolean } = {}) {
+  return renderWithQueryClient(
+    <DetailPanel
+      payload={payload}
+      courseId={1}
+      mockLlm={false}
+      runActive={overrides.runActive ?? false}
+    />,
+  );
+}
+
 beforeEach(() => {
   useUiStore.setState({ expandedTopicIds: new Set(), selection: null });
   mockedGetMaterial.mockReset();
+  mockedGetTopicEnrichment.mockReset();
+  mockedGetTopicEnrichment.mockResolvedValue({
+    topicId: 1,
+    resources: [],
+    meta: { suggested: 0, kept: 0, dismissed: 0, searched: false, thin: false },
+  });
 });
 
 afterEach(cleanup);
 
 describe("DetailPanel: nothing selected", () => {
   it("shows a hint", () => {
-    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+    renderDetailPanel(fixturePayload());
     expect(screen.getByText(/select a topic or material/i)).toBeTruthy();
   });
 });
@@ -59,7 +79,7 @@ describe("DetailPanel: nothing selected", () => {
 describe("DetailPanel: topic selected", () => {
   it("renders the topic's materials and edge chips", () => {
     useUiStore.setState({ selection: { type: "topic", id: 1 } });
-    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+    renderDetailPanel(fixturePayload());
 
     expect(screen.getByText("Intro")).toBeTruthy();
     expect(screen.getByText("Intro topic desc.")).toBeTruthy();
@@ -70,7 +90,7 @@ describe("DetailPanel: topic selected", () => {
 
   it("clicking an edge chip moves the selection to that topic", () => {
     useUiStore.setState({ selection: { type: "topic", id: 1 } });
-    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+    renderDetailPanel(fixturePayload());
 
     fireEvent.click(screen.getByText(/required by: Advanced/));
 
@@ -79,11 +99,19 @@ describe("DetailPanel: topic selected", () => {
 
   it("clicking a material in the topic's list selects that material", () => {
     useUiStore.setState({ selection: { type: "topic", id: 1 } });
-    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+    renderDetailPanel(fixturePayload());
 
     fireEvent.click(screen.getByText("Lecture 1"));
 
     expect(useUiStore.getState().selection).toEqual({ type: "material", id: 10 });
+  });
+
+  it("renders the Supplementary section below the materials list", async () => {
+    useUiStore.setState({ selection: { type: "topic", id: 1 } });
+    renderDetailPanel(fixturePayload());
+
+    expect(await screen.findByText(/not searched yet/i)).toBeTruthy();
+    expect(mockedGetTopicEnrichment).toHaveBeenCalledWith(1);
   });
 });
 
@@ -107,7 +135,7 @@ describe("DetailPanel: material selected", () => {
   it("renders the summary and key terms once loaded", async () => {
     mockedGetMaterial.mockResolvedValue(materialFixture());
     useUiStore.setState({ selection: { type: "material", id: 10 } });
-    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+    renderDetailPanel(fixturePayload());
 
     expect(await screen.findByText("This lecture covers the basics.")).toBeTruthy();
     expect(screen.getByText("alpha")).toBeTruthy();
@@ -118,7 +146,7 @@ describe("DetailPanel: material selected", () => {
   it("shows a topic chip with confidence, wired to select that topic", async () => {
     mockedGetMaterial.mockResolvedValue(materialFixture());
     useUiStore.setState({ selection: { type: "material", id: 10 } });
-    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+    renderDetailPanel(fixturePayload());
 
     const chip = await screen.findByText(/Intro.*90%/);
     fireEvent.click(chip);
@@ -129,7 +157,7 @@ describe("DetailPanel: material selected", () => {
   it("omits the Open in Brightspace link when there is no http sourceUrl", async () => {
     mockedGetMaterial.mockResolvedValue(materialFixture());
     useUiStore.setState({ selection: { type: "material", id: 10 } });
-    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+    renderDetailPanel(fixturePayload());
 
     await screen.findByText("This lecture covers the basics.");
     expect(screen.queryByText(/Open in Brightspace/)).toBeNull();
@@ -138,7 +166,7 @@ describe("DetailPanel: material selected", () => {
   it("shows an Open in Brightspace link when sourceUrl starts with http", async () => {
     mockedGetMaterial.mockResolvedValue({ ...materialFixture(), sourceUrl: "https://example.d2l.com/x" });
     useUiStore.setState({ selection: { type: "material", id: 10 } });
-    renderWithQueryClient(<DetailPanel payload={fixturePayload()} />);
+    renderDetailPanel(fixturePayload());
 
     const link = (await screen.findByText(/Open in Brightspace/)).closest("a");
     expect(link?.getAttribute("href")).toBe("https://example.d2l.com/x");
