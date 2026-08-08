@@ -6,7 +6,7 @@ Course material in Brightspace (D2L) is organized the way it was *delivered* —
 
 This project reorganizes a course around its **topics**. It pulls everything out of Brightspace, has an LLM pipeline work out what the course is actually about, assigns every material to the topics it teaches, and renders the result as a graph you can walk.
 
-Milestone 1 (built) covers sync, organization, and browsing. Lecture recordings and transcripts (M2), agents that find supplementary material on the web (M3), and an MCP server exposing the graph to other AI tools (M4) are designed but not built.
+Milestones 1 and 3 are built: sync, organization, browsing, and the web-enrichment agent team (validated against the live API 2026-08-07; see the TIER DECISION note in `pipeline/stages/enrich.py` for the cost lesson that run taught). Lecture recordings and transcripts (M2) and an MCP server exposing the graph to other AI tools (M4) are designed but not built.
 
 ---
 
