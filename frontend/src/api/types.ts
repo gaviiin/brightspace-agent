@@ -61,9 +61,13 @@ export interface GraphPayload {
   materials: GraphMaterial[];
   topicEdges: GraphEdge[];
   attachments: GraphAttachment[];
-  // `adminCount` (M3.5a) is optional here so existing fixtures/tests that
-  // predate it keep type-checking; the backend always sends it. UI wiring
-  // for the admin bucket itself is left to a later task.
+  // `adminCount` (M3.5a) is how many materials S4 filed under the synthetic
+  // "Logistics & admin" bucket (ADMIN_TOPIC_ID). Purely informational --
+  // nothing in the UI derives the bucket from it; the bucket is a topic in
+  // `topics` like any other, and its contents come from `attachments`. It's
+  // read by tests and by consumers that want the count without walking the
+  // attachment list. Optional here so fixtures that predate it keep
+  // type-checking; the backend always sends it.
   meta: { taxonomyVersion: number; orphanCount: number; adminCount?: number };
 }
 

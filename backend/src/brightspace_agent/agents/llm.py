@@ -22,7 +22,9 @@ from pydantic import BaseModel
 
 from brightspace_agent.agents.promptfmt import (
     SECTION_COURSE_TOPICS,
+    SECTION_MATERIAL,
     SECTION_MODULE_OUTLINE,
+    labeled_value,
     section_body,
     slugify,
 )
@@ -289,11 +291,33 @@ def _mock_taxonomy(user: str) -> TaxonomyOut:
 # "3. graph-algorithms — Graph Algorithms — ..." -> "graph-algorithms"
 _NUMBERED_SLUG_RE = re.compile(r"^\s*\d+\.\s+(?P<slug>\S+)")
 
+# M3.5a: title substrings (matched case-insensitively) that make the mock
+# answer `is_administrative=True`. Chosen to read as obviously
+# course-mechanics rather than course content, and short enough that an
+# offline fixture can opt in just by naming a material sensibly -- the fake
+# D2L tenant's "Office hours moved" announcement is exactly that (see
+# tests/fake_d2l.py's NEWS).
+_MOCK_ADMIN_TITLE_MARKERS = ("office hours", "grades")
+
 
 def _mock_classification(user: str) -> ClassificationOut:
     """Assign the first two topics of whatever taxonomy the prompt carries:
     one confident, one weak -- a deterministic multi-label answer that also
-    produces a low-confidence row for the review-flagging path."""
+    produces a low-confidence row for the review-flagging path.
+
+    Exception (M3.5a): a material whose `Title:` contains "Office Hours" or
+    "Grades" (case-insensitive) comes back `is_administrative=True` with no
+    assignments, the shape S3 turns into an empty-topics material and S4
+    files under its own "Logistics & admin" bucket. Without it no offline
+    run -- `make e2e` included -- ever produces that bucket, so the whole
+    admin path would be exercised only by unit tests that set the column by
+    hand.
+    """
+    title = labeled_value(section_body(user, SECTION_MATERIAL), "Title") or ""
+    lowered = title.lower()
+    if any(marker in lowered for marker in _MOCK_ADMIN_TITLE_MARKERS):
+        return ClassificationOut(assignments=[], is_administrative=True)
+
     slugs: list[str] = []
     for line in section_body(user, SECTION_COURSE_TOPICS).splitlines():
         match = _NUMBERED_SLUG_RE.match(line)

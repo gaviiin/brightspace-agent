@@ -20,7 +20,8 @@ from brightspace_agent.agents.llm import (
     MockBackend,
     make_backend,
 )
-from brightspace_agent.agents.schemas import DocSummary
+from brightspace_agent.agents.promptfmt import SECTION_COURSE_TOPICS, SECTION_MATERIAL
+from brightspace_agent.agents.schemas import ClassificationOut, DocSummary
 from brightspace_agent.config import Settings
 
 
@@ -83,6 +84,67 @@ def test_mock_backend_output_is_valid_doc_summary_instance():
     assert isinstance(parsed, DocSummary)
     assert parsed.doc_kind_guess in get_args(DocSummary.model_fields["doc_kind_guess"].annotation)
     assert len(parsed.key_terms) <= 10
+
+
+# --------------------------------------------------------------------------
+# MockBackend classification: the M3.5a administrative heuristic
+# --------------------------------------------------------------------------
+
+
+def _classify_prompt(title: str) -> str:
+    """The shape classify.py's `_build_user_prompt` produces (promptfmt's
+    sections + a `Title:` line), which is what the mock reads."""
+    return (
+        f"{SECTION_COURSE_TOPICS}\n"
+        "1. arrays-and-lists — Arrays and Lists — Contiguous storage.\n"
+        "2. sorting-algorithms — Sorting Algorithms — Comparison sorts.\n"
+        "\n"
+        f"{SECTION_MATERIAL}\n"
+        f"Title: {title}\n"
+        "Kind: announcement\n"
+        "Key terms: (none)\n"
+        "Summary:\n"
+        "Some summary text.\n"
+    )
+
+
+@pytest.mark.parametrize("title", ["Office hours moved", "OFFICE HOURS", "Final Grades Posted", "grades"])
+def test_mock_classification_flags_admin_titles(title):
+    backend = MockBackend()
+
+    parsed, _ = backend.structured_call(
+        ClassificationOut, system="sys", user=_classify_prompt(title), tier="fast"
+    )
+
+    assert parsed.is_administrative is True
+    assert parsed.assignments == []  # the shape S3 turns into an empty-topics material
+
+
+def test_mock_classification_leaves_ordinary_titles_alone():
+    backend = MockBackend()
+
+    parsed, _ = backend.structured_call(
+        ClassificationOut, system="sys", user=_classify_prompt("Lecture 5: Quicksort"), tier="fast"
+    )
+
+    assert parsed.is_administrative is False
+    assert [a.topic_slug for a in parsed.assignments] == ["arrays-and-lists", "sorting-algorithms"]
+
+
+def test_mock_classification_reads_the_title_not_the_whole_prompt():
+    """The marker has to come from the material's own `Title:` line. A
+    course whose taxonomy happens to include an "office hours" topic, or a
+    summary that merely mentions grades, must not turn every material in it
+    administrative."""
+    backend = MockBackend()
+    prompt = _classify_prompt("Lecture 5: Quicksort").replace(
+        "Some summary text.", "Mentions office hours and grades in passing."
+    )
+
+    parsed, _ = backend.structured_call(ClassificationOut, system="sys", user=prompt, tier="fast")
+
+    assert parsed.is_administrative is False
+    assert parsed.assignments
 
 
 # --------------------------------------------------------------------------

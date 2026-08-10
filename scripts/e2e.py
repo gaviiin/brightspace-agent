@@ -44,6 +44,8 @@ from typing import Any
 import httpx
 import uvicorn
 
+from brightspace_agent.graph.build import ADMIN_TOPIC_ID, UNSORTED_TOPIC_ID
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_TESTS_DIR = REPO_ROOT / "backend" / "tests"
 FIXTURE_DIR = BACKEND_TESTS_DIR / "fixtures" / "d2l"
@@ -487,6 +489,11 @@ def _check_transcript_reached_the_graph(graph: dict, media: dict) -> None:
         _assert(material["kind"] == "transcript", "transcript material has the wrong kind", material)
 
 
+def _admin_material_ids(graph: dict) -> set[int]:
+    """Materials S4 filed under the synthetic "Logistics & admin" bucket."""
+    return {a["materialId"] for a in graph["attachments"] if a["topicId"] == ADMIN_TOPIC_ID}
+
+
 def _check_link_material_flows_to_summarized_and_classified(graph: dict) -> None:
     """M3.5a regression: a link-kind material (toc_sample's TOPIC-1003, "the
     fake tenant already has link topics") has no sha256/blob at all, so
@@ -499,6 +506,7 @@ def _check_link_material_flows_to_summarized_and_classified(graph: dict) -> None
     links = [m for m in graph["materials"] if m["kind"] == "link"]
     _assert(links, "expected at least one kind='link' material in the graph", graph["materials"])
 
+    admin_ids = _admin_material_ids(graph)
     for link in links:
         _assert(
             link["status"] == "summarized",
@@ -506,6 +514,13 @@ def _check_link_material_flows_to_summarized_and_classified(graph: dict) -> None
             f"(status={link['status']!r}) -- the metadata pseudo-document pass didn't pick it up",
             link,
         )
+        if link["id"] in admin_ids:
+            # An administrative material carries NO material_topics rows by
+            # design (see classify.py), so `maxConfidence` is legitimately
+            # null -- reaching the admin bucket IS its classification. The
+            # assertion below is about links that never made it into S3's
+            # worklist at all, which is a different failure.
+            continue
         _assert(
             link["maxConfidence"] is not None,
             f"link material {link['id']!r} ({link['title']!r}) has no classification "
@@ -514,9 +529,56 @@ def _check_link_material_flows_to_summarized_and_classified(graph: dict) -> None
         )
 
 
+def _check_admin_bucket(graph: dict) -> None:
+    """M3.5a: the fake tenant's administrative announcement (fake_d2l's
+    ADMIN_NEWS_TITLE, which MockBackend classifies `is_administrative=True`)
+    must reach S4's "Logistics & admin" bucket rather than a real topic or
+    Unsorted -- the only end-to-end proof that S3's flag, S4's bucket and
+    the graph contract line up."""
+    admin_topics = [t for t in graph["topics"] if t["id"] == ADMIN_TOPIC_ID]
+    _assert(
+        len(admin_topics) == 1,
+        "expected exactly one 'Logistics & admin' bucket in the graph",
+        [t["id"] for t in graph["topics"]],
+    )
+
+    admin_ids = _admin_material_ids(graph)
+    _assert(
+        admin_topics[0]["materialCount"] == len(admin_ids),
+        "admin bucket's materialCount disagrees with its attachments",
+        {"materialCount": admin_topics[0]["materialCount"], "attached": sorted(admin_ids)},
+    )
+    _assert(
+        graph["meta"]["adminCount"] == len(admin_ids) >= 1,
+        "meta.adminCount disagrees with the admin bucket's attachments (or is 0)",
+        {"adminCount": graph["meta"]["adminCount"], "attached": sorted(admin_ids)},
+    )
+
+    titles = {m["title"] for m in graph["materials"] if m["id"] in admin_ids}
+    _assert(
+        fake_d2l.ADMIN_NEWS_TITLE in titles,
+        f"the fixture's administrative announcement ({fake_d2l.ADMIN_NEWS_TITLE!r}) "
+        "did not land in the Logistics & admin bucket",
+        sorted(titles),
+    )
+
+    # An administrative material must not ALSO be filed under a real topic
+    # or under Unsorted -- the whole point of the bucket is that it stops
+    # crowding those.
+    stray = [
+        a for a in graph["attachments"]
+        if a["materialId"] in admin_ids and a["topicId"] != ADMIN_TOPIC_ID
+    ]
+    _assert(not stray, "an administrative material is also attached elsewhere", stray)
+
+
 def _check_graph_invariants(graph: dict, course: dict) -> None:
-    real_topics = [t for t in graph["topics"] if t["id"] != 0]
-    _assert(len(real_topics) >= 3, f"expected >= 3 non-Unsorted topics, got {len(real_topics)}", real_topics)
+    # Both synthetic buckets are excluded: neither Unsorted nor Logistics &
+    # admin is a topic the taxonomy stage proposed, so counting either would
+    # let a course with a degenerate taxonomy pass this check.
+    synthetic_ids = {UNSORTED_TOPIC_ID, ADMIN_TOPIC_ID}
+    real_topics = [t for t in graph["topics"] if t["id"] not in synthetic_ids]
+    _assert(len(real_topics) >= 3, f"expected >= 3 real topics, got {len(real_topics)}", real_topics)
 
     material_ids = {m["id"] for m in graph["materials"]}
     attached_ids = {a["materialId"] for a in graph["attachments"]}
@@ -604,10 +666,12 @@ async def run_main_scenario() -> None:
                 _check_graph_invariants(graph1, course_detail1)
                 _check_transcript_reached_the_graph(graph1, media)
                 _check_link_material_flows_to_summarized_and_classified(graph1)
+                _check_admin_bucket(graph1)
                 print(f"[e2e] media OK: {len(media['sources'])} recording(s) transcribed and in the graph")
                 print(
                     f"[e2e] first run OK: {len(graph1['topics'])} topics, "
-                    f"{len(graph1['materials'])} materials, taxonomyVersion={graph1['meta']['taxonomyVersion']}"
+                    f"{len(graph1['materials'])} materials, taxonomyVersion={graph1['meta']['taxonomyVersion']}, "
+                    f"adminCount={graph1['meta']['adminCount']}"
                 )
 
                 llm_cache_before = _count_llm_cache_rows(data_dir)

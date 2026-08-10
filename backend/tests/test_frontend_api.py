@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from brightspace_agent.db.models import Course, Material, MaterialTopic, MediaSource, Topic
+from brightspace_agent.graph.build import ADMIN_TOPIC_ID, ADMIN_TOPIC_SLUG, UNSORTED_TOPIC_ID
 
 CSRF_HEADERS = {"X-BSA-Request": "1"}
 
@@ -453,6 +454,85 @@ def test_pipeline_run_forwards_force_taxonomy_and_defaults_it_off(client, app, d
     _wait_for_pipeline_idle(client, course_id)
 
     assert seen == [False, True]
+
+
+# --------------------------------------------------------------------------
+# (4b) M3.5a: S3 -> S4 -> GET /graph produces the "Logistics & admin" bucket.
+# The stage tests cover S3's flag and graph/build.py's bucket separately;
+# this is the seam between them, through the real runner and the real HTTP
+# read model, with nothing setting `is_administrative` by hand.
+# --------------------------------------------------------------------------
+
+
+def _add_summarized_material(db_session_factory, course_id, *, title, kind, sha256) -> int:
+    return _add_material(
+        db_session_factory, course_id, kind=kind, title=title, mime="text/plain",
+        sha256=sha256, size_bytes=10, status="summarized",
+        summary=f"{title}: a short summary of this material.",
+        summary_meta_json=json.dumps({"key_terms": ["alpha", "beta"]}),
+    )
+
+
+def test_administrative_material_reaches_the_graphs_admin_bucket(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    with db_session_factory() as session:
+        for order_index, (slug, name) in enumerate([("arrays", "Arrays"), ("sorting", "Sorting")]):
+            session.add(
+                Topic(
+                    course_id=course_id, taxonomy_version=1, slug=slug, name=name,
+                    description=f"{name} in this course.", order_index=order_index, created_by="agent",
+                )
+            )
+        session.get(Course, course_id).taxonomy_version = 1
+        session.commit()
+
+    # MockBackend flags this one administrative off its title alone (see
+    # agents/llm.py's `_MOCK_ADMIN_TITLE_MARKERS`); the other classifies
+    # normally.
+    admin_id = _add_summarized_material(
+        db_session_factory, course_id, title="Office Hours Moved", kind="announcement", sha256="a" * 64,
+    )
+    lecture_id = _add_summarized_material(
+        db_session_factory, course_id, title="Lecture 1", kind="slides", sha256="b" * 64,
+    )
+
+    resp = client.post(
+        f"/api/courses/{course_id}/pipeline/run",
+        json={"stages": ["classify", "assemble"]},
+        headers=CSRF_HEADERS,
+    )
+    assert resp.status_code == 200
+    status = _wait_for_pipeline_idle(client, course_id)
+    assert [s["status"] for s in status["stages"]] == ["complete", "complete"]
+
+    # S3 set the flag -- no test fixture did.
+    with db_session_factory() as session:
+        assert session.get(Material, admin_id).is_administrative == 1
+        assert session.get(Material, lecture_id).is_administrative == 0
+        assert (
+            session.execute(
+                select(MaterialTopic).where(MaterialTopic.material_id == admin_id)
+            ).scalars().all()
+            == []
+        )  # administrative materials get no topic rows at all
+
+    graph = client.get(f"/api/courses/{course_id}/graph").json()
+
+    admin_bucket = next(t for t in graph["topics"] if t["id"] == ADMIN_TOPIC_ID)
+    assert admin_bucket["slug"] == ADMIN_TOPIC_SLUG
+    assert admin_bucket["materialCount"] == 1
+    assert graph["meta"]["adminCount"] == 1
+    assert graph["meta"]["orphanCount"] == 0  # the admin material is not counted as unfiled
+
+    attachments_by_material: dict[int, set[int]] = {}
+    for attachment in graph["attachments"]:
+        attachments_by_material.setdefault(attachment["materialId"], set()).add(attachment["topicId"])
+    # The admin material is in the bucket and nowhere else...
+    assert attachments_by_material[admin_id] == {ADMIN_TOPIC_ID}
+    # ...and the ordinary one is under real topics, untouched by any of this.
+    assert attachments_by_material[lecture_id]
+    assert ADMIN_TOPIC_ID not in attachments_by_material[lecture_id]
+    assert UNSORTED_TOPIC_ID not in attachments_by_material[lecture_id]
 
 
 def test_pipeline_status_shape(client, db_session_factory):
