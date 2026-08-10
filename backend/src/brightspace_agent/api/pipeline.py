@@ -20,6 +20,7 @@ from brightspace_agent.api.deps import get_runner, get_session
 from brightspace_agent.config import Settings
 from brightspace_agent.db.models import Course, Material, MaterialTopic
 from brightspace_agent.pipeline.runner import PipelineRunner, RunActiveError
+from brightspace_agent.pipeline.stages.summarize import METADATA_KINDS
 
 router = APIRouter(prefix="/api/courses", tags=["pipeline"])
 
@@ -142,7 +143,22 @@ def _dry_run_counts(session: Session, course: Course) -> dict[str, int]:
             Material.course_id == course.id, Material.status == "extracted", Material.summary.is_(None)
         )
     ).scalar_one()
-    summarize_calls = fetched_needing_extract + extracted_needing_summary
+    # S1's third pass (M3.5a's metadata pseudo-document): one call per
+    # text-less material the first two terms can't see -- `status='fetched'`
+    # with no sha256 at all, most commonly a link. `METADATA_KINDS` is
+    # imported from the stage rather than restated here so the estimate and
+    # the stage can't drift on which kinds pass 3 actually picks up.
+    fetched_needing_metadata_summary = session.execute(
+        select(func.count(Material.id)).where(
+            Material.course_id == course.id,
+            Material.status == "fetched",
+            Material.sha256.is_(None),
+            Material.kind.in_(METADATA_KINDS),
+        )
+    ).scalar_one()
+    summarize_calls = (
+        fetched_needing_extract + extracted_needing_summary + fetched_needing_metadata_summary
+    )
 
     any_summarized = (
         session.execute(

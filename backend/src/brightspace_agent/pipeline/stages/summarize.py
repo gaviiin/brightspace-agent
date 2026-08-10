@@ -22,7 +22,9 @@ Three passes (`run_summarize_stage`):
    never resolves -- no sha256 at all, most commonly a link -- get
    summarized anyway, from a deterministic `Title:`/`Kind:`/`Module:`/`URL:`
    string built from the row itself rather than extracted text. See
-   `_promote_metadata_one` for why this never touches `material.sha256`.
+   `_promote_metadata_one` for why this never touches `material.sha256`,
+   and `_select_metadata_material_ids` for why "has bytes but no sidecar"
+   is deliberately not this pass's problem.
 
 All three passes fan out across `concurrency` workers (`asyncio.gather` +
 `Semaphore`); each worker opens its own session, does its work, and commits,
@@ -68,7 +70,12 @@ _MAX_CHARS = 12000
 # of those kinds still stuck at 'fetched' with no sha256 is a genuine gap
 # worth surfacing as failed/never-fetched, not papering over with a
 # title-only summary.
-_METADATA_KINDS = ("link", "assignment", "announcement", "other")
+#
+# Public (not `_`-prefixed) because api/pipeline.py's `_dry_run_counts`
+# reads it to count pass 3's calls: the dry-run estimate and the stage have
+# to agree on which materials pass 3 will pick up, and one shared tuple is
+# the only way that stays true when this list changes.
+METADATA_KINDS = ("link", "assignment", "announcement", "other")
 
 _SYSTEM_PROMPT = (
     resources.files("brightspace_agent.agents.prompts").joinpath("summarize.md").read_text(encoding="utf-8")
@@ -142,11 +149,11 @@ async def run_summarize_stage(
         ),
     )
 
-    # Pass 3 (M3.5a): materials pass 1 never touches -- no sha256 (links) or,
-    # defensively, a sha256 whose text sidecar is missing -- get a fair shot
-    # at classification via a metadata-only pseudo-document instead of
-    # sitting at 'fetched' forever. See `_promote_metadata_one`.
-    metadata_ids = _select_metadata_material_ids(session_factory, blob_store, course_id)
+    # Pass 3 (M3.5a): materials pass 1 never touches -- no sha256 at all, most
+    # commonly a link -- get a fair shot at classification via a metadata-only
+    # pseudo-document instead of sitting at 'fetched' forever. See
+    # `_promote_metadata_one`.
+    metadata_ids = _select_metadata_material_ids(session_factory, course_id)
     await _fan_out(
         metadata_ids,
         concurrency,
@@ -422,29 +429,29 @@ def _apply_summary(material: Material, doc_summary_data: dict, model: str, usage
 
 
 def _select_metadata_material_ids(
-    session_factory: sessionmaker[Session], blob_store: BlobStore, course_id: int
+    session_factory: sessionmaker[Session], course_id: int
 ) -> list[int]:
-    """`status='fetched'`, kind in `_METADATA_KINDS`, and no usable text: no
-    sha256 at all (the common case -- a link never gets a blob), or,
-    defensively, a sha256 whose text sidecar is missing. By the time this
-    runs, pass 1 has already resolved every fetched+sha256 material in THIS
-    call to 'extracted' or 'failed', so the sidecar-missing half only ever
-    matters for a material left over from a prior partial run; checked here
-    anyway rather than assumed away.
+    """`status='fetched'`, kind in `METADATA_KINDS`, and no sha256 at all --
+    a link never gets a blob, and a file-less stub hasn't been uploaded yet.
+
+    `sha256 IS NULL` is the whole rule on purpose. A material that HAS bytes
+    but no text sidecar is pass 1's territory (this stage resolves every
+    fetched+sha256 material to 'extracted' or 'failed' before pass 3 runs);
+    summarizing one here would write a title-only guess into `summary` as if
+    it were the real document's, while `compute_needed` -- which keys re-fetch
+    off `sha256 IS NULL` -- sees nothing missing and never repairs the sidecar.
     """
     with session_factory() as session:
-        rows = session.execute(
-            select(Material.id, Material.sha256).where(
-                Material.course_id == course_id,
-                Material.status == "fetched",
-                Material.kind.in_(_METADATA_KINDS),
-            )
-        ).all()
-    return [
-        material_id
-        for material_id, sha256 in rows
-        if not sha256 or blob_store.read_text(sha256) is None
-    ]
+        return list(
+            session.execute(
+                select(Material.id).where(
+                    Material.course_id == course_id,
+                    Material.status == "fetched",
+                    Material.sha256.is_(None),
+                    Material.kind.in_(METADATA_KINDS),
+                )
+            ).scalars().all()
+        )
 
 
 def _build_pseudo_doc(material: Material, module_title: str | None) -> str:
@@ -509,7 +516,7 @@ def _promote_metadata_one(
         if (
             material is None
             or material.status != "fetched"
-            or material.kind not in _METADATA_KINDS
+            or material.kind not in METADATA_KINDS
         ):
             return  # raced, or no longer eligible
 

@@ -526,6 +526,39 @@ def test_dry_run_counts_match_db_state_with_no_backend_calls(client, app, db_ses
     assert counting.calls == 0  # a dry run must never touch the LLM
 
 
+def test_dry_run_counts_text_less_links_that_only_the_metadata_pass_can_reach(
+    client, db_session_factory
+):
+    """M3.5a's pass 3 (summarize.py's metadata pseudo-document) calls the LLM
+    once per `status='fetched'` material with no sha256 whose kind is in
+    `METADATA_KINDS`. The estimate has to count those too -- a link-heavy
+    course would otherwise be quoted $0.00 and then bill for every link.
+    """
+    course_id = _add_course(db_session_factory)
+    resp = client.post(f"/api/courses/{course_id}/pipeline/dry-run", headers=CSRF_HEADERS)
+    assert resp.json()["byStage"]["summarize"]["calls"] == 0
+
+    # A text-less link: no sha256 at all, so neither of the first two
+    # summarize terms (extract / already-extracted) can see it.
+    _add_material(
+        db_session_factory, course_id, kind="link", title="Recommended Reading",
+        source_url="https://en.wikipedia.org/wiki/Big_O_notation", status="fetched",
+    )
+    # A kind outside METADATA_KINDS in the same state is a genuine gap pass 3
+    # deliberately skips (see summarize.py's METADATA_KINDS comment), so it
+    # must NOT be counted.
+    _add_material(
+        db_session_factory, course_id, kind="document", title="Never Uploaded", status="fetched",
+    )
+
+    resp = client.post(f"/api/courses/{course_id}/pipeline/dry-run", headers=CSRF_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["byStage"]["summarize"]["calls"] == 1
+    assert body["byStage"]["summarize"]["estCostUsd"] > 0
+    assert body["totalEstCostUsd"] > 0
+
+
 def test_dry_run_zero_calls_for_a_fresh_course(client, db_session_factory):
     course_id = _add_course(db_session_factory)
     resp = client.post(f"/api/courses/{course_id}/pipeline/dry-run", headers=CSRF_HEADERS)

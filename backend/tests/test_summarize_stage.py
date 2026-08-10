@@ -17,7 +17,11 @@ from brightspace_agent.agents.llm import MockBackend
 from brightspace_agent.db.models import Course, LlmCache, Material, Module
 from brightspace_agent.db.session import init_db
 from brightspace_agent.ingest.store import BlobStore
-from brightspace_agent.pipeline.stages.summarize import PROMPT_VERSION, run_summarize_stage
+from brightspace_agent.pipeline.stages.summarize import (
+    PROMPT_VERSION,
+    _select_metadata_material_ids,
+    run_summarize_stage,
+)
 
 
 def _make_pdf_bytes(text: str) -> bytes:
@@ -465,6 +469,31 @@ def test_metadata_pass_ignores_kinds_outside_the_allowlist(session_factory, blob
     assert stats.summarized == 0
     material = _get_material(session_factory, material_id)
     assert material.status == "fetched"  # untouched, left for a real upload to fix
+
+
+def test_metadata_pass_worklist_is_sha256_is_null_only(session_factory, blob_store, course_id):
+    """A material that HAS bytes is pass 1's job even if its text sidecar is
+    missing -- pass 3 must not pick it up. Summarizing it from metadata would
+    write a title-only guess into `summary` as though it were the real
+    document's, and (since `compute_needed` keys re-fetch off `sha256 IS
+    NULL`) nothing would ever repair the sidecar.
+
+    Asserted on the selector directly rather than through a stage run: pass
+    1 resolves every fetched+sha256 material to 'extracted' or 'failed'
+    before pass 3 runs, so the state this rules out cannot be staged from
+    the outside -- which is exactly why the old sidecar-missing branch was
+    unreachable, and worth pinning as unreachable by construction.
+    """
+    no_sha_id = _add_material(
+        session_factory, course_id, kind="link", title="A link", status="fetched",
+    )
+    _add_material(
+        session_factory, course_id, kind="link", title="Bytes but no sidecar",
+        mime="text/html", sha256="d" * 64, size_bytes=10, status="fetched",
+    )
+    assert blob_store.read_text("d" * 64) is None  # the sidecar really is missing
+
+    assert _select_metadata_material_ids(session_factory, course_id) == [no_sha_id]
 
 
 @pytest.mark.parametrize("kind", ["link", "assignment", "announcement", "other"])
