@@ -173,16 +173,29 @@ def test_migration_2_dedups_duplicate_topic_url_rows_before_creating_unique_inde
     # without the unique index) that already has a duplicate (topic_id, url)
     # pair -- built from raw SQL, not schema.sql, since schema.sql (as of
     # M3.1) already creates the index for a fresh database and so can't be
-    # used to reproduce the pre-hardening scenario this test targets. A bare
-    # `materials` stub is included too -- a REAL v1 database always has one
-    # (schema.sql creates it), and migration 5's ALTER TABLE needs it to
-    # exist when migrate() runs every later migration in this same call.
+    # used to reproduce the pre-hardening scenario this test targets. Bare
+    # `materials`/`material_topics` stubs are included too -- a REAL v1
+    # database always has them (schema.sql creates them), and migration 5's
+    # ALTER TABLE and migration 6's rebuild both need them to exist when
+    # migrate() runs every later migration in this same call.
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(
             """
             BEGIN;
             CREATE TABLE materials (id INTEGER PRIMARY KEY AUTOINCREMENT);
+            CREATE TABLE topics (id INTEGER PRIMARY KEY AUTOINCREMENT);
+            CREATE TABLE material_topics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+                topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+                taxonomy_version INTEGER NOT NULL,
+                confidence REAL,
+                rationale TEXT,
+                method TEXT NOT NULL CHECK(method IN ('llm','embedding','user')) DEFAULT 'llm',
+                review_status TEXT NOT NULL CHECK(review_status IN ('auto','confirmed','rejected')) DEFAULT 'auto',
+                UNIQUE(material_id, topic_id, taxonomy_version)
+            );
             CREATE TABLE enrichment_resources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 topic_id INTEGER NOT NULL,
@@ -255,10 +268,11 @@ def test_migration_3_adds_media_sources_to_a_v2_database(db_path, tmp_path):
         # migrate() always brings a database to the LATEST version, not just
         # the next one -- from v2 that's migration 3 (adds the table), then
         # migration 4 (M2.6a's material_id-nullable rebuild), then migration
-        # 5 (M3.5a's materials.is_administrative column) in the same call,
+        # 5 (M3.5a's materials.is_administrative column), then migration 6
+        # (M3.5b's material_topics.method CHECK widening) in the same call,
         # so the version lands on whatever's newest, not literally 3.
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
-        assert MIGRATIONS[-1][0] == 5  # nothing newer has been appended without updating this test
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert MIGRATIONS[-1][0] == 6  # nothing newer has been appended without updating this test
 
         # The migrated table must match what a fresh database gets from
         # schema.sql -- a migration that produces a differently-shaped table
@@ -286,7 +300,7 @@ def test_migration_3_adds_media_sources_to_a_v2_database(db_path, tmp_path):
 
         migrate(conn)
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
         row = conn.execute("SELECT url, status FROM media_sources").fetchone()
         assert row == ("https://zoom.us/rec/share/abc", "detected")
     finally:
@@ -364,10 +378,10 @@ def test_migration_4_makes_media_sources_material_id_nullable(db_path, tmp_path)
         before = conn.execute(f"SELECT {columns} FROM media_sources ORDER BY id").fetchall()
         assert len(before) == 2  # the seeded precondition really held
 
-        migrate(conn)  # applies migration 4, then migration 5, on top of this v3 db
+        migrate(conn)  # applies migration 4, then migrations 5 and 6, on top of this v3 db
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
-        assert MIGRATIONS[-1][0] == 5  # nothing newer has been appended without updating this test
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert MIGRATIONS[-1][0] == 6  # nothing newer has been appended without updating this test
 
         after = conn.execute(f"SELECT {columns} FROM media_sources ORDER BY id").fetchall()
         assert after == before  # every row, every column, survives byte-identical
@@ -409,7 +423,7 @@ def test_migration_4_makes_media_sources_material_id_nullable(db_path, tmp_path)
         # migration 3's test's own post-migration insert-then-remigrate).
         before_second_migrate = conn.execute(f"SELECT {columns} FROM media_sources ORDER BY id").fetchall()
         migrate(conn)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
         after2 = conn.execute(f"SELECT {columns} FROM media_sources ORDER BY id").fetchall()
         assert after2 == before_second_migrate
     finally:
@@ -449,10 +463,10 @@ def test_migration_5_adds_materials_is_administrative_column(db_path, tmp_path):
         before = conn.execute("SELECT id, title FROM materials ORDER BY id").fetchall()
         assert len(before) == 2  # the seeded precondition really held
 
-        migrate(conn)  # applies migration 5 on top of this v4 db
+        migrate(conn)  # applies migrations 5 and 6 on top of this v4 db
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
-        assert MIGRATIONS[-1][0] == 5  # nothing newer has been appended without updating this test
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert MIGRATIONS[-1][0] == 6  # nothing newer has been appended without updating this test
 
         assert "is_administrative" in _table_columns(conn, "materials")
         rows = conn.execute("SELECT id, is_administrative FROM materials ORDER BY id").fetchall()
@@ -486,8 +500,126 @@ def test_migration_5_adds_materials_is_administrative_column(db_path, tmp_path):
             "SELECT id, title, is_administrative FROM materials ORDER BY id"
         ).fetchall()
         migrate(conn)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
         after2 = conn.execute("SELECT id, title, is_administrative FROM materials ORDER BY id").fetchall()
+        assert after2 == before_second_migrate
+    finally:
+        conn.close()
+
+
+
+# --------------------------------------------------------------------------
+# M3.5b's migration 6 (material_topics.method CHECK gains 'inherited'). Same
+# table-rebuild shape as migration 4: hand-build a v5 database (method's
+# CHECK still only allows llm/embedding/user -- schema.sql already reflects
+# the widened CHECK as of this task, so it can't be used to reproduce the
+# pre-migration-6 state, same reasoning as migration 4's own hand-built v3
+# setup) WITH data rows, including one of every pre-existing method value,
+# and prove the rebuild carries every row across byte-identical and the
+# CHECK constraint now actually accepts 'inherited'.
+# --------------------------------------------------------------------------
+
+
+def test_migration_6_adds_inherited_to_material_topics_method_check(db_path, tmp_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(MIGRATIONS[0][1])  # courses/materials/topics/etc. -- unaffected by this migration
+        conn.executescript(
+            """
+            BEGIN;
+            DROP TABLE material_topics;
+            CREATE TABLE material_topics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+                topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+                taxonomy_version INTEGER NOT NULL,
+                confidence REAL,
+                rationale TEXT,
+                method TEXT NOT NULL CHECK(method IN ('llm','embedding','user')) DEFAULT 'llm',
+                review_status TEXT NOT NULL CHECK(review_status IN ('auto','confirmed','rejected')) DEFAULT 'auto',
+                UNIQUE(material_id, topic_id, taxonomy_version)
+            );
+            PRAGMA user_version = 5;
+            COMMIT;
+            """
+        )
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+
+        # A material/topic pair per pre-existing method value, so the
+        # byte-identical check below actually exercises every one of them,
+        # plus a NULL-confidence/rationale row (both nullable columns).
+        conn.executescript(
+            """
+            INSERT INTO courses (d2l_org_unit_id, tenant_origin, name)
+                VALUES (1, 'school.d2l.com', 'Intro to CS');
+            INSERT INTO materials (course_id, title) VALUES (1, 'Lecture 1');
+            INSERT INTO topics (course_id, taxonomy_version, slug, name)
+                VALUES (1, 1, 'arrays', 'Arrays');
+            INSERT INTO topics (course_id, taxonomy_version, slug, name)
+                VALUES (1, 1, 'sorting', 'Sorting');
+            INSERT INTO material_topics (material_id, topic_id, taxonomy_version, confidence, rationale, method, review_status)
+                VALUES (1, 1, 1, 0.9, 'model said so', 'llm', 'auto');
+            INSERT INTO material_topics (material_id, topic_id, taxonomy_version, confidence, rationale, method, review_status)
+                VALUES (1, 2, 1, NULL, NULL, 'user', 'confirmed');
+            """
+        )
+
+        columns = "id, material_id, topic_id, taxonomy_version, confidence, rationale, method, review_status"
+        before = conn.execute(f"SELECT {columns} FROM material_topics ORDER BY id").fetchall()
+        assert len(before) == 2  # the seeded precondition really held
+
+        migrate(conn)  # applies migration 6 on top of this v5 db
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert MIGRATIONS[-1][0] == 6  # nothing newer has been appended without updating this test
+
+        after = conn.execute(f"SELECT {columns} FROM material_topics ORDER BY id").fetchall()
+        assert after == before  # every row, every column, survives byte-identical
+
+        # The migrated table must match what a fresh database gets from
+        # schema.sql.
+        fresh_path = tmp_path / "fresh.db"
+        init_db(fresh_path)
+        fresh_conn = sqlite3.connect(fresh_path)
+        try:
+            assert _table_columns(conn, "material_topics") == _table_columns(fresh_conn, "material_topics")
+        finally:
+            fresh_conn.close()
+
+        # The whole point: 'inherited' is now an accepted method.
+        conn.execute(
+            "INSERT INTO material_topics (material_id, topic_id, taxonomy_version, confidence, rationale, method, review_status) "
+            "VALUES (1, 1, 2, 0.9, 'inherited from the lecture transcript', 'inherited', 'auto')"
+        )
+        conn.commit()
+        inherited_row = conn.execute(
+            "SELECT method FROM material_topics WHERE taxonomy_version = 2"
+        ).fetchone()
+        assert inherited_row == ("inherited",)
+
+        # An out-of-set value is still rejected.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO material_topics (material_id, topic_id, taxonomy_version, method) "
+                "VALUES (1, 1, 3, 'bogus')"
+            )
+        conn.rollback()
+
+        # UNIQUE(material_id, topic_id, taxonomy_version) survived the rebuild.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO material_topics (material_id, topic_id, taxonomy_version, method) "
+                "VALUES (1, 1, 2, 'llm')"
+            )
+        conn.rollback()
+
+        # A second migrate() is a no-op: version and data both unchanged
+        # (data includes the 'inherited' row above -- the "same shape usable
+        # after the rebuild" check, mirroring migration 4's own test).
+        before_second_migrate = conn.execute(f"SELECT {columns} FROM material_topics ORDER BY id").fetchall()
+        migrate(conn)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        after2 = conn.execute(f"SELECT {columns} FROM material_topics ORDER BY id").fetchall()
         assert after2 == before_second_migrate
     finally:
         conn.close()

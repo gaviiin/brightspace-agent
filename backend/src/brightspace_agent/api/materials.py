@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from starlette.responses import PlainTextResponse, StreamingResponse
 
 from brightspace_agent.api.deps import get_blob_store, get_session
-from brightspace_agent.db.models import Course, Material, MaterialTopic
+from brightspace_agent.db.models import Course, Material, MaterialTopic, MediaSource
 from brightspace_agent.ingest.store import BlobStore
 
 router = APIRouter(prefix="/api/materials", tags=["materials"])
@@ -44,6 +44,14 @@ class MaterialOut(CamelModel):
     summary: str | None
     key_terms: list[str]
     topic_ids: list[int]
+    # M3.5b: recording linkage, for the frontend's "open recording" action.
+    # A plain dict (not a nested CamelModel) on purpose -- the two shapes
+    # this can take ({url, status, transcriptMaterialId} vs {url, status,
+    # sourceMaterialId}, see `_recording_info`) share no field beyond
+    # url/status, and a single model with both id fields would always
+    # serialize both keys (one of them null) instead of only the one that
+    # applies.
+    recording: dict[str, str | int | None] | None = None
 
 
 def _key_terms(material: Material) -> list[str]:
@@ -74,6 +82,50 @@ def _get_material_or_404(session: Session, material_id: int) -> Material:
     return material
 
 
+def _most_recent_media_source(
+    session: Session, *, material_id: int | None, transcript_material_id: int | None
+) -> MediaSource | None:
+    """The `media_sources` row for the given `material_id`/
+    `transcript_material_id` filter, most recently updated first -- exactly
+    one of the two kwargs is non-None per call site below."""
+    stmt = select(MediaSource)
+    if material_id is not None:
+        stmt = stmt.where(MediaSource.material_id == material_id)
+    else:
+        stmt = stmt.where(MediaSource.transcript_material_id == transcript_material_id)
+    stmt = stmt.order_by(MediaSource.updated_at.desc(), MediaSource.id.desc()).limit(1)
+    return session.execute(stmt).scalar_one_or_none()
+
+
+def _recording_info(session: Session, material_id: int) -> dict[str, str | int | None] | None:
+    """The recording linkage for `material_id`, if it is either end of a
+    `media_sources` row (M3.5b): `{url, status, transcriptMaterialId}` if
+    it's a recording's own source material, `{url, status,
+    sourceMaterialId}` if it's the transcript. A material only ever matches
+    one of the two (they come from different flows -- a synced link/page vs.
+    an app-created transcript material), but if several `media_sources` rows
+    happen to point at the same material, the most recently updated one
+    wins.
+    """
+    as_source = _most_recent_media_source(session, material_id=material_id, transcript_material_id=None)
+    if as_source is not None:
+        return {
+            "url": as_source.url,
+            "status": as_source.status,
+            "transcriptMaterialId": as_source.transcript_material_id,
+        }
+
+    as_transcript = _most_recent_media_source(session, material_id=None, transcript_material_id=material_id)
+    if as_transcript is not None:
+        return {
+            "url": as_transcript.url,
+            "status": as_transcript.status,
+            "sourceMaterialId": as_transcript.material_id,
+        }
+
+    return None
+
+
 @router.get("/{material_id}", response_model=MaterialOut)
 def get_material(material_id: int, session: Session = Depends(get_session)) -> MaterialOut:
     material = _get_material_or_404(session, material_id)
@@ -89,6 +141,7 @@ def get_material(material_id: int, session: Session = Depends(get_session)) -> M
         summary=material.summary,
         key_terms=_key_terms(material),
         topic_ids=_current_topic_ids(session, material),
+        recording=_recording_info(session, material.id),
     )
 
 

@@ -114,12 +114,46 @@ _MATERIALS_IS_ADMINISTRATIVE_COLUMN = (
     "ALTER TABLE materials ADD COLUMN is_administrative INTEGER NOT NULL DEFAULT 0;"
 )
 
+# Migration 6 (M3.5b) adds 'inherited' to material_topics.method's CHECK
+# constraint -- the recording-topic-inheritance post-pass
+# (classify.py's `_inherit_recording_topics`) writes rows with
+# `method='inherited'` for a recording's source material, mirrored from its
+# transcript's own assignments. SQLite can't ALTER a CHECK constraint in
+# place, so this is the same table-rebuild dance migration 4 used for
+# media_sources: rebuild under a temp name with the widened CHECK, copy
+# every row across unchanged, drop the old table, rename the new one into
+# place. Also folded into schema.sql directly (unlike migration 5's ADD
+# COLUMN, which can't be -- see that migration's comment): a CREATE TABLE
+# rebuild is safe to also express as the fresh-database DDL, the same
+# "also in schema.sql" pairing migrations 2-4 use.
+_MATERIAL_TOPICS_METHOD_INHERITED = (
+    "CREATE TABLE material_topics_new (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,\n"
+    "    topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,\n"
+    "    taxonomy_version INTEGER NOT NULL,\n"
+    "    confidence REAL,\n"
+    "    rationale TEXT,\n"
+    "    method TEXT NOT NULL CHECK(method IN ('llm','embedding','user','inherited')) DEFAULT 'llm',\n"
+    "    review_status TEXT NOT NULL CHECK(review_status IN ('auto','confirmed','rejected')) DEFAULT 'auto',\n"
+    "    UNIQUE(material_id, topic_id, taxonomy_version)\n"
+    ");\n"
+    "INSERT INTO material_topics_new (\n"
+    "    id, material_id, topic_id, taxonomy_version, confidence, rationale, method, review_status\n"
+    ")\n"
+    "SELECT id, material_id, topic_id, taxonomy_version, confidence, rationale, method, review_status\n"
+    "FROM material_topics;\n"
+    "DROP TABLE material_topics;\n"
+    "ALTER TABLE material_topics_new RENAME TO material_topics;"
+)
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _SCHEMA_SQL),
     (2, _ENRICHMENT_UNIQUE_INDEX),
     (3, _MEDIA_SOURCES_TABLE),
     (4, _MEDIA_SOURCES_MATERIAL_ID_NULLABLE),
     (5, _MATERIALS_IS_ADMINISTRATIVE_COLUMN),
+    (6, _MATERIAL_TOPICS_METHOD_INHERITED),
 ]
 
 

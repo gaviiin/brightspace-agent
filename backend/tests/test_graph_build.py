@@ -321,6 +321,47 @@ def test_no_admin_bucket_when_no_material_is_administrative(session_factory, cou
 
 
 # --------------------------------------------------------------------------
+# (3c) M3.5b: recording topic inheritance -- a source material's inherited
+# rows (classify.py's `_inherit_recording_topics`, method='inherited') must
+# be attached exactly like any other assignment.
+# --------------------------------------------------------------------------
+
+
+def test_inherited_topic_assignment_places_the_recording_under_its_transcripts_topic(
+    session_factory, course_id, seeded
+):
+    with session_factory() as session:
+        recording_id = _add_material(session, course_id, title="Lecture 5 Recording", kind="link")
+        session.add(
+            MaterialTopic(
+                material_id=recording_id, topic_id=seeded["topic_ids"]["arrays-and-lists"], taxonomy_version=1,
+                confidence=0.9, rationale="inherited from the lecture transcript", method="inherited",
+                review_status="auto",
+            )
+        )
+        session.commit()
+
+    graph = _build(session_factory, course_id)
+
+    material_ids = {material["id"] for material in graph["materials"]}
+    assert recording_id in material_ids
+
+    by_slug = {topic["slug"]: topic for topic in graph["topics"]}
+    # lecture_id (seeded, direct) + recording_id (inherited) both land here.
+    assert by_slug["arrays-and-lists"]["materialCount"] == 2
+
+    attachment = next(
+        a for a in graph["attachments"]
+        if a["topicId"] == seeded["topic_ids"]["arrays-and-lists"] and a["materialId"] == recording_id
+    )
+    assert attachment["confidence"] == pytest.approx(0.9)
+    assert recording_id not in {a["materialId"] for a in graph["attachments"] if a["topicId"] == UNSORTED_TOPIC_ID}
+
+    by_id = {material["id"]: material for material in graph["materials"]}
+    assert by_id[recording_id]["maxConfidence"] == pytest.approx(0.9)
+
+
+# --------------------------------------------------------------------------
 # (4) Edges reference DB ids
 # --------------------------------------------------------------------------
 

@@ -14,7 +14,7 @@ from sqlalchemy import delete, select
 
 from brightspace_agent.agents.llm import LLMCallError, MockBackend
 from brightspace_agent.agents.schemas import ClassificationOut, TopicAssignment
-from brightspace_agent.db.models import Course, LlmCache, Material, MaterialTopic, Topic
+from brightspace_agent.db.models import Course, LlmCache, Material, MaterialTopic, MediaSource, Topic
 from brightspace_agent.db.session import init_db
 from brightspace_agent.pipeline.stages.classify import PROMPT_VERSION, run_classify_stage
 
@@ -120,7 +120,7 @@ def _write_taxonomy(session_factory, course_id, version, topics) -> dict[str, in
 
 def _add_material(
     session_factory, course_id, *, title, kind="document", sha256=None, status="summarized", summary=None,
-    key_terms=("alpha", "beta"),
+    key_terms=("alpha", "beta"), is_administrative=0,
 ) -> int:
     with session_factory() as session:
         material = Material(
@@ -141,10 +141,31 @@ def _add_material(
                 }
             ),
             status=status,
+            is_administrative=is_administrative,
         )
         session.add(material)
         session.commit()
         return material.id
+
+
+def _add_media_source(
+    session_factory, course_id, *, material_id, transcript_material_id, url,
+    platform="zoom", status="done",
+) -> int:
+    with session_factory() as session:
+        source = MediaSource(
+            course_id=course_id,
+            material_id=material_id,
+            transcript_material_id=transcript_material_id,
+            platform=platform,
+            url=url,
+            status=status,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        session.add(source)
+        session.commit()
+        return source.id
 
 
 def _run(session_factory, backend, course_id, **kwargs):
@@ -769,3 +790,159 @@ def test_cost_cap_never_blocks_a_cache_hit(session_factory, backend, course_id):
 
     assert stats.aborted is False
     assert len(_rows(session_factory, material_id=mirror_id)) == 2
+
+
+# --------------------------------------------------------------------------
+# M3.5b: recording topic inheritance
+# --------------------------------------------------------------------------
+
+
+def test_recording_source_inherits_transcript_topics_and_clears_admin_flag(session_factory, backend, course_id):
+    """A recording's own material (the link/page the sync found, pointed at
+    by media_sources.material_id) rarely has classifiable content of its
+    own; a stale S3 run may even have flagged it administrative from a thin
+    pseudo-doc. This material is left at status='fetched' (never reaches
+    this run's classify worklist) so the post-pass is the ONLY thing that
+    can give it real topics."""
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    source_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording", kind="link", status="fetched",
+        is_administrative=1,
+    )
+    transcript_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording (transcript)", kind="transcript",
+    )
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=transcript_id,
+        url="https://zoom.us/rec/share/lecture5",
+    )
+
+    _run(session_factory, backend, course_id)
+
+    transcript_rows = _rows(session_factory, material_id=transcript_id)
+    assert len(transcript_rows) == 2  # MockBackend's usual two assignments
+    assert all(row.method == "llm" for row in transcript_rows)
+
+    source_rows = _rows(session_factory, material_id=source_id)
+    assert len(source_rows) == 2
+    assert all(row.method == "inherited" for row in source_rows)
+    assert all(row.rationale == "inherited from the lecture transcript" for row in source_rows)
+    assert {row.topic_id for row in source_rows} == {row.topic_id for row in transcript_rows}
+    by_topic = {row.topic_id: row.confidence for row in source_rows}
+    for row in transcript_rows:
+        assert by_topic[row.topic_id] == pytest.approx(row.confidence)
+
+    with session_factory() as session:
+        assert session.get(Material, source_id).is_administrative == 0  # cleared
+
+
+def test_inheritance_adds_only_missing_topics_and_preserves_direct_assignments(
+    session_factory, backend, course_id
+):
+    """A source material that already carries its own direct assignment at
+    this version (e.g. a weak title-only classification) keeps it
+    untouched; inheritance only fills in the topics the source itself
+    lacks."""
+    topic_ids = _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    source_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording", kind="link", status="summarized",
+    )
+    transcript_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording (transcript)", kind="transcript",
+    )
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=transcript_id,
+        url="https://zoom.us/rec/share/lecture5",
+    )
+    with session_factory() as session:
+        # A pre-existing direct assignment on the source, at the SAME topic
+        # MockBackend will also give the transcript -- this is the row that
+        # must survive unmodified.
+        session.add(
+            MaterialTopic(
+                material_id=source_id, topic_id=topic_ids["arrays-and-lists"], taxonomy_version=1,
+                confidence=0.3, rationale="weak title match", method="llm", review_status="auto",
+            )
+        )
+        session.commit()
+
+    _run(session_factory, backend, course_id)
+
+    # The transcript, having its own real content, gets classified normally.
+    transcript_rows = _rows(session_factory, material_id=transcript_id)
+    assert {row.topic_id for row in transcript_rows} == {
+        topic_ids["arrays-and-lists"], topic_ids["sorting-algorithms"],
+    }
+
+    source_rows = _rows(session_factory, material_id=source_id)
+    by_topic = {row.topic_id: row for row in source_rows}
+    assert set(by_topic) == {topic_ids["arrays-and-lists"], topic_ids["sorting-algorithms"]}
+
+    # The pre-existing direct row: untouched, not overwritten by the
+    # transcript's own (higher) confidence for the same topic.
+    direct = by_topic[topic_ids["arrays-and-lists"]]
+    assert direct.method == "llm"
+    assert direct.confidence == pytest.approx(0.3)
+    assert direct.rationale == "weak title match"
+
+    # The gap: filled in by inheritance.
+    inherited = by_topic[topic_ids["sorting-algorithms"]]
+    assert inherited.method == "inherited"
+    assert inherited.rationale == "inherited from the lecture transcript"
+    assert inherited.confidence == pytest.approx(0.4)
+
+
+def test_inheritance_rerun_is_idempotent_no_duplicate_rows(session_factory, backend, course_id):
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    source_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording", kind="link", status="fetched",
+    )
+    transcript_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording (transcript)", kind="transcript",
+    )
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=transcript_id,
+        url="https://zoom.us/rec/share/lecture5",
+    )
+
+    _run(session_factory, backend, course_id)
+    first = _rows(session_factory, material_id=source_id)
+    assert len(first) == 2
+
+    _run(session_factory, backend, course_id)  # transcript already classified: no new LLM call needed
+    second = _rows(session_factory, material_id=source_id)
+
+    assert len(second) == 2  # no duplicates
+    assert {row.topic_id for row in second} == {row.topic_id for row in first}
+    assert {row.confidence for row in second} == {row.confidence for row in first}
+
+
+def test_media_source_with_null_material_id_or_null_transcript_material_id_is_a_noop(
+    session_factory, backend, course_id
+):
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    transcript_id = _add_material(
+        session_factory, course_id, title="Some Transcript", kind="transcript",
+    )
+    source_id = _add_material(
+        session_factory, course_id, title="Some Recording", kind="link", status="fetched",
+    )
+
+    # A manually-added media source (M2.6a): no backing materials row yet.
+    _add_media_source(
+        session_factory, course_id, material_id=None, transcript_material_id=transcript_id,
+        url="https://zoom.us/rec/share/no-material-yet",
+    )
+    # A media source whose recording hasn't been transcribed yet.
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=None,
+        url="https://zoom.us/rec/share/not-transcribed-yet",
+    )
+
+    stats = _run(session_factory, backend, course_id)  # must not raise
+
+    assert stats.failed == 0
+    assert _rows(session_factory, material_id=source_id) == []
+    # The transcript material itself still gets classified normally --
+    # inheritance just has nothing to attach it to.
+    assert len(_rows(session_factory, material_id=transcript_id)) == 2

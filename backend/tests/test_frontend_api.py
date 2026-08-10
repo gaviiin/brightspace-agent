@@ -15,7 +15,7 @@ import uvicorn
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from brightspace_agent.db.models import Course, Material, MaterialTopic, Topic
+from brightspace_agent.db.models import Course, Material, MaterialTopic, MediaSource, Topic
 
 CSRF_HEADERS = {"X-BSA-Request": "1"}
 
@@ -263,6 +263,7 @@ def test_material_get_shape(client, db_session_factory):
     assert body["summary"] == "A short summary."
     assert body["keyTerms"] == ["alpha", "beta"]
     assert body["topicIds"] == []
+    assert body["recording"] is None  # not linked from any media_sources row
 
 
 def test_material_and_file_and_text_404s(client, db_session_factory):
@@ -276,6 +277,100 @@ def test_material_and_file_and_text_404s(client, db_session_factory):
     material_id = _add_material(db_session_factory, course_id, kind="link", title="Course site", status="fetched")
     assert client.get(f"/api/materials/{material_id}/file").status_code == 404
     assert client.get(f"/api/materials/{material_id}/text").status_code == 404
+
+
+# --------------------------------------------------------------------------
+# (3b) M3.5b: recording linkage on material detail
+# --------------------------------------------------------------------------
+
+
+def _add_media_source(db_session_factory, course_id, **kwargs) -> int:
+    defaults = dict(
+        platform="zoom", url="https://zoom.us/rec/share/abc", status="done",
+        created_at="2026-01-01T00:00:00+00:00", updated_at="2026-01-01T00:00:00+00:00",
+    )
+    defaults.update(kwargs)
+    with db_session_factory() as session:
+        source = MediaSource(course_id=course_id, **defaults)
+        session.add(source)
+        session.commit()
+        return source.id
+
+
+def test_material_detail_recording_field_for_the_source_material(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    source_id = _add_material(
+        db_session_factory, course_id, kind="link", title="Lecture 5 Recording", status="summarized",
+    )
+    transcript_id = _add_material(
+        db_session_factory, course_id, kind="transcript", title="Lecture 5 Recording (transcript)",
+        status="summarized",
+    )
+    _add_media_source(
+        db_session_factory, course_id, material_id=source_id, transcript_material_id=transcript_id,
+        url="https://zoom.us/rec/share/lecture5", status="done",
+    )
+
+    resp = client.get(f"/api/materials/{source_id}")
+    assert resp.status_code == 200
+    assert resp.json()["recording"] == {
+        "url": "https://zoom.us/rec/share/lecture5",
+        "status": "done",
+        "transcriptMaterialId": transcript_id,
+    }
+
+
+def test_material_detail_recording_field_for_the_transcript_material(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    source_id = _add_material(
+        db_session_factory, course_id, kind="link", title="Lecture 5 Recording", status="summarized",
+    )
+    transcript_id = _add_material(
+        db_session_factory, course_id, kind="transcript", title="Lecture 5 Recording (transcript)",
+        status="summarized",
+    )
+    _add_media_source(
+        db_session_factory, course_id, material_id=source_id, transcript_material_id=transcript_id,
+        url="https://zoom.us/rec/share/lecture5", status="done",
+    )
+
+    resp = client.get(f"/api/materials/{transcript_id}")
+    assert resp.status_code == 200
+    assert resp.json()["recording"] == {
+        "url": "https://zoom.us/rec/share/lecture5",
+        "status": "done",
+        "sourceMaterialId": source_id,
+    }
+
+
+def test_material_detail_recording_field_null_for_a_plain_material(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    material_id = _add_material(db_session_factory, course_id, kind="document", title="Syllabus", status="summarized")
+
+    resp = client.get(f"/api/materials/{material_id}")
+    assert resp.json()["recording"] is None
+
+
+def test_material_detail_recording_picks_the_most_recently_updated_media_source(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    source_id = _add_material(
+        db_session_factory, course_id, kind="link", title="Lecture 5 Recording", status="summarized",
+    )
+    _add_media_source(
+        db_session_factory, course_id, material_id=source_id, transcript_material_id=None,
+        url="https://zoom.us/rec/share/old", status="failed",
+        created_at="2026-01-01T00:00:00+00:00", updated_at="2026-01-01T00:00:00+00:00",
+    )
+    _add_media_source(
+        db_session_factory, course_id, material_id=source_id, transcript_material_id=None,
+        url="https://zoom.us/rec/share/new", status="done",
+        created_at="2026-01-02T00:00:00+00:00", updated_at="2026-01-02T00:00:00+00:00",
+    )
+
+    resp = client.get(f"/api/materials/{source_id}")
+    body = resp.json()
+    assert body["recording"]["url"] == "https://zoom.us/rec/share/new"
+    assert body["recording"]["status"] == "done"
 
 
 # --------------------------------------------------------------------------
