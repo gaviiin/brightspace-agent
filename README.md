@@ -77,6 +77,40 @@ hot reload (Vite on :5173 proxies to the backend).
 Costs are estimated before every paid action, counted per run (including
 web-search fees), and hard-capped (`BSA_MAX_COST_USD_PER_RUN`, default $5).
 
+### Lecture recordings
+
+Optional, and off the default install path — the download/transcription
+dependencies are heavy, so they live in their own group:
+
+```sh
+make install-media        # cd backend && uv sync --group media
+```
+
+Then open a course, **Recordings** → **Detect** (scans synced pages and
+links for Mediasite / Zoom / Google Drive recordings) → **Process**. A
+platform caption track is used when there is one; otherwise the audio is
+downloaded and transcribed locally with `parakeet-mlx` (Apple Silicon). The
+transcript becomes an ordinary material, so re-running the pipeline files it
+under topics like anything else.
+
+Notes:
+
+- **Auth:** yt-dlp reads your live Chrome cookies, so macOS shows a Keychain
+  prompt the first time — choose **Always Allow** or it will ask on every
+  fetch. If reading the browser profile doesn't work (Chrome running, a
+  locked profile, a different browser), export a Netscape `cookies.txt` and
+  point `BSA_COOKIES_FILE=/path/to/cookies.txt` at it instead.
+- **Zoom passcodes:** detection picks one out of the page text when it's
+  written next to the link; otherwise type it into the row and Save.
+- **Extractor breakage:** platforms change their players, and a fetch that
+  used to work starts failing. That's a yt-dlp version problem, not a
+  passcode one: `cd backend && uv lock --upgrade-package yt-dlp && uv sync
+  --group media`.
+- **The group is easy to lose:** any plain `uv sync` — including the one a
+  bare `uv run ...` (so `make test`) performs — re-syncs the environment to
+  the default groups and uninstalls these. Rerun `make install-media`
+  afterwards.
+
 ## Tests
 
 ```sh
@@ -85,9 +119,10 @@ make test    # backend (pytest) + extension + frontend (vitest), all offline
 
 No API key or real tenant needed: LLM stages run against a deterministic
 mock (`BSA_MOCK_LLM=1`), and `make e2e` drives a fake D2L tenant through
-sync → pipeline → graph end to end. See `docs/OVERVIEW.md` for architecture
-detail and `docs/plan.md` for the roadmap (lecture-recording transcripts and
-an MCP server are next).
+sync → recordings → pipeline → graph end to end (the media stage runs
+against mock fetch/transcribe backends, so no yt-dlp or ASR is needed to run
+the suite). See `docs/OVERVIEW.md` for architecture detail and
+`docs/plan.md` for the roadmap (an MCP server is next).
 
 ## Caveats
 

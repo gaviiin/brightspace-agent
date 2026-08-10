@@ -130,7 +130,7 @@ Routes: `/` (courses + sync status + pairing), `/courses/:id` (workspace), `/set
 12. TaxonomyEditor + re-classify loop (M)
 13. E2E hardening on a bigger course (M); tag v0.1
 
-**M2 — media + transcripts**: extension capture.ts grabs LTI launch URLs + player network requests (VTT/manifest) during sync; media/ytdlp.py (browser cookies, Panopto/Kaltura); media/whisper.py (mlx-whisper large-v3-turbo fallback); transcripts become kind=transcript materials flowing through S1–S4 unchanged.
+**M2 — media + transcripts**: superseded by `docs/plan-m2.md` (the platforms turned out to be Mediasite/Zoom/Google Drive, not Panopto/Kaltura, and the local ASR pick is parakeet-mlx, not Whisper). As built: URL detection over synced content, yt-dlp captions-first/audio-fallback fetching, local transcription, transcripts as kind=transcript materials flowing through S1–S4 unchanged.
 
 **M4 / backlog — MCP server**: expose the organized course graph as an MCP server (`backend/src/brightspace_agent/mcp_server.py`, stdio transport) so Claude Desktop/Code and other MCP clients can query topics/materials — makes the app a first-class agent-ecosystem citizen.
 

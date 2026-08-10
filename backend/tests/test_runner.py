@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 
 import fitz  # PyMuPDF
 import pytest
@@ -15,7 +17,7 @@ from sqlalchemy import select
 
 from brightspace_agent.agents.llm import MockBackend
 from brightspace_agent.config import Settings
-from brightspace_agent.db.models import Course, Material, MaterialTopic, PipelineRun, Topic
+from brightspace_agent.db.models import Course, Material, MaterialTopic, MediaSource, PipelineRun, Topic
 from brightspace_agent.db.session import init_db
 from brightspace_agent.ingest.store import BlobStore
 from brightspace_agent.pipeline import runner as runner_module
@@ -461,3 +463,134 @@ def test_startup_sweep_db_failure_degrades_instead_of_crashing_construction(blob
     runner = PipelineRunner(broken_session_factory, blob_store, MockBackend(), settings)
 
     assert runner.is_active(1) is False
+
+
+def _add_course(session_factory, *, org_unit_id, name) -> int:
+    with session_factory() as session:
+        course = Course(d2l_org_unit_id=org_unit_id, tenant_origin="school.d2l.com", name=name)
+        session.add(course)
+        session.commit()
+        return course.id
+
+
+def _add_media_source(session_factory, course_id, material_id, *, url, status):
+    with session_factory() as session:
+        row = MediaSource(
+            course_id=course_id, material_id=material_id, platform="zoom", url=url, status=status,
+            created_at="2020-01-01T00:00:00+00:00", updated_at="2020-01-01T00:00:00+00:00",
+        )
+        session.add(row)
+        session.commit()
+        return row.id
+
+
+def test_startup_sweep_marks_stuck_media_sources_as_failed(session_factory, blob_store, course_id):
+    """`media_sources` rows stuck mid-job ('fetching'/'transcribing') have
+    exactly the same "only a live task can legitimately own this" property
+    the pipeline_runs sweep relies on: with no task left behind them they
+    would sit 'fetching' forever, and the drawer offers no action on a row
+    in that state. The startup sweep must fail them with a retry hint.
+    Untouched: every other status."""
+    material_id = _add_fetched_pdf(
+        session_factory, blob_store, course_id, title="Lecture 1", text="body"
+    )
+    fetching = _add_media_source(
+        session_factory, course_id, material_id, url="https://zoom.us/rec/share/a", status="fetching"
+    )
+    transcribing = _add_media_source(
+        session_factory, course_id, material_id, url="https://zoom.us/rec/share/b", status="transcribing"
+    )
+    detected = _add_media_source(
+        session_factory, course_id, material_id, url="https://zoom.us/rec/share/c", status="detected"
+    )
+    done = _add_media_source(
+        session_factory, course_id, material_id, url="https://zoom.us/rec/share/d", status="done"
+    )
+
+    _make_runner(session_factory, blob_store, MockBackend())
+
+    with session_factory() as session:
+        for source_id in (fetching, transcribing):
+            row = session.get(MediaSource, source_id)
+            assert row.status == "failed"
+            assert row.error == "interrupted by a server restart; press Process to retry"
+            assert row.updated_at != "2020-01-01T00:00:00+00:00"
+
+        untouched = session.get(MediaSource, detected)
+        assert untouched.status == "detected"
+        assert untouched.error is None
+        assert untouched.updated_at == "2020-01-01T00:00:00+00:00"
+
+        still_done = session.get(MediaSource, done)
+        assert still_done.status == "done"
+
+
+class _SlowRecordingTranscriber:
+    """Records the wall-clock interval of every `transcribe` call so a test
+    can assert two of them never overlapped."""
+
+    def __init__(self, duration_s: float = 0.05) -> None:
+        self.duration_s = duration_s
+        self.intervals: list[tuple[float, float]] = []
+        self._lock = threading.Lock()
+
+    def transcribe(self, audio_path, dest_dir):
+        started = time.monotonic()
+        time.sleep(self.duration_s)
+        finished = time.monotonic()
+        with self._lock:
+            self.intervals.append((started, finished))
+        path = dest_dir / f"{audio_path.stem}.vtt"
+        path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n", encoding="utf-8")
+        return path
+
+
+def test_asr_is_serialized_across_concurrent_course_media_jobs(
+    session_factory, blob_store, tmp_path, monkeypatch
+):
+    """Local ASR runs on a single GPU. Two courses' media jobs are separate
+    asyncio tasks with separate `_active` entries, so nothing but the
+    module-level semaphore stops their transcriptions from overlapping."""
+    monkeypatch.setenv("BSA_DATA_DIR", str(tmp_path / "data"))
+
+    course_a = _add_course(session_factory, org_unit_id=101, name="Course A")
+    course_b = _add_course(session_factory, org_unit_id=102, name="Course B")
+    for course, url in ((course_a, "https://zoom.us/rec/share/a"), (course_b, "https://zoom.us/rec/share/b")):
+        material_id = _add_fetched_pdf(session_factory, blob_store, course, title="Lecture", text="body")
+        _add_media_source(session_factory, course, material_id, url=url, status="detected")
+
+    transcriber = _SlowRecordingTranscriber()
+
+    async def scenario():
+        runner = PipelineRunner(
+            session_factory, blob_store, MockBackend(), Settings(), transcriber=transcriber
+        )
+        runner.start_media(course_a)
+        runner.start_media(course_b)
+        await asyncio.gather(runner.wait_media_idle(course_a), runner.wait_media_idle(course_b))
+
+    asyncio.run(scenario())
+
+    assert len(transcriber.intervals) == 2  # both sources really reached ASR
+    first, second = sorted(transcriber.intervals)
+    assert second[0] >= first[1], f"ASR calls overlapped: {transcriber.intervals}"
+
+
+def test_startup_sweep_handles_stuck_media_rows_with_no_stale_pipeline_runs(
+    session_factory, blob_store, course_id
+):
+    """The media sweep must not be short-circuited by the pipeline_runs half
+    finding nothing to do -- a crash during a media job leaves a stuck
+    media_sources row and (once the run row itself was reconciled) possibly
+    no 'running' pipeline_runs row at all."""
+    material_id = _add_fetched_pdf(
+        session_factory, blob_store, course_id, title="Lecture 1", text="body"
+    )
+    stuck = _add_media_source(
+        session_factory, course_id, material_id, url="https://zoom.us/rec/share/z", status="fetching"
+    )
+
+    _make_runner(session_factory, blob_store, MockBackend())
+
+    with session_factory() as session:
+        assert session.get(MediaSource, stuck).status == "failed"

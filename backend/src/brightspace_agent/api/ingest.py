@@ -32,6 +32,7 @@ from brightspace_agent.db.models import SyncRun
 from brightspace_agent.ingest import repo, zip_import
 from brightspace_agent.ingest.diff import compute_needed, is_file_topic, parse_toc
 from brightspace_agent.ingest.store import BlobStore
+from brightspace_agent.media.detect import detect_media_sources
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +381,12 @@ class CompleteRequest(CamelModel):
 class CompleteResponse(CamelModel):
     status: str
     stats: dict[str, Any]
+    # M2.1: count of new media_sources rows the recording-URL detector
+    # inserted for this sync's course (0 on a clean re-sync with nothing
+    # new, or if detection itself failed -- see the fail-soft wrap below).
+    # Unknown to older extension builds, which ignore fields they don't
+    # recognize (verified against extension/src/lib/backend-client.ts).
+    media_detected: int = 0
 
 
 @router.post("/complete", response_model=CompleteResponse)
@@ -394,6 +401,21 @@ def complete_sync(
     stats = repo.finalize_sync_run(session, sync_run, errors)
     session.commit()
 
+    # M2.1: detect lecture-recording URLs (Mediasite/Zoom/Drive) in whatever
+    # this sync just landed. Fail-soft, matching pipeline/runner.py's own
+    # "a hiccup here must degrade, not crash" shape -- a detector bug or a
+    # transient DB error must never fail the sync the extension is waiting
+    # on; it's just logged, and the next /complete call tries again.
+    media_detected = 0
+    try:
+        detect_stats = detect_media_sources(request.app.state.session_factory, sync_run.course_id)
+    except Exception:  # noqa: BLE001 -- fail-soft by design, see comment above
+        logger.exception(
+            "media detection failed for course %s (sync run %s)", sync_run.course_id, sync_run.id
+        )
+    else:
+        media_detected = detect_stats.added
+
     # Task 9 hook: the frontend's SSE feed learns about sync completion the
     # same way it learns about pipeline progress -- one shared bus.
     request.app.state.event_bus.publish(
@@ -405,7 +427,7 @@ def complete_sync(
         }
     )
 
-    return CompleteResponse(status=sync_run.status, stats=stats)
+    return CompleteResponse(status=sync_run.status, stats=stats, media_detected=media_detected)
 
 
 # --------------------------------------------------------------------------

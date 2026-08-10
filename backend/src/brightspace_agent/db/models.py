@@ -64,6 +64,25 @@ class Material(Base):
     error: Mapped[str | None]
 
 
+class MediaSource(Base):
+    __tablename__ = "media_sources"
+    __table_args__ = (UniqueConstraint("course_id", "url"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    course_id: Mapped[int] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"))
+    # Nullable as of M2.6a: a manually-added URL/channel row (api/media.py's
+    # POST .../media/add) has no backing `materials` row.
+    material_id: Mapped[int | None] = mapped_column(ForeignKey("materials.id", ondelete="CASCADE"))
+    platform: Mapped[str]
+    url: Mapped[str]
+    passcode: Mapped[str | None]
+    status: Mapped[str] = mapped_column(server_default=text("'detected'"))
+    error: Mapped[str | None]
+    transcript_material_id: Mapped[int | None] = mapped_column(ForeignKey("materials.id", ondelete="SET NULL"))
+    created_at: Mapped[str]
+    updated_at: Mapped[str]
+
+
 class Topic(Base):
     __tablename__ = "topics"
     __table_args__ = (UniqueConstraint("course_id", "taxonomy_version", "slug"),)

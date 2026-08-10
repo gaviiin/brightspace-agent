@@ -239,7 +239,19 @@ export interface EnrichmentBsaEvent {
   stats?: Record<string, unknown>;
 }
 
-export type BsaEvent = PipelineBsaEvent | SyncBsaEvent | EnrichmentBsaEvent;
+/** `sourceId` is present for a per-source status change (fetching/
+ * transcribing/done/failed -- the `media_sources.status` values), absent
+ * for a run-level event (`status` then one of run-started/complete/failed
+ * -- see runner.py's `_MediaRunHooks`). */
+export interface MediaBsaEvent {
+  type: "media";
+  courseId: number;
+  runToken: number;
+  sourceId?: number;
+  status: string;
+}
+
+export type BsaEvent = PipelineBsaEvent | SyncBsaEvent | EnrichmentBsaEvent | MediaBsaEvent;
 
 // ---------------------------------------------------------------------------
 // Enrichment (api/enrichment.py) -- M3.3
@@ -295,6 +307,82 @@ export interface EnrichDryRunResponse {
    * `estCostPerTopicUsd` -- so the confirm dialog shows it rather than
    * leaving the number unexplained. */
   webSearchesPerTopic: number;
+}
+
+// ---------------------------------------------------------------------------
+// Media (api/media.py) -- M2.5
+// ---------------------------------------------------------------------------
+
+export type MediaPlatform = "mediasite" | "zoom" | "gdrive";
+
+export type MediaSourceStatus = "detected" | "fetching" | "transcribing" | "done" | "failed" | "skipped";
+
+export interface MediaSourceSummary {
+  id: number;
+  /** Both null for a manually-added row (POST .../media/add -- M2.6a): it
+   * has no backing `materials` row at all (see api/media.py's
+   * `MediaSourceOut`). */
+  materialId: number | null;
+  materialTitle: string | null;
+  platform: MediaPlatform;
+  url: string;
+  /** Local single-user app, no masking (see api/media.py's `MediaSourceOut`). */
+  passcode: string | null;
+  status: MediaSourceStatus;
+  error: string | null;
+  transcriptMaterialId: number | null;
+  updatedAt: string;
+}
+
+/** A link material that looks like an LTI-embedded recording channel the
+ * sync structurally can't read into (api/media.py's `_compute_lti_hints`) --
+ * points the user at the manual-add workaround instead. */
+export interface MediaHint {
+  materialId: number;
+  title: string;
+}
+
+export interface MediaListResponse {
+  sources: MediaSourceSummary[];
+  /** Any run (pipeline/enrichment/media) active for the course -- runner.py
+   * shares one `_active` guard across all three, same meaning as
+   * `PipelineStatusResponse.active`. */
+  active: boolean;
+  hints: MediaHint[];
+}
+
+export interface MediaDetectResponse {
+  scannedMaterials: number;
+  found: number;
+  added: number;
+}
+
+export interface MediaRunResponse {
+  runToken: number;
+}
+
+/** `POST /api/courses/{id}/media/add` body (M2.6a) -- a pasted recording or
+ * channel/catalog URL, with an optional passcode applied to any
+ * zoom-classified row(s) it expands into. */
+export interface MediaAddRequest {
+  url: string;
+  passcode?: string | null;
+}
+
+export interface MediaAddResponse {
+  added: number;
+  skipped: number;
+  total: number;
+  sources: MediaSourceSummary[];
+}
+
+/** `PUT /api/media/{id}` body. Both fields are optional-and-distinct-from-
+ * `null` on the wire (an absent field means "leave alone"; the backend's
+ * `MediaSourceUpdate` rejects an explicit `status: null`) -- `passcode:
+ * null` is the one meaningful null, clearing a stored passcode. */
+export interface MediaSourceUpdateRequest {
+  passcode?: string | null;
+  status?: "skipped" | "detected";
 }
 
 // ---------------------------------------------------------------------------

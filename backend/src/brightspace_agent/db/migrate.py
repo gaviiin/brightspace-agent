@@ -39,9 +39,70 @@ _ENRICHMENT_UNIQUE_INDEX = (
     "ON enrichment_resources(topic_id, url);"
 )
 
+# Migration 3 adds the media_sources table (M2.1's recording-URL detector).
+# Same "also in schema.sql via IF NOT EXISTS" shape as migration 2 above: a
+# fresh database gets the table from schema.sql at migration 1, so this
+# statement is a no-op there; it only does real work bringing a database
+# already at version 1 or 2 up to date.
+_MEDIA_SOURCES_TABLE = (
+    "CREATE TABLE IF NOT EXISTS media_sources (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,\n"
+    "    material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,\n"
+    "    platform TEXT NOT NULL CHECK(platform IN ('mediasite','zoom','gdrive')),\n"
+    "    url TEXT NOT NULL,\n"
+    "    passcode TEXT,\n"
+    "    status TEXT NOT NULL CHECK(status IN ('detected','fetching','transcribing','done','failed','skipped')) DEFAULT 'detected',\n"
+    "    error TEXT,\n"
+    "    transcript_material_id INTEGER REFERENCES materials(id) ON DELETE SET NULL,\n"
+    "    created_at TEXT NOT NULL,\n"
+    "    updated_at TEXT NOT NULL,\n"
+    "    UNIQUE(course_id, url)\n"
+    ");"
+)
+
+# Migration 4 (M2.6a) makes media_sources.material_id nullable, so a
+# manually-added recording URL/channel row (api/media.py's POST
+# .../media/add) can exist with no backing `materials` row. SQLite can't
+# drop a NOT NULL constraint with ALTER TABLE, so this is the standard
+# SQLite table-rebuild dance: create the new shape under a temp name, copy
+# every row across unchanged, drop the old table, rename the new one into
+# place. `UNIQUE(course_id, url)` and both FKs are carried over verbatim --
+# only the `NOT NULL` on `material_id` is dropped. Also in schema.sql
+# (already nullable there as of this task) for the same "fresh database
+# reasoning" as migrations 2/3: this statement only does real work bringing
+# an already-migrated (v1-v3) database up to date.
+_MEDIA_SOURCES_MATERIAL_ID_NULLABLE = (
+    "CREATE TABLE media_sources_new (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,\n"
+    "    material_id INTEGER REFERENCES materials(id) ON DELETE CASCADE,\n"
+    "    platform TEXT NOT NULL CHECK(platform IN ('mediasite','zoom','gdrive')),\n"
+    "    url TEXT NOT NULL,\n"
+    "    passcode TEXT,\n"
+    "    status TEXT NOT NULL CHECK(status IN ('detected','fetching','transcribing','done','failed','skipped')) DEFAULT 'detected',\n"
+    "    error TEXT,\n"
+    "    transcript_material_id INTEGER REFERENCES materials(id) ON DELETE SET NULL,\n"
+    "    created_at TEXT NOT NULL,\n"
+    "    updated_at TEXT NOT NULL,\n"
+    "    UNIQUE(course_id, url)\n"
+    ");\n"
+    "INSERT INTO media_sources_new (\n"
+    "    id, course_id, material_id, platform, url, passcode, status, error,\n"
+    "    transcript_material_id, created_at, updated_at\n"
+    ")\n"
+    "SELECT id, course_id, material_id, platform, url, passcode, status, error,\n"
+    "       transcript_material_id, created_at, updated_at\n"
+    "FROM media_sources;\n"
+    "DROP TABLE media_sources;\n"
+    "ALTER TABLE media_sources_new RENAME TO media_sources;"
+)
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _SCHEMA_SQL),
     (2, _ENRICHMENT_UNIQUE_INDEX),
+    (3, _MEDIA_SOURCES_TABLE),
+    (4, _MEDIA_SOURCES_MATERIAL_ID_NULLABLE),
 ]
 
 

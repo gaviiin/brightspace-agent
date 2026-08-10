@@ -400,6 +400,49 @@ async def _run_pipeline_to_completion(backend: httpx.AsyncClient, course_id: int
     return status
 
 
+async def _run_media_to_completion(backend: httpx.AsyncClient, course_id: int, *, timeout: float = 60.0) -> dict:
+    """Detect + process this course's recordings, offline. `BSA_MOCK_LLM=1`
+    forces MockMediaFetcher/MockTranscriber (see make_media_fetcher), so no
+    yt-dlp subprocess and no ASR engine are involved -- the fake tenant's
+    third announcement carries a `mock-captions` Zoom link, which that mock
+    answers with a caption track. Runs BEFORE the pipeline so the transcript
+    material it produces is summarized/classified by the ordinary run,
+    which is the whole point of ingesting a transcript as just a material.
+    """
+    detect_resp = await backend.post(
+        f"/api/courses/{course_id}/media/detect", headers={"X-BSA-Request": "1"}
+    )
+    detect_resp.raise_for_status()
+    detected = detect_resp.json()
+    _assert(detected["found"] >= 1, "media detect found no recording links in the synced course", detected)
+
+    process_resp = await backend.post(
+        f"/api/courses/{course_id}/media/process", headers={"X-BSA-Request": "1"}
+    )
+    process_resp.raise_for_status()
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        resp = await backend.get(f"/api/courses/{course_id}/media")
+        resp.raise_for_status()
+        body = resp.json()
+        if not body["active"]:
+            break
+        if loop.time() > deadline:
+            raise E2EAssertionError(f"media job did not finish within {timeout}s", body)
+        await asyncio.sleep(0.05)
+
+    unfinished = [s for s in body["sources"] if s["status"] != "done"]
+    _assert(not unfinished, "a media source did not finish 'done'", unfinished)
+    _assert(
+        all(s["transcriptMaterialId"] is not None for s in body["sources"]),
+        "a done media source has no transcript material",
+        body["sources"],
+    )
+    return body
+
+
 def _count_llm_cache_rows(data_dir: Path) -> int:
     conn = sqlite3.connect(data_dir / "brightspace.db")
     try:
@@ -422,6 +465,26 @@ def _find_snake_case_keys(obj: Any, path: str = "$") -> list[str]:
         for index, item in enumerate(obj):
             found.extend(_find_snake_case_keys(item, f"{path}[{index}]"))
     return found
+
+
+def _check_transcript_reached_the_graph(graph: dict, media: dict) -> None:
+    """The media half of the graph invariants: every transcript the media
+    job produced must be a material in the graph AND attached to something.
+    `_check_graph_invariants`'s "no material has zero attachments" rule
+    would already catch the second half, but only implicitly -- this names
+    the transcript, so a regression reads as "the recording never made it"
+    rather than "some material lost its attachments"."""
+    transcript_ids = {s["transcriptMaterialId"] for s in media["sources"]}
+    material_ids = {m["id"] for m in graph["materials"]}
+    attached_ids = {a["materialId"] for a in graph["attachments"]}
+
+    _assert(transcript_ids <= material_ids, "a transcript material is missing from the graph", sorted(transcript_ids))
+    _assert(transcript_ids <= attached_ids, "a transcript material has no attachments", sorted(transcript_ids))
+
+    by_id = {m["id"]: m for m in graph["materials"]}
+    for transcript_id in transcript_ids:
+        material = by_id[transcript_id]
+        _assert(material["kind"] == "transcript", "transcript material has the wrong kind", material)
 
 
 def _check_graph_invariants(graph: dict, course: dict) -> None:
@@ -506,11 +569,14 @@ async def run_main_scenario() -> None:
 
                 course = await _discover_and_sync(driver)
                 course_id = course["courseId"]
+                media = await _run_media_to_completion(backend, course_id)
                 await _run_pipeline_to_completion(backend, course_id)
 
                 graph1 = await _get_graph(backend, course_id)
                 course_detail1 = await _get_course(backend, course_id)
                 _check_graph_invariants(graph1, course_detail1)
+                _check_transcript_reached_the_graph(graph1, media)
+                print(f"[e2e] media OK: {len(media['sources'])} recording(s) transcribed and in the graph")
                 print(
                     f"[e2e] first run OK: {len(graph1['topics'])} topics, "
                     f"{len(graph1['materials'])} materials, taxonomyVersion={graph1['meta']['taxonomyVersion']}"

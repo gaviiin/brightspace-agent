@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from brightspace_agent.config import Settings
 from brightspace_agent.ingest.store import BlobStore
+from brightspace_agent.media.fetch import MediaFetcher
 from brightspace_agent.pipeline.runner import EventBus, PipelineRunner
 
 
@@ -50,3 +51,11 @@ def get_event_bus(request: Request) -> EventBus:
 
 def get_settings(request: Request) -> Settings:
     return request.app.state.settings
+
+
+def get_media_fetcher(request: Request) -> MediaFetcher:
+    """The same `MediaFetcher` instance `PipelineRunner` fetches/transcribes
+    with (see main.py) -- api/media.py's manual-add endpoint reuses it for
+    `expand()` rather than constructing a second one, so `BSA_MOCK_MEDIA`/
+    `BSA_MOCK_LLM` govern both consistently."""
+    return request.app.state.media_fetcher
