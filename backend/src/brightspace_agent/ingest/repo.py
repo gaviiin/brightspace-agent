@@ -42,6 +42,12 @@ def reset_pipeline_progress(session: Session, course_id: int, material: Material
     from the new bytes, but never re-classified. The rows at the current
     version go with the summary.
 
+    `material.is_administrative` (M3.5a) goes with them too, same
+    lifecycle: it's derived from content just like a topic assignment is,
+    so a stale `True` from the OLD bytes must not linger in the graph's
+    "Logistics & admin" bucket while the material sits mid-repipeline
+    waiting to be re-summarized and re-classified from the NEW ones.
+
     Older versions are deliberately untouched: they are history (the
     taxonomy editor and any later remap read them), and nothing selects
     work off them.
@@ -52,6 +58,7 @@ def reset_pipeline_progress(session: Session, course_id: int, material: Material
     material.status = status
     material.summary = None
     material.error = None
+    material.is_administrative = 0
 
     if material.id is None:  # pragma: no cover -- defensive; callers flush first
         return

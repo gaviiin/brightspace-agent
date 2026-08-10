@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { GraphPayload } from "../api/types";
+import { ADMIN_TOPIC_ID } from "../api/types";
 import {
   addEdge,
   addTopic,
@@ -60,6 +61,35 @@ describe("initDraft", () => {
   it("isStructural is false immediately after init (no edits yet)", () => {
     const draft = initDraft(fixturePayload());
     expect(isStructural(draft)).toBe(false);
+  });
+
+  it("excludes the synthetic Logistics & admin topic (id -1), and any edge touching it -- CRITICAL: a course with an administrative material must still be able to save", () => {
+    const payload = fixturePayload();
+    payload.topics.push({
+      id: ADMIN_TOPIC_ID,
+      slug: "_admin",
+      name: "Logistics & admin",
+      description: "Administrative materials.",
+      orderIndex: 4,
+      materialCount: 2,
+    });
+    // Defensive: an edge touching the admin bucket should never exist in
+    // practice (graph/build.py never emits topicEdges for it), but a real
+    // GraphPayload is untrusted input here just like it is for Unsorted.
+    payload.topicEdges.push({ fromTopicId: 1, toTopicId: ADMIN_TOPIC_ID, relation: "related" });
+
+    const draft = initDraft(payload);
+
+    expect(draft.topics.every((t) => t.id !== ADMIN_TOPIC_ID)).toBe(true);
+    expect(draft.topics.map((t) => t.name)).toEqual(["Intro", "Advanced", "Extra"]);
+    expect(draft.edges).toHaveLength(1); // only the intro->advanced edge survives
+    expect(draft.base.topicIds.has(ADMIN_TOPIC_ID)).toBe(false);
+
+    // The regression this pins: toRequest()'s body must never carry id -1,
+    // or the backend's PUT .../taxonomy 422s on an unknown topic id and the
+    // editor cannot save at all for this course.
+    const request = toRequest(draft);
+    expect(request.topics.some((t) => t.id === ADMIN_TOPIC_ID)).toBe(false);
   });
 });
 

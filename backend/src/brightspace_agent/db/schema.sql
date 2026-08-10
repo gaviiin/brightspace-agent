@@ -104,7 +104,13 @@ CREATE TABLE material_topics (
     taxonomy_version INTEGER NOT NULL,
     confidence REAL,
     rationale TEXT,
-    method TEXT NOT NULL CHECK(method IN ('llm','embedding','user')) DEFAULT 'llm',
+    -- M3.5b: 'inherited' is the recording-topic-inheritance post-pass's
+    -- method (pipeline/stages/classify.py's `_inherit_recording_topics`) --
+    -- a row mirrored onto a recording's source material from its
+    -- transcript's own assignment, not the model's or a user's own
+    -- judgment. Databases that predate this are brought up to it by
+    -- migration 6 (SQLite can't ALTER a CHECK constraint in place).
+    method TEXT NOT NULL CHECK(method IN ('llm','embedding','user','inherited')) DEFAULT 'llm',
     review_status TEXT NOT NULL CHECK(review_status IN ('auto','confirmed','rejected')) DEFAULT 'auto',
     UNIQUE(material_id, topic_id, taxonomy_version)
 );

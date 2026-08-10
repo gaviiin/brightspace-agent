@@ -10,6 +10,9 @@
 /** The synthetic "everything unfiled" topic id (see graph/build.py). */
 export const UNSORTED_TOPIC_ID = 0;
 
+/** The synthetic "Logistics & admin" topic id (M3.5a; see graph/build.py). */
+export const ADMIN_TOPIC_ID = -1;
+
 export type MaterialKind =
   | "syllabus"
   | "slides"
@@ -58,12 +61,30 @@ export interface GraphPayload {
   materials: GraphMaterial[];
   topicEdges: GraphEdge[];
   attachments: GraphAttachment[];
-  meta: { taxonomyVersion: number; orphanCount: number };
+  // `adminCount` (M3.5a) is how many materials S4 filed under the synthetic
+  // "Logistics & admin" bucket (ADMIN_TOPIC_ID). Purely informational --
+  // nothing in the UI derives the bucket from it; the bucket is a topic in
+  // `topics` like any other, and its contents come from `attachments`. It's
+  // read by tests and by consumers that want the count without walking the
+  // attachment list. Optional here so fixtures that predate it keep
+  // type-checking; the backend always sends it.
+  meta: { taxonomyVersion: number; orphanCount: number; adminCount?: number };
 }
 
 // ---------------------------------------------------------------------------
 // GET /api/materials/{id}  (api/materials.py)
 // ---------------------------------------------------------------------------
+
+/** M3.5c: a material's recording linkage, when it is either end of a
+ * `media_sources` row (api/materials.py's `_recording_info`). The two
+ * shapes share `url`/`status` but never both id fields at once --
+ * `transcriptMaterialId` appears only on the recording's own source
+ * material, `sourceMaterialId` only on its transcript material. Narrow
+ * with `"sourceMaterialId" in recording` / `"transcriptMaterialId" in
+ * recording`, mirroring the backend's plain-dict shape. */
+export type MaterialRecording =
+  | { url: string; status: string; transcriptMaterialId?: number | null }
+  | { url: string; status: string; sourceMaterialId?: number | null };
 
 export interface MaterialDetail {
   id: number;
@@ -77,6 +98,8 @@ export interface MaterialDetail {
   summary: string | null;
   keyTerms: string[];
   topicIds: number[];
+  /** Null when this material isn't either end of a recording (M3.5c). */
+  recording: MaterialRecording | null;
 }
 
 // ---------------------------------------------------------------------------

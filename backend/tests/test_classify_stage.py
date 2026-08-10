@@ -14,7 +14,7 @@ from sqlalchemy import delete, select
 
 from brightspace_agent.agents.llm import LLMCallError, MockBackend
 from brightspace_agent.agents.schemas import ClassificationOut, TopicAssignment
-from brightspace_agent.db.models import Course, LlmCache, Material, MaterialTopic, Topic
+from brightspace_agent.db.models import Course, LlmCache, Material, MaterialTopic, MediaSource, Topic
 from brightspace_agent.db.session import init_db
 from brightspace_agent.pipeline.stages.classify import PROMPT_VERSION, run_classify_stage
 
@@ -120,7 +120,7 @@ def _write_taxonomy(session_factory, course_id, version, topics) -> dict[str, in
 
 def _add_material(
     session_factory, course_id, *, title, kind="document", sha256=None, status="summarized", summary=None,
-    key_terms=("alpha", "beta"),
+    key_terms=("alpha", "beta"), is_administrative=0,
 ) -> int:
     with session_factory() as session:
         material = Material(
@@ -141,10 +141,31 @@ def _add_material(
                 }
             ),
             status=status,
+            is_administrative=is_administrative,
         )
         session.add(material)
         session.commit()
         return material.id
+
+
+def _add_media_source(
+    session_factory, course_id, *, material_id, transcript_material_id, url,
+    platform="zoom", status="done",
+) -> int:
+    with session_factory() as session:
+        source = MediaSource(
+            course_id=course_id,
+            material_id=material_id,
+            transcript_material_id=transcript_material_id,
+            platform=platform,
+            url=url,
+            status=status,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        session.add(source)
+        session.commit()
+        return source.id
 
 
 def _run(session_factory, backend, course_id, **kwargs):
@@ -290,6 +311,117 @@ def test_empty_and_all_dropped_assignments_write_nothing(session_factory, course
     # The material is left alone for S4 to orphan; its status is untouched.
     with session_factory() as session:
         assert session.get(Material, empty_id).status == "summarized"
+
+
+# --------------------------------------------------------------------------
+# (2b) M3.5a: administrative materials
+# --------------------------------------------------------------------------
+
+
+def test_administrative_material_gets_flag_and_no_topic_rows(session_factory, course_id):
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    material_id = _add_material(session_factory, course_id, title="Final Grades Posted")
+    # The model may (wrongly) also return assignments alongside
+    # is_administrative=True -- classify.py must drop them regardless.
+    stub = _StubBackend(
+        ClassificationOut(
+            assignments=[TopicAssignment(topic_slug="graph-algorithms", confidence=0.9, rationale="noise")],
+            is_administrative=True,
+        )
+    )
+
+    stats = _run(session_factory, stub, course_id)
+
+    assert _rows(session_factory, material_id=material_id) == []
+    with session_factory() as session:
+        assert session.get(Material, material_id).is_administrative == 1
+    assert stats.assignments == 0
+    assert stats.classified == 0
+    assert stats.unassigned == 1
+
+
+def test_non_administrative_material_classifies_as_before(session_factory, course_id):
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    material_id = _add_material(session_factory, course_id, title="Lecture 5 Quicksort")
+    stub = _StubBackend(
+        ClassificationOut(
+            assignments=[TopicAssignment(topic_slug="sorting-algorithms", confidence=0.9, rationale="quicksort")],
+            is_administrative=False,
+        )
+    )
+
+    stats = _run(session_factory, stub, course_id)
+
+    rows = _rows(session_factory, material_id=material_id)
+    assert len(rows) == 1
+    assert stats.classified == 1
+    with session_factory() as session:
+        assert session.get(Material, material_id).is_administrative == 0
+
+
+def test_reclassify_clears_then_rederives_the_administrative_flag(session_factory, course_id):
+    """A material re-synced with changed bytes must not keep a stale
+    administrative flag from its old content: reset_pipeline_progress clears
+    it immediately (same lifecycle as material_topics rows), and the next
+    classify run re-derives it fresh from the new content."""
+    from brightspace_agent.ingest import repo
+
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    material_id = _add_material(session_factory, course_id, title="Office Hours Notice", sha256="a" * 64)
+    with session_factory() as session:
+        material = session.get(Material, material_id)
+        material.d2l_topic_id = 2001
+        session.commit()
+
+    admin_stub = _StubBackend(ClassificationOut(assignments=[], is_administrative=True))
+    _run(session_factory, admin_stub, course_id)
+
+    with session_factory() as session:
+        assert session.get(Material, material_id).is_administrative == 1
+
+    # Re-synced with genuinely different bytes -- reset_pipeline_progress
+    # runs, and must clear the stale flag right away, before any
+    # reclassification happens.
+    with session_factory() as session:
+        repo.upsert_file_material(
+            session,
+            course_id=course_id,
+            d2l_topic_id=2001,
+            sha256="b" * 64,
+            mime="text/plain",
+            size_bytes=42,
+            source_url="https://tenant.example/topics/office-hours",
+            title="Office Hours Notice",
+            d2l_updated_at="2026-03-01T00:00:00.000Z",
+        )
+        session.commit()
+
+    with session_factory() as session:
+        material = session.get(Material, material_id)
+        assert material.is_administrative == 0
+        assert material.status == "fetched"
+
+    # S1 would re-summarize the new bytes; simulate that directly so S3 gets
+    # its turn against genuinely different (non-administrative) content.
+    with session_factory() as session:
+        material = session.get(Material, material_id)
+        material.status = "summarized"
+        material.summary = "Covers dynamic array resizing and amortized cost."
+        session.commit()
+
+    content_stub = _StubBackend(
+        ClassificationOut(
+            assignments=[TopicAssignment(topic_slug="arrays-and-lists", confidence=0.8, rationale="resizing")],
+            is_administrative=False,
+        )
+    )
+    stats = _run(session_factory, content_stub, course_id)
+
+    rows = _rows(session_factory, material_id=material_id)
+    assert len(rows) == 1
+    assert stats.classified == 1
+    with session_factory() as session:
+        assert session.get(Material, material_id).is_administrative == 0
 
 
 # --------------------------------------------------------------------------
@@ -658,3 +790,286 @@ def test_cost_cap_never_blocks_a_cache_hit(session_factory, backend, course_id):
 
     assert stats.aborted is False
     assert len(_rows(session_factory, material_id=mirror_id)) == 2
+
+
+# --------------------------------------------------------------------------
+# M3.5b: recording topic inheritance
+# --------------------------------------------------------------------------
+
+
+def test_recording_source_inherits_transcript_topics_and_clears_admin_flag(session_factory, backend, course_id):
+    """A recording's own material (the link/page the sync found, pointed at
+    by media_sources.material_id) rarely has classifiable content of its
+    own; a stale S3 run may even have flagged it administrative from a thin
+    pseudo-doc. This material is left at status='fetched' (never reaches
+    this run's classify worklist) so the post-pass is the ONLY thing that
+    can give it real topics."""
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    source_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording", kind="link", status="fetched",
+        is_administrative=1,
+    )
+    transcript_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording (transcript)", kind="transcript",
+    )
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=transcript_id,
+        url="https://zoom.us/rec/share/lecture5",
+    )
+
+    _run(session_factory, backend, course_id)
+
+    transcript_rows = _rows(session_factory, material_id=transcript_id)
+    assert len(transcript_rows) == 2  # MockBackend's usual two assignments
+    assert all(row.method == "llm" for row in transcript_rows)
+
+    source_rows = _rows(session_factory, material_id=source_id)
+    assert len(source_rows) == 2
+    assert all(row.method == "inherited" for row in source_rows)
+    assert all(row.rationale == "inherited from the lecture transcript" for row in source_rows)
+    assert {row.topic_id for row in source_rows} == {row.topic_id for row in transcript_rows}
+    by_topic = {row.topic_id: row.confidence for row in source_rows}
+    for row in transcript_rows:
+        assert by_topic[row.topic_id] == pytest.approx(row.confidence)
+
+    with session_factory() as session:
+        assert session.get(Material, source_id).is_administrative == 0  # cleared
+
+
+def test_inheritance_adds_only_missing_topics_and_preserves_direct_assignments(
+    session_factory, backend, course_id
+):
+    """A source material that already carries its own direct assignment at
+    this version (e.g. a weak title-only classification) keeps it
+    untouched; inheritance only fills in the topics the source itself
+    lacks."""
+    topic_ids = _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    source_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording", kind="link", status="summarized",
+        is_administrative=1,
+    )
+    transcript_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording (transcript)", kind="transcript",
+    )
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=transcript_id,
+        url="https://zoom.us/rec/share/lecture5",
+    )
+    with session_factory() as session:
+        # A pre-existing direct assignment on the source, at the SAME topic
+        # MockBackend will also give the transcript -- this is the row that
+        # must survive unmodified.
+        session.add(
+            MaterialTopic(
+                material_id=source_id, topic_id=topic_ids["arrays-and-lists"], taxonomy_version=1,
+                confidence=0.3, rationale="weak title match", method="llm", review_status="auto",
+            )
+        )
+        session.commit()
+
+    _run(session_factory, backend, course_id)
+
+    # The transcript, having its own real content, gets classified normally.
+    transcript_rows = _rows(session_factory, material_id=transcript_id)
+    assert {row.topic_id for row in transcript_rows} == {
+        topic_ids["arrays-and-lists"], topic_ids["sorting-algorithms"],
+    }
+
+    source_rows = _rows(session_factory, material_id=source_id)
+    by_topic = {row.topic_id: row for row in source_rows}
+    assert set(by_topic) == {topic_ids["arrays-and-lists"], topic_ids["sorting-algorithms"]}
+
+    # The pre-existing direct row: untouched, not overwritten by the
+    # transcript's own (higher) confidence for the same topic.
+    direct = by_topic[topic_ids["arrays-and-lists"]]
+    assert direct.method == "llm"
+    assert direct.confidence == pytest.approx(0.3)
+    assert direct.rationale == "weak title match"
+
+    # The gap: filled in by inheritance.
+    inherited = by_topic[topic_ids["sorting-algorithms"]]
+    assert inherited.method == "inherited"
+    assert inherited.rationale == "inherited from the lecture transcript"
+    assert inherited.confidence == pytest.approx(0.4)
+
+    with session_factory() as session:
+        assert session.get(Material, source_id).is_administrative == 0  # cleared
+
+
+def test_inheritance_clears_the_admin_flag_even_when_every_topic_is_already_direct(
+    session_factory, backend, course_id
+):
+    """The admin flag has to be cleared off the back of "this source's
+    transcript IS classified", not "inheritance happened to write a row".
+
+    A source whose direct assignments already cover every topic its
+    transcript carries needs no inherited rows -- but it is demonstrably not
+    administrative, and a stale `is_administrative=1` makes S4 (graph/
+    build.py) file it in the Logistics & admin bucket and drop its
+    assignments from every real topic. The material then reads as unfiled to
+    the student even though it is perfectly well classified.
+    """
+    topic_ids = _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    source_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording", kind="link", status="fetched",
+        is_administrative=1,
+    )
+    transcript_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording (transcript)", kind="transcript",
+    )
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=transcript_id,
+        url="https://zoom.us/rec/share/lecture5",
+    )
+    with session_factory() as session:
+        # Direct rows on the source for BOTH topics MockBackend gives the
+        # transcript, so `_inherit_one` finds nothing left to write.
+        for slug in ("arrays-and-lists", "sorting-algorithms"):
+            session.add(
+                MaterialTopic(
+                    material_id=source_id, topic_id=topic_ids[slug], taxonomy_version=1,
+                    confidence=0.5, rationale="direct", method="llm", review_status="auto",
+                )
+            )
+        session.commit()
+
+    _run(session_factory, backend, course_id)
+
+    source_rows = _rows(session_factory, material_id=source_id)
+    assert len(source_rows) == 2
+    assert all(row.method == "llm" for row in source_rows)  # nothing was inherited
+
+    with session_factory() as session:
+        assert session.get(Material, source_id).is_administrative == 0
+
+
+def test_inheritance_rerun_is_idempotent_no_duplicate_rows(session_factory, backend, course_id):
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    source_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording", kind="link", status="fetched",
+    )
+    transcript_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording (transcript)", kind="transcript",
+    )
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=transcript_id,
+        url="https://zoom.us/rec/share/lecture5",
+    )
+
+    _run(session_factory, backend, course_id)
+    first = _rows(session_factory, material_id=source_id)
+    assert len(first) == 2
+
+    _run(session_factory, backend, course_id)  # transcript already classified: no new LLM call needed
+    second = _rows(session_factory, material_id=source_id)
+
+    assert len(second) == 2  # no duplicates
+    assert {row.topic_id for row in second} == {row.topic_id for row in first}
+    assert {row.confidence for row in second} == {row.confidence for row in first}
+
+
+def test_one_source_material_linked_to_two_transcripts_gets_the_union_at_highest_confidence(
+    session_factory, course_id
+):
+    """Review fix: a source material can be linked from SEVERAL
+    media_sources rows sharing the same material_id -- e.g. an HTML
+    "Recordings" page material where detect.py's page-scan created one row
+    per linked video, all pointing material_id at that one page. Each
+    linked transcript's assignments must be UNIONED onto the source in one
+    pass, not applied one transcript at a time (which would have each
+    later transcript's delete-and-rewrite wipe out the previous one's
+    inherited rows -- and with no deterministic ordering, "which transcript
+    wins" wasn't even reproducible)."""
+    topic_ids = _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    source_id = _add_material(
+        session_factory, course_id, title="Recordings Page", kind="link", status="fetched",
+    )
+    transcript_a_id = _add_material(
+        session_factory, course_id, title="Video 1 (transcript)", kind="transcript",
+    )
+    transcript_b_id = _add_material(
+        session_factory, course_id, title="Video 2 (transcript)", kind="transcript",
+    )
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=transcript_a_id,
+        url="https://zoom.us/rec/share/video1",
+    )
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=transcript_b_id,
+        url="https://zoom.us/rec/share/video2",
+    )
+
+    def _result(user):
+        # Transcript A: a topic it shares with B (at a LOWER confidence --
+        # B's must win) plus one it alone carries.
+        if "Video 1 (transcript)" in user:
+            return ClassificationOut(
+                assignments=[
+                    TopicAssignment(topic_slug="arrays-and-lists", confidence=0.6, rationale="video 1: arrays"),
+                    TopicAssignment(topic_slug="graph-algorithms", confidence=0.7, rationale="video 1: graphs"),
+                ]
+            )
+        # Transcript B: the shared topic at a HIGHER confidence, plus one
+        # it alone carries.
+        if "Video 2 (transcript)" in user:
+            return ClassificationOut(
+                assignments=[
+                    TopicAssignment(topic_slug="arrays-and-lists", confidence=0.9, rationale="video 2: arrays"),
+                    TopicAssignment(topic_slug="sorting-algorithms", confidence=0.5, rationale="video 2: sorting"),
+                ]
+            )
+        raise AssertionError(f"unexpected prompt: {user[:200]}")
+
+    stub = _StubBackend(_result)
+
+    _run(session_factory, stub, course_id)
+
+    source_rows = _rows(session_factory, material_id=source_id)
+    by_topic = {row.topic_id: row for row in source_rows}
+    assert set(by_topic) == {
+        topic_ids["arrays-and-lists"], topic_ids["graph-algorithms"], topic_ids["sorting-algorithms"],
+    }  # the union of both transcripts' topics
+    assert all(row.method == "inherited" for row in source_rows)
+    # The overlapping topic keeps the HIGHER of the two transcripts' confidences.
+    assert by_topic[topic_ids["arrays-and-lists"]].confidence == pytest.approx(0.9)
+    assert by_topic[topic_ids["graph-algorithms"]].confidence == pytest.approx(0.7)
+    assert by_topic[topic_ids["sorting-algorithms"]].confidence == pytest.approx(0.5)
+
+    # Deterministic across re-runs: same union, same winning confidence,
+    # still no duplicates.
+    _run(session_factory, stub, course_id)
+    rerun_rows = _rows(session_factory, material_id=source_id)
+    assert len(rerun_rows) == 3
+    rerun_by_topic = {row.topic_id: row.confidence for row in rerun_rows}
+    assert rerun_by_topic == {topic_id: row.confidence for topic_id, row in by_topic.items()}
+
+
+def test_media_source_with_null_material_id_or_null_transcript_material_id_is_a_noop(
+    session_factory, backend, course_id
+):
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    transcript_id = _add_material(
+        session_factory, course_id, title="Some Transcript", kind="transcript",
+    )
+    source_id = _add_material(
+        session_factory, course_id, title="Some Recording", kind="link", status="fetched",
+    )
+
+    # A manually-added media source (M2.6a): no backing materials row yet.
+    _add_media_source(
+        session_factory, course_id, material_id=None, transcript_material_id=transcript_id,
+        url="https://zoom.us/rec/share/no-material-yet",
+    )
+    # A media source whose recording hasn't been transcribed yet.
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=None,
+        url="https://zoom.us/rec/share/not-transcribed-yet",
+    )
+
+    stats = _run(session_factory, backend, course_id)  # must not raise
+
+    assert stats.failed == 0
+    assert _rows(session_factory, material_id=source_id) == []
+    # The transcript material itself still gets classified normally --
+    # inheritance just has nothing to attach it to.
+    assert len(_rows(session_factory, material_id=transcript_id)) == 2

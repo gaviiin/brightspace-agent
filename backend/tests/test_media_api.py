@@ -438,6 +438,43 @@ def test_get_media_unknown_course_404(client):
     assert resp.status_code == 404
 
 
+def test_get_media_never_reports_idle_with_stale_sources(client, db_session_factory, monkeypatch):
+    """Regression guard for the read model's ordering: a GET whose response
+    says `active: false` must carry the run's FINAL source rows. The handler
+    used to read the sources (then hints) BEFORE `runner.is_active()`, so a
+    request straddling the end of the background media task could pair
+    pre-completion rows (still 'fetching') with `active: false` -- which is
+    exactly what `_wait_for_media_idle` trusts, making every test built on
+    it intermittently observe stale statuses under load.
+
+    The race window (between the sources query and the is_active read) is
+    sub-millisecond in real runs; wrapping `_compute_lti_hints` -- which
+    executes between the two -- with a 100ms sleep widens it enough that the
+    old ordering fails this test every time instead of once in a thousand.
+    """
+    import brightspace_agent.api.media as media_api
+
+    original_hints = media_api._compute_lti_hints
+
+    def slow_hints(session, course_id):
+        time.sleep(0.1)
+        return original_hints(session, course_id)
+
+    monkeypatch.setattr(media_api, "_compute_lti_hints", slow_hints)
+
+    course_id = _add_course(db_session_factory)
+    material_id = _add_material(db_session_factory, course_id, source_url="https://zoom.us/rec/share/mock-captions")
+    source_id = _add_media_source(
+        db_session_factory, course_id, material_id, url="https://zoom.us/rec/share/mock-captions",
+    )
+
+    resp = client.post(f"/api/media/{source_id}/process", headers=CSRF_HEADERS)
+    assert resp.status_code == 200
+
+    body = _wait_for_media_idle(client, course_id, timeout_s=10.0)
+    assert body["sources"][0]["status"] == "done"
+
+
 # --------------------------------------------------------------------------
 # (6) detect endpoint: stats + CSRF
 # --------------------------------------------------------------------------
@@ -936,6 +973,27 @@ def test_add_non_http_scheme_url_422(client, db_session_factory):
     )
 
     assert resp.status_code == 422
+
+
+def test_add_javascript_scheme_zoom_shaped_url_422(client, db_session_factory):
+    """A javascript: URL that is otherwise Zoom-shaped (host+path match --
+    see classify_url's scheme-safety tests in test_media_detect.py) is
+    rejected before it ever reaches classify_url: `add_media_url`'s
+    `_require_absolute_http_url` guard runs first, so this never gets the
+    chance to be misclassified and persisted."""
+    course_id = _add_course(db_session_factory)
+
+    resp = client.post(
+        f"/api/courses/{course_id}/media/add",
+        json={"url": "javascript://zoom.us/rec/share/x"},
+        headers=CSRF_HEADERS,
+    )
+
+    assert resp.status_code == 422
+
+    with db_session_factory() as session:
+        rows = list(session.execute(select(MediaSource).where(MediaSource.course_id == course_id)).scalars().all())
+        assert rows == []
 
 
 def test_add_requires_csrf(client, db_session_factory):

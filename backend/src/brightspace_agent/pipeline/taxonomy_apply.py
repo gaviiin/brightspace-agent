@@ -41,11 +41,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from brightspace_agent.agents.promptfmt import slugify
-from brightspace_agent.db.models import Course, MaterialTopic, Topic, TopicEdge
+from brightspace_agent.db.models import Course, Material, MaterialTopic, Topic, TopicEdge
 from brightspace_agent.pipeline.runner import RunActiveError
 
 
@@ -335,6 +335,23 @@ def _apply_structural(
         )
 
     _carry_over_assignments(session, new_version, current_version, old_to_new)
+
+    # M3.5a: is_administrative isn't versioned (materials has one column,
+    # not one row per taxonomy_version), so carry-over above doesn't touch
+    # it the way it does material_topics rows. An administrative material
+    # never has material_topics rows to carry in the first place (S3 writes
+    # none for it), so it would be re-selected and re-derived on the next
+    # classify run regardless -- but clearing it HERE, at the same moment
+    # the version bumps, keeps the graph honest in the window before that
+    # run finishes: the material shows as unfiled (Unsorted) pending
+    # reclassification, exactly like a material whose old topic wasn't
+    # carried, rather than staying in the admin bucket on a stale verdict
+    # from the taxonomy that just changed.
+    session.execute(
+        update(Material).where(Material.course_id == course.id, Material.is_administrative == 1).values(
+            is_administrative=0
+        )
+    )
 
     course.taxonomy_version = new_version
 

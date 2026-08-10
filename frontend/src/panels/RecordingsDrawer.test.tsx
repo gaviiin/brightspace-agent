@@ -143,6 +143,80 @@ describe("RecordingsDrawer: rows", () => {
   });
 });
 
+describe("RecordingsDrawer: open recording link", () => {
+  it("renders an external Open link to the row's source.url, regardless of status", async () => {
+    mockedGetMedia.mockResolvedValue(fixtureMedia());
+
+    renderDrawer();
+    await screen.findByText("Lecture 1 (Mediasite)");
+
+    // status "detected"
+    const detectedLink = within(rowFor("Lecture 1 (Mediasite)")).getByRole("link", { name: /open/i });
+    expect(detectedLink.getAttribute("href")).toBe("https://mediasite.example.edu/watch/1");
+    expect(detectedLink.getAttribute("target")).toBe("_blank");
+    expect(detectedLink.getAttribute("rel")).toContain("noopener");
+
+    // status "done" -- still enabled, same as every other status.
+    const doneLink = within(rowFor("Lecture 3 (Drive)")).getByRole("link", { name: /open/i });
+    expect(doneLink.getAttribute("href")).toBe("https://drive.google.com/file/d/xyz");
+
+    // status "skipped" -- still enabled.
+    const skippedLink = within(rowFor("Lecture 4 (Zoom, skipped)")).getByRole("link", { name: /open/i });
+    expect(skippedLink.getAttribute("href")).toBe("https://zoom.us/rec/share/def");
+  });
+
+  it("renders the Open link on a manually-added row too", async () => {
+    mockedGetMedia.mockResolvedValue(
+      fixtureMedia({
+        sources: [
+          source({
+            id: 5,
+            materialId: null,
+            materialTitle: null,
+            platform: "mediasite",
+            url: "https://mediasite.example.edu/Mediasite/Play/manual",
+          }),
+        ],
+      }),
+    );
+
+    renderDrawer();
+    await screen.findByText("Added manually");
+    const row = rowFor("Added manually");
+
+    const link = within(row).getByRole("link", { name: /open/i });
+    expect(link.getAttribute("href")).toBe("https://mediasite.example.edu/Mediasite/Play/manual");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toContain("noopener");
+  });
+
+  it("renders no Open link when source.url has an unsafe scheme (defense-in-depth review fix)", async () => {
+    // The backend's classify_url now rejects this before it can ever be
+    // persisted (see test_media_detect.py), but this row renders whatever
+    // media_sources.url actually holds -- an older row written before that
+    // fix, say -- so the frontend must never trust it's already safe.
+    mockedGetMedia.mockResolvedValue(
+      fixtureMedia({
+        sources: [
+          source({
+            id: 6,
+            materialId: 60,
+            materialTitle: "Sketchy Row",
+            platform: "zoom",
+            url: "javascript://zoom.us/rec/share/x",
+          }),
+        ],
+      }),
+    );
+
+    renderDrawer();
+    await screen.findByText("Sketchy Row");
+    const row = rowFor("Sketchy Row");
+
+    expect(within(row).queryByRole("link", { name: /open/i })).toBeNull();
+  });
+});
+
 describe("RecordingsDrawer: passcode", () => {
   it("saves a typed passcode via updateMediaSource", async () => {
     mockedGetMedia.mockResolvedValue(fixtureMedia());

@@ -2,7 +2,10 @@
 
 `schema.sql` is the DDL source of truth for the current schema; it is applied
 as migration 1. Future schema changes should be appended to MIGRATIONS as
-additional (version, sql) entries rather than editing schema.sql in place.
+additional (version, sql) entries rather than editing schema.sql in place --
+with a version strictly greater than the last one, which
+`check_migration_versions` enforces at import (see its docstring for the
+stacked-branch hazard that guards against).
 """
 
 from importlib import resources
@@ -98,12 +101,95 @@ _MEDIA_SOURCES_MATERIAL_ID_NULLABLE = (
     "ALTER TABLE media_sources_new RENAME TO media_sources;"
 )
 
+# Migration 5 (M3.5a) adds materials.is_administrative: a flag S3's classify
+# stage sets for grades/scheduling/office-hours/logistics materials, so S4
+# can file them under their own "Logistics & admin" bucket instead of
+# Unsorted. Deliberately NOT also added to schema.sql's `CREATE TABLE
+# materials` (unlike migrations 2-4's "also in schema.sql" pairing):
+# `ALTER TABLE ... ADD COLUMN` has no `IF NOT EXISTS` form in SQLite, so a
+# fresh database -- which starts at user_version 0 and therefore runs EVERY
+# migration in one `migrate()` call, schema.sql (migration 1) included --
+# would hit "duplicate column name" the moment this ran if schema.sql had
+# already created the column. Keeping it exclusively in this migration
+# (which fresh databases run just like any upgraded one) is what keeps a
+# single, crash-free code path for both.
+_MATERIALS_IS_ADMINISTRATIVE_COLUMN = (
+    "ALTER TABLE materials ADD COLUMN is_administrative INTEGER NOT NULL DEFAULT 0;"
+)
+
+# Migration 6 (M3.5b) adds 'inherited' to material_topics.method's CHECK
+# constraint -- the recording-topic-inheritance post-pass
+# (classify.py's `_inherit_recording_topics`) writes rows with
+# `method='inherited'` for a recording's source material, mirrored from its
+# transcript's own assignments. SQLite can't ALTER a CHECK constraint in
+# place, so this is the same table-rebuild dance migration 4 used for
+# media_sources: rebuild under a temp name with the widened CHECK, copy
+# every row across unchanged, drop the old table, rename the new one into
+# place. Also folded into schema.sql directly (unlike migration 5's ADD
+# COLUMN, which can't be -- see that migration's comment): a CREATE TABLE
+# rebuild is safe to also express as the fresh-database DDL, the same
+# "also in schema.sql" pairing migrations 2-4 use.
+_MATERIAL_TOPICS_METHOD_INHERITED = (
+    "CREATE TABLE material_topics_new (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,\n"
+    "    topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,\n"
+    "    taxonomy_version INTEGER NOT NULL,\n"
+    "    confidence REAL,\n"
+    "    rationale TEXT,\n"
+    "    method TEXT NOT NULL CHECK(method IN ('llm','embedding','user','inherited')) DEFAULT 'llm',\n"
+    "    review_status TEXT NOT NULL CHECK(review_status IN ('auto','confirmed','rejected')) DEFAULT 'auto',\n"
+    "    UNIQUE(material_id, topic_id, taxonomy_version)\n"
+    ");\n"
+    "INSERT INTO material_topics_new (\n"
+    "    id, material_id, topic_id, taxonomy_version, confidence, rationale, method, review_status\n"
+    ")\n"
+    "SELECT id, material_id, topic_id, taxonomy_version, confidence, rationale, method, review_status\n"
+    "FROM material_topics;\n"
+    "DROP TABLE material_topics;\n"
+    "ALTER TABLE material_topics_new RENAME TO material_topics;"
+)
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _SCHEMA_SQL),
     (2, _ENRICHMENT_UNIQUE_INDEX),
     (3, _MEDIA_SOURCES_TABLE),
     (4, _MEDIA_SOURCES_MATERIAL_ID_NULLABLE),
+    (5, _MATERIALS_IS_ADMINISTRATIVE_COLUMN),
+    (6, _MATERIAL_TOPICS_METHOD_INHERITED),
 ]
+
+
+def check_migration_versions(migrations: list[tuple[int, str]]) -> None:
+    """Raise unless `migrations`' versions are unique and strictly increasing.
+
+    Called at import (below) on MIGRATIONS itself, so a bad list is a loud
+    failure the first time anything touches the database rather than a
+    subtle one at runtime.
+
+    The hazard is stacked branches, and it is not hypothetical: two branches
+    developed in parallel each append "the next" migration, both pick
+    version 5, and the merge produces a list with 5 twice. `migrate()` skips
+    every entry whose version is `<= current_version`, so on a database that
+    reaches 5 the second entry is silently skipped forever -- its column
+    never exists, and the failure surfaces far away as an
+    OperationalError("no such column") at startup on developer machines that
+    happened to migrate in the wrong order. A non-increasing version has the
+    same shape. Cheap to check, and there is no valid reason to write one.
+
+    A raise rather than `assert`: `python -O` strips assertions, and this is
+    a data-integrity guard, not a debugging aid.
+    """
+    versions = [version for version, _sql in migrations]
+    for previous, current in zip(versions, versions[1:], strict=False):
+        if current <= previous:
+            raise ValueError(
+                f"MIGRATIONS versions must be unique and strictly increasing; "
+                f"found {previous} followed by {current} in {versions}"
+            )
+
+
+check_migration_versions(MIGRATIONS)
 
 
 def migrate(connection: Connection) -> None:

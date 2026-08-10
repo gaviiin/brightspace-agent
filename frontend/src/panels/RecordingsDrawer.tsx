@@ -10,6 +10,7 @@ import {
   updateMediaSource,
 } from "../api/client";
 import type { MediaHint, MediaSourceStatus, MediaSourceSummary, MediaSourceUpdateRequest } from "../api/types";
+import { isSafeHttpUrl } from "../lib/url";
 import { useUiStore } from "../state/uiStore";
 import { StatusBadge } from "./RunsDrawer";
 
@@ -366,37 +367,45 @@ function SourceRow({
       {processError && <p className="mt-1 text-xs text-red-600 dark:text-red-400">{processError}</p>}
       {updateError && <p className="mt-1 text-xs text-red-600 dark:text-red-400">{updateError}</p>}
 
-      {(source.status === "detected" ||
-        source.status === "failed" ||
-        source.status === "skipped" ||
-        source.transcriptMaterialId !== null) && (
-        <div className="mt-1.5 flex flex-wrap gap-1.5">
-          {(source.status === "detected" || source.status === "failed") && (
-            <>
-              <button type="button" disabled={busy} onClick={onProcess} className={ACTION_BUTTON_CLASS}>
-                Process
-              </button>
-              <button type="button" disabled={busy} onClick={onSkip} className={ACTION_BUTTON_CLASS}>
-                Skip
-              </button>
-            </>
-          )}
-          {source.status === "skipped" && (
-            <button type="button" disabled={busy} onClick={onUnskip} className={ACTION_BUTTON_CLASS}>
-              Unskip
+      {/* M3.5c: watching the recording in the browser is always legitimate,
+       * so this stays enabled regardless of status -- unlike Process/Skip/
+       * Unskip below, which are gated on it. Always rendered (this row's
+       * status is no longer what decides whether the actions div shows up
+       * at all). Review fix: `source.url` is backend-supplied and rendered
+       * straight into `href` -- gated on `isSafeHttpUrl` so a non-http(s)
+       * scheme (classify_url now rejects these at write time, but an older
+       * row could still hold one) never reaches an anchor. */}
+      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+        {isSafeHttpUrl(source.url) && (
+          <a href={source.url} target="_blank" rel="noopener noreferrer" className={ACTION_BUTTON_CLASS}>
+            Open ↗
+          </a>
+        )}
+        {(source.status === "detected" || source.status === "failed") && (
+          <>
+            <button type="button" disabled={busy} onClick={onProcess} className={ACTION_BUTTON_CLASS}>
+              Process
             </button>
-          )}
-          {source.transcriptMaterialId !== null && (
-            <button
-              type="button"
-              onClick={() => onSelectTranscript(source.transcriptMaterialId as number)}
-              className={ACTION_BUTTON_CLASS}
-            >
-              Transcript ready
+            <button type="button" disabled={busy} onClick={onSkip} className={ACTION_BUTTON_CLASS}>
+              Skip
             </button>
-          )}
-        </div>
-      )}
+          </>
+        )}
+        {source.status === "skipped" && (
+          <button type="button" disabled={busy} onClick={onUnskip} className={ACTION_BUTTON_CLASS}>
+            Unskip
+          </button>
+        )}
+        {source.transcriptMaterialId !== null && (
+          <button
+            type="button"
+            onClick={() => onSelectTranscript(source.transcriptMaterialId as number)}
+            className={ACTION_BUTTON_CLASS}
+          >
+            Transcript ready
+          </button>
+        )}
+      </div>
     </li>
   );
 }

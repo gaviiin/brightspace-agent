@@ -76,6 +76,16 @@ _ENROLLMENT_PAGE_SIZE = 1
 #
 # The second news item exercises the defensive half of that mapping: a
 # tenant that publishes an announcement with no HTML rendering at all.
+ADMIN_NEWS_TITLE = "Office hours moved"
+"""M3.5a: the fixture's administrative material. Its title carries one of
+MockBackend's `_MOCK_ADMIN_TITLE_MARKERS` (agents/llm.py), so an offline run
+classifies it `is_administrative=True` and S4 files it under the synthetic
+"Logistics & admin" bucket -- which is what lets scripts/e2e.py assert that
+bucket end to end instead of only unit tests setting the column by hand.
+Named rather than inlined below because e2e.py asserts on it by title:
+renaming the announcement without renaming this constant would quietly
+delete that coverage."""
+
 NEWS: list[dict[str, Any]] = [
     {
         "Id": 1,
@@ -91,7 +101,7 @@ NEWS: list[dict[str, Any]] = [
     },
     {
         "Id": 2,
-        "Title": "Office hours moved",
+        "Title": ADMIN_NEWS_TITLE,
         "Body": {"Text": "Office hours are now on Thursdays.", "Html": None},
         "StartDate": "2026-01-06T12:00:00.000Z",
         "EndDate": None,

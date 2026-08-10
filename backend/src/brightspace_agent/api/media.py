@@ -139,6 +139,15 @@ def _compute_lti_hints(session: Session, course_id: int) -> list[MediaHintOut]:
 def list_media_sources(
     course_id: int, session: Session = Depends(get_session), runner: PipelineRunner = Depends(get_runner)
 ) -> MediaListOut:
+    # Read the active flag BEFORE any DB query (the order runner.status()
+    # and enrichment_status() already use): every row write of a media run
+    # commits before the run's finally-block clears the active flag, so
+    # active=False observed here guarantees the queries below see the run's
+    # final rows. Read after them instead, `active: false` could pair with
+    # stale mid-run rows -- and pollers (the drawer, the tests'
+    # wait-for-idle helpers) treat that as "run finished, rows are final".
+    # Stale-True is the harmless direction: the poller just polls again.
+    active = runner.is_active(course_id)
     _get_course_or_404(session, course_id)
     rows = session.execute(
         select(MediaSource, Material.title)
@@ -151,7 +160,7 @@ def list_media_sources(
     ).all()
     sources = [_media_source_out(source, title) for source, title in rows]
     hints = _compute_lti_hints(session, course_id)
-    return MediaListOut(sources=sources, active=runner.is_active(course_id), hints=hints)
+    return MediaListOut(sources=sources, active=active, hints=hints)
 
 
 # --------------------------------------------------------------------------

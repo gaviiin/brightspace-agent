@@ -11,7 +11,7 @@ from sqlalchemy import select
 from brightspace_agent.db.models import Course, Material, MediaSource
 from brightspace_agent.db.session import init_db
 from brightspace_agent.ingest.store import BlobStore
-from brightspace_agent.media.detect import DetectStats, detect_media_sources
+from brightspace_agent.media.detect import DetectStats, classify_url, detect_media_sources
 
 # --------------------------------------------------------------------------
 # Fixtures -- direct DB/blob-store setup, no HTTP, matching
@@ -92,6 +92,41 @@ def _rows(session_factory, course_id) -> list[MediaSource]:
         return list(
             session.execute(select(MediaSource).where(MediaSource.course_id == course_id)).scalars().all()
         )
+
+
+# --------------------------------------------------------------------------
+# classify_url: scheme safety (review fix on M3.5c)
+#
+# classify_url only ever checked scheme+netloc were non-empty, not that the
+# scheme was http(s) -- and the HTML-scanning path below feeds it raw
+# `<a href>` values straight out of already-synced, untrusted page HTML
+# with no separate scheme guard of its own (unlike api/media.py's manual-
+# add endpoint, which has its own `_require_absolute_http_url`). A crafted
+# `javascript://zoom.us/rec/share/x` parses with scheme="javascript",
+# netloc="zoom.us", path="/rec/share/x" -- host+path matching alone (and
+# mediasite's path-only matching, no host check at all) would classify it
+# as a real Zoom/Mediasite URL and persist it verbatim to
+# `media_sources.url`, which M3.5c started rendering into an `<a href>`.
+# --------------------------------------------------------------------------
+
+
+def test_classify_url_rejects_javascript_scheme_zoom_shaped():
+    assert classify_url("javascript://zoom.us/rec/share/x") is None
+
+
+def test_classify_url_rejects_javascript_scheme_mediasite_shaped():
+    # Mediasite matching is path-only (no host check), so this is the more
+    # dangerous of the two absent a scheme guard.
+    assert classify_url("javascript://mediasite.example.edu/Mediasite/Play/xyz") is None
+
+
+def test_classify_url_rejects_data_scheme_zoom_shaped():
+    assert classify_url("data://zoom.us/rec/share/x") is None
+
+
+def test_classify_url_still_accepts_real_http_and_https_urls():
+    assert classify_url("https://zoom.us/rec/share/xyz789") is not None
+    assert classify_url("http://media.school.edu/Mediasite/Play/abc123") is not None
 
 
 # --------------------------------------------------------------------------
@@ -185,6 +220,24 @@ def test_html_page_non_recording_hrefs_ignored(session_factory, blob_store, cour
 
     assert _rows(session_factory, course_id) == []
     assert stats.scanned_materials == 1
+    assert stats.found == 0
+
+
+def test_html_page_javascript_scheme_zoom_shaped_href_ignored(session_factory, blob_store, course_id):
+    """The actual injection path the classify_url scheme guard defends:
+    course-synced page HTML is untrusted, and hrefs from it reach
+    classify_url with no separate scheme check of their own (see the
+    classify_url scheme-safety section above)."""
+    html = (
+        "<html><body>"
+        '<a href="javascript://zoom.us/rec/share/x">watch here</a>'
+        "</body></html>"
+    )
+    _add_html_material(session_factory, blob_store, course_id, html=html, d2l_topic_id=1)
+
+    stats = detect_media_sources(session_factory, course_id)
+
+    assert _rows(session_factory, course_id) == []
     assert stats.found == 0
 
 

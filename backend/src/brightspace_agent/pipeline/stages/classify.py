@@ -21,6 +21,27 @@ Two things worth knowing:
   Since `material.sha256` is content-addressed and therefore shared across
   courses, the digest is also what stops two courses that happen to hold the
   same file from reading each other's answers.
+
+M3.5a: the model also returns `is_administrative` per material (grades,
+scheduling, office hours, logistics -- never course content). A material the
+model marks administrative gets the flag written and NO `material_topics`
+rows, regardless of what `assignments` it also returned -- S4 (graph/build.py)
+files it under its own "Logistics & admin" bucket instead of a real topic or
+Unsorted. The flag isn't versioned by taxonomy (materials.is_administrative is
+a single column), but it's re-derived every time this stage actually
+processes the material -- which, since an administrative material never gets
+material_topics rows, is every run until reclassified into real content (see
+`_select_worklist`).
+
+M3.5b: a post-pass (`_inherit_recording_topics`, run unconditionally at the
+end of `run_classify_stage`, independent of this run's worklist above) mirrors
+each recording's transcript's topic assignments onto the recording's own
+source material -- a `media_sources` link's `material_id`. A recording's own
+material is usually a bare link/page with nothing of its own to classify
+(it rarely even reaches `status='summarized'`), so left alone it stays
+Unsorted forever even though its transcript -- the thing that actually
+carries what the lecture covered -- is filed correctly. Pure DB work, no LLM
+calls; see that function's docstring for the exact rules.
 """
 
 from __future__ import annotations
@@ -35,7 +56,7 @@ from datetime import datetime, timezone
 from importlib import resources
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -48,12 +69,12 @@ from brightspace_agent.agents.promptfmt import (
     taxonomy_digest,
 )
 from brightspace_agent.agents.schemas import ClassificationOut
-from brightspace_agent.db.models import Course, LlmCache, Material, MaterialTopic, Topic
+from brightspace_agent.db.models import Course, LlmCache, Material, MaterialTopic, MediaSource, Topic
 from brightspace_agent.pipeline.stats import StageStats
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "s3.v1"
+PROMPT_VERSION = "s3.v2"  # M3.5a: adds is_administrative to the output schema
 _STAGE = "classify"
 _TIER: Tier = "fast"
 _MAX_ASSIGNMENTS = 3  # classify.md asks for 1-3; this is what enforces it
@@ -125,25 +146,33 @@ async def run_classify_stage(
     material_ids = _select_worklist(session_factory, course_id, context.version)
     if not material_ids:
         logger.info("classify: course %s has nothing to classify at version %d", course_id, context.version)
-        return stats
+    else:
+        semaphore = asyncio.Semaphore(max(1, concurrency))
 
-    semaphore = asyncio.Semaphore(max(1, concurrency))
+        async def _run_one(material_id: int) -> None:
+            async with semaphore:
+                await asyncio.to_thread(
+                    _classify_one,
+                    session_factory,
+                    backend,
+                    context,
+                    material_id,
+                    stats,
+                    progress,
+                    cost_cap_usd,
+                    cost_lock,
+                )
 
-    async def _run_one(material_id: int) -> None:
-        async with semaphore:
-            await asyncio.to_thread(
-                _classify_one,
-                session_factory,
-                backend,
-                context,
-                material_id,
-                stats,
-                progress,
-                cost_cap_usd,
-                cost_lock,
-            )
+        await asyncio.gather(*(_run_one(material_id) for material_id in material_ids))
 
-    await asyncio.gather(*(_run_one(material_id) for material_id in material_ids))
+    # M3.5b: independent of the worklist above (and of whether the cost cap
+    # just aborted it) -- a media_sources link can be new, or its transcript
+    # can have already been classified in this run OR an earlier one, on a
+    # run where the recording's own material was never in the worklist at
+    # all (see this function's docstring). No LLM calls, so nothing here
+    # counts against the cap; it simply mirrors whatever transcripts already
+    # have real assignments right now.
+    _inherit_recording_topics(session_factory, course_id, context.version)
     return stats
 
 
@@ -264,24 +293,43 @@ def _classify_one(
             else:
                 stats.cached_hits += 1
 
-            assignments = _validate(classification, context, material_id)
-            for topic_id, confidence, rationale in assignments:
-                session.add(
-                    MaterialTopic(
-                        material_id=material_id,
-                        topic_id=topic_id,
-                        taxonomy_version=context.version,
-                        confidence=confidence,
-                        rationale=rationale,
-                        method="llm",
-                        review_status="auto",
+            # M3.5a: administrative materials (grades, scheduling, office
+            # hours, logistics) get the flag and NO material_topics rows --
+            # S4 files them under their own bucket instead of a real topic
+            # or Unsorted. `material.is_administrative` is always written
+            # explicitly (both branches), not just when true, so a material
+            # that used to be administrative and is re-classified as real
+            # content has its stale flag cleared right here, the same run
+            # that gives it real assignments.
+            if classification.is_administrative:
+                material.is_administrative = 1
+                assignments: list[tuple[int, float, str]] = []
+            else:
+                material.is_administrative = 0
+                assignments = _validate(classification, context, material_id)
+                for topic_id, confidence, rationale in assignments:
+                    session.add(
+                        MaterialTopic(
+                            material_id=material_id,
+                            topic_id=topic_id,
+                            taxonomy_version=context.version,
+                            confidence=confidence,
+                            rationale=rationale,
+                            method="llm",
+                            review_status="auto",
+                        )
                     )
-                )
             session.commit()
 
         if assignments:
             stats.classified += 1
             stats.assignments += len(assignments)
+        elif classification.is_administrative:
+            stats.unassigned += 1
+            logger.info(
+                "classify: material %s is administrative; filed in the logistics/admin bucket",
+                material_id,
+            )
         else:
             stats.unassigned += 1
             logger.info(
@@ -441,3 +489,164 @@ def _validate(
         )
         kept = kept[:_MAX_ASSIGNMENTS]
     return kept
+
+
+# --------------------------------------------------------------------------
+# M3.5b: recording topic inheritance
+# --------------------------------------------------------------------------
+
+
+def _inherit_recording_topics(
+    session_factory: sessionmaker[Session], course_id: int, version: int
+) -> None:
+    """For every `media_sources` row of `course_id` with BOTH `material_id`
+    and `transcript_material_id` set, mirror the linked transcript(s)'
+    `material_topics` rows at `version` onto the source material.
+
+    Grouped by source material FIRST (review fix): one source material can
+    be linked from SEVERAL `media_sources` rows sharing the same
+    `material_id` -- e.g. an HTML "Recordings" page material where
+    `media/detect.py`'s page-scan created one row per linked video, all
+    pointing `material_id` at that one page. `_inherit_one` below is given
+    every linked transcript for a source at once and does a SINGLE
+    delete-and-rewrite pass over their union -- running one pass per
+    (source, transcript) pair independently would have each later
+    transcript's pass wipe out the previous transcript's inherited rows,
+    leaving the source with only whichever link happened to be processed
+    last (and, with no ordering on the original per-row query, "last"
+    wasn't even deterministic).
+
+    One session for the whole course (unlike `_classify_one`'s one-session-
+    per-material fan-out above): this is pure DB work with no LLM call to
+    isolate a slow/failing call from, so there's nothing gained by paying a
+    session per link, and a single commit at the end keeps every link's
+    write atomic together.
+    """
+    with session_factory() as session:
+        links = list(
+            session.execute(
+                select(MediaSource.material_id, MediaSource.transcript_material_id)
+                .where(
+                    MediaSource.course_id == course_id,
+                    MediaSource.material_id.is_not(None),
+                    MediaSource.transcript_material_id.is_not(None),
+                )
+                # Deterministic grouping order -- not load-bearing for
+                # correctness (the union/tie-break below doesn't depend on
+                # it), but keeps behavior reproducible run to run.
+                .order_by(MediaSource.material_id, MediaSource.transcript_material_id, MediaSource.id)
+            ).all()
+        )
+        by_source: dict[int, list[int]] = {}
+        for source_material_id, transcript_material_id in links:
+            by_source.setdefault(source_material_id, []).append(transcript_material_id)
+
+        for source_material_id, transcript_material_ids in by_source.items():
+            _inherit_one(session, source_material_id, transcript_material_ids, version)
+        session.commit()
+
+
+def _inherit_one(
+    session: Session, source_material_id: int, transcript_material_ids: list[int], version: int
+) -> None:
+    """Mirror the UNION of `transcript_material_ids`' `material_topics` rows
+    at `version` onto `source_material_id`, same version, in a single
+    delete-and-rewrite pass.
+
+    When more than one linked transcript assigns the SAME topic, the
+    highest-confidence row wins -- mirrors `taxonomy_apply.py`'s
+    `_carry_over_assignments` tie-break exactly (`> `, not `>=`); a tie
+    keeps whichever is seen first, which the `order_by` below (by
+    transcript material id, then topic id, then row id) makes deterministic
+    across re-runs regardless of dict/query iteration order.
+
+    Idempotent by delete-and-rewrite: every existing `method='inherited'`
+    row for `source_material_id` at `version` is dropped and rewritten
+    fresh from the transcripts' CURRENT assignments, rather than a per-row
+    upsert -- simpler, and correct even when a linked transcript's own
+    topics changed since the last run (a stale inherited row for a topic no
+    linked transcript carries anymore must not survive a re-run).
+    Non-inherited rows (`'llm'` from the source's own thin-pseudo-doc
+    classification, or `'user'` from a manual edit) are never touched or
+    shadowed -- inheritance only fills topics the source lacks.
+
+    If NONE of the linked transcripts have rows at `version` yet, this is a
+    no-op that leaves any existing inherited rows (and the source's
+    `is_administrative` flag) exactly as they are -- deliberately: "never
+    classified at this version" and "classified but matched zero topics" are
+    indistinguishable from here (a transcript that matched nothing simply
+    has no `material_topics` rows, same as one never classified), and wiping
+    the source's last-known-good inherited rows on every transient
+    zero-topic reclassification would be worse than leaving them briefly
+    stale.
+    """
+    transcript_rows = list(
+        session.execute(
+            select(MaterialTopic)
+            .where(
+                MaterialTopic.material_id.in_(transcript_material_ids),
+                MaterialTopic.taxonomy_version == version,
+            )
+            .order_by(MaterialTopic.material_id, MaterialTopic.topic_id, MaterialTopic.id)
+        ).scalars().all()
+    )
+    if not transcript_rows:
+        return  # no linked transcript is classified at this version (yet) -- nothing to mirror
+
+    best: dict[int, MaterialTopic] = {}
+    for row in transcript_rows:
+        existing = best.get(row.topic_id)
+        if existing is None or (row.confidence or 0.0) > (existing.confidence or 0.0):
+            best[row.topic_id] = row
+
+    direct_topic_ids = set(
+        session.execute(
+            select(MaterialTopic.topic_id).where(
+                MaterialTopic.material_id == source_material_id,
+                MaterialTopic.taxonomy_version == version,
+                MaterialTopic.method != "inherited",
+            )
+        ).scalars().all()
+    )
+
+    session.execute(
+        delete(MaterialTopic).where(
+            MaterialTopic.material_id == source_material_id,
+            MaterialTopic.taxonomy_version == version,
+            MaterialTopic.method == "inherited",
+        )
+    )
+
+    for topic_id, row in best.items():
+        if topic_id in direct_topic_ids:
+            continue  # a direct assignment on the source wins; never shadowed
+        session.add(
+            MaterialTopic(
+                material_id=source_material_id,
+                topic_id=topic_id,
+                taxonomy_version=version,
+                confidence=row.confidence,
+                rationale="inherited from the lecture transcript",
+                method="inherited",
+                review_status="auto",
+            )
+        )
+
+    # M3.5a's admin flag (task-A review fix: S3 may have flagged a bare
+    # recording link as administrative from its thin pseudo-doc): if it
+    # stays, S4's admin exclusion silently hides this material's topics --
+    # inherited or direct -- and files it under Logistics & admin instead.
+    # Mirrors classify.py's own per-material rule (`_classify_one` above) of
+    # always writing the flag explicitly the moment a material has real
+    # topics, not just leaving a stale `True` in place; the recording
+    # material usually never goes through that pass itself, so this is the
+    # only place that clears it for one.
+    #
+    # Keyed on "a linked transcript IS classified at this version" (the
+    # `transcript_rows` guard above), NOT on "inheritance wrote a row" -- a
+    # source whose direct assignments already cover every topic its
+    # transcript carries writes nothing here and is still, demonstrably, not
+    # administrative.
+    source_material = session.get(Material, source_material_id)
+    if source_material is not None:
+        source_material.is_administrative = 0

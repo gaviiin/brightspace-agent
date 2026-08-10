@@ -10,7 +10,13 @@ import pytest
 
 from brightspace_agent.db.models import Course, Material, MaterialTopic, Topic, TopicEdge
 from brightspace_agent.db.session import init_db
-from brightspace_agent.graph.build import UNSORTED_TOPIC_ID, UNSORTED_TOPIC_SLUG, build_graph
+from brightspace_agent.graph.build import (
+    ADMIN_TOPIC_ID,
+    ADMIN_TOPIC_SLUG,
+    UNSORTED_TOPIC_ID,
+    UNSORTED_TOPIC_SLUG,
+    build_graph,
+)
 
 
 @pytest.fixture
@@ -45,13 +51,16 @@ def _add_topics(session, course_id, version, specs) -> dict[str, int]:
     return ids
 
 
-def _add_material(session, course_id, *, title, kind="document", status="summarized") -> int:
+def _add_material(
+    session, course_id, *, title, kind="document", status="summarized", is_administrative=0
+) -> int:
     material = Material(
         course_id=course_id,
         kind=kind,
         title=title,
         sha256=f"sha-{title.lower().replace(' ', '-')}",
         status=status,
+        is_administrative=is_administrative,
     )
     session.add(material)
     session.flush()
@@ -145,7 +154,7 @@ def test_graph_shape_and_camel_case_keys(session_factory, course_id, seeded):
     assert set(graph["materials"][0]) == {"id", "title", "kind", "status", "maxConfidence"}
     assert set(graph["topicEdges"][0]) == {"fromTopicId", "toTopicId", "relation"}
     assert set(graph["attachments"][0]) == {"topicId", "materialId", "confidence", "rationale"}
-    assert set(graph["meta"]) == {"taxonomyVersion", "orphanCount"}
+    assert set(graph["meta"]) == {"taxonomyVersion", "orphanCount", "adminCount"}
     assert graph["meta"]["taxonomyVersion"] == 1
 
     # Only current-version topics (plus Unsorted); the version-0 topic is gone.
@@ -243,6 +252,113 @@ def test_course_without_a_taxonomy_puts_everything_in_unsorted(session_factory, 
     assert [topic["id"] for topic in graph["topics"]] == [UNSORTED_TOPIC_ID]
     assert graph["meta"]["orphanCount"] == 2
     assert len(graph["attachments"]) == 2
+
+
+# --------------------------------------------------------------------------
+# (3b) M3.5a: administrative bucket
+# --------------------------------------------------------------------------
+
+
+def test_administrative_material_lands_in_the_admin_bucket_not_unsorted(session_factory, course_id, seeded):
+    with session_factory() as session:
+        admin_id = _add_material(session, course_id, title="Final Grades Posted", kind="announcement")
+        session.get(Material, admin_id).is_administrative = 1
+        session.commit()
+
+    graph = _build(session_factory, course_id)
+
+    admin = next(topic for topic in graph["topics"] if topic["id"] == ADMIN_TOPIC_ID)
+    assert admin["slug"] == ADMIN_TOPIC_SLUG
+    assert admin["name"] == "Logistics & admin"
+    assert admin["description"]
+    assert admin["materialCount"] == 1
+
+    admin_attachments = [a for a in graph["attachments"] if a["topicId"] == ADMIN_TOPIC_ID]
+    assert len(admin_attachments) == 1
+    assert admin_attachments[0]["materialId"] == admin_id
+    assert admin_attachments[0]["confidence"] is None
+
+    # Not counted as unsorted, and not double-counted anywhere else.
+    unsorted_attachments = [a for a in graph["attachments"] if a["topicId"] == UNSORTED_TOPIC_ID]
+    assert admin_id not in {a["materialId"] for a in unsorted_attachments}
+    assert graph["meta"]["orphanCount"] == 1  # unchanged -- still just seeded["orphan_id"]
+    assert graph["meta"]["adminCount"] == 1
+
+
+def test_administrative_material_excluded_even_with_a_stray_topic_assignment(session_factory, course_id):
+    """S3 never writes material_topics rows alongside is_administrative=True,
+    but this stage doesn't trust that from a distance: an administrative
+    material with a (stray/legacy) real assignment still goes to the admin
+    bucket only, not also to a real topic."""
+    with session_factory() as session:
+        topic_ids = _add_topics(session, course_id, 1, [("a", "A")])
+        session.get(Course, course_id).taxonomy_version = 1
+        admin_id = _add_material(session, course_id, title="Office Hours Notice", kind="announcement")
+        session.get(Material, admin_id).is_administrative = 1
+        session.add(
+            MaterialTopic(
+                material_id=admin_id, topic_id=topic_ids["a"], taxonomy_version=1,
+                confidence=0.5, rationale="stray", method="llm", review_status="auto",
+            )
+        )
+        session.commit()
+
+    graph = _build(session_factory, course_id)
+
+    by_slug = {topic["slug"]: topic for topic in graph["topics"]}
+    assert by_slug["a"]["materialCount"] == 0  # the stray assignment doesn't count here
+    assert graph["meta"]["adminCount"] == 1
+    assert graph["meta"]["orphanCount"] == 0
+    admin_attachments = [a for a in graph["attachments"] if a["topicId"] == ADMIN_TOPIC_ID]
+    assert [a["materialId"] for a in admin_attachments] == [admin_id]
+
+
+def test_no_admin_bucket_when_no_material_is_administrative(session_factory, course_id, seeded):
+    graph = _build(session_factory, course_id)
+
+    assert all(topic["id"] != ADMIN_TOPIC_ID for topic in graph["topics"])
+    assert graph["meta"]["adminCount"] == 0
+
+
+# --------------------------------------------------------------------------
+# (3c) M3.5b: recording topic inheritance -- a source material's inherited
+# rows (classify.py's `_inherit_recording_topics`, method='inherited') must
+# be attached exactly like any other assignment.
+# --------------------------------------------------------------------------
+
+
+def test_inherited_topic_assignment_places_the_recording_under_its_transcripts_topic(
+    session_factory, course_id, seeded
+):
+    with session_factory() as session:
+        recording_id = _add_material(session, course_id, title="Lecture 5 Recording", kind="link")
+        session.add(
+            MaterialTopic(
+                material_id=recording_id, topic_id=seeded["topic_ids"]["arrays-and-lists"], taxonomy_version=1,
+                confidence=0.9, rationale="inherited from the lecture transcript", method="inherited",
+                review_status="auto",
+            )
+        )
+        session.commit()
+
+    graph = _build(session_factory, course_id)
+
+    material_ids = {material["id"] for material in graph["materials"]}
+    assert recording_id in material_ids
+
+    by_slug = {topic["slug"]: topic for topic in graph["topics"]}
+    # lecture_id (seeded, direct) + recording_id (inherited) both land here.
+    assert by_slug["arrays-and-lists"]["materialCount"] == 2
+
+    attachment = next(
+        a for a in graph["attachments"]
+        if a["topicId"] == seeded["topic_ids"]["arrays-and-lists"] and a["materialId"] == recording_id
+    )
+    assert attachment["confidence"] == pytest.approx(0.9)
+    assert recording_id not in {a["materialId"] for a in graph["attachments"] if a["topicId"] == UNSORTED_TOPIC_ID}
+
+    by_id = {material["id"]: material for material in graph["materials"]}
+    assert by_id[recording_id]["maxConfidence"] == pytest.approx(0.9)
 
 
 # --------------------------------------------------------------------------

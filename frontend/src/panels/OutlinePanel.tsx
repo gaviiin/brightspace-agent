@@ -2,12 +2,29 @@ import { ChevronRight } from "lucide-react";
 import { useMemo } from "react";
 
 import type { GraphAttachment, GraphMaterial, GraphPayload, GraphTopic } from "../api/types";
-import { UNSORTED_TOPIC_ID } from "../api/types";
+import { ADMIN_TOPIC_ID, UNSORTED_TOPIC_ID } from "../api/types";
 import { KIND_ICON } from "../graph/nodes/MaterialNode";
 import { useUiStore } from "../state/uiStore";
 
 interface OutlinePanelProps {
   payload: GraphPayload;
+}
+
+/** Topics in `orderIndex` order, except the Logistics & admin bucket
+ * (M3.5c), which always renders LAST regardless of its `orderIndex` --
+ * graph/build.py appends it BEFORE Unsorted, so a plain orderIndex sort
+ * would put it ahead of Unsorted rather than after. Unsorted itself keeps
+ * its normal orderIndex-driven position (still "the last real slot" in
+ * practice, since the backend appends it last of all -- this just makes
+ * admin sit outside that ordering entirely, as the quietest bucket in the
+ * outline). */
+function sortTopicsAdminLast(topics: GraphTopic[]): GraphTopic[] {
+  const sorted = [...topics].sort((a, b) => a.orderIndex - b.orderIndex);
+  const adminIndex = sorted.findIndex((topic) => topic.id === ADMIN_TOPIC_ID);
+  if (adminIndex === -1) return sorted;
+  const [admin] = sorted.splice(adminIndex, 1);
+  sorted.push(admin);
+  return sorted;
 }
 
 /** Materials attached to each topic, in the graph/transform's deterministic
@@ -48,10 +65,7 @@ export function OutlinePanel({ payload }: OutlinePanelProps) {
   const selectTopic = useUiStore((state) => state.selectTopic);
   const selectMaterial = useUiStore((state) => state.selectMaterial);
 
-  const topics = useMemo(
-    () => [...payload.topics].sort((a, b) => a.orderIndex - b.orderIndex),
-    [payload.topics],
-  );
+  const topics = useMemo(() => sortTopicsAdminLast(payload.topics), [payload.topics]);
   const materialsByTopic = useMaterialsByTopic(payload);
 
   return (
@@ -96,7 +110,10 @@ function TopicRow({
   onSelectTopic,
   onSelectMaterial,
 }: TopicRowProps) {
-  const isUnsorted = topic.id === UNSORTED_TOPIC_ID;
+  // Both synthetic buckets get the same muted/italic treatment (M3.5c
+  // extends Unsorted's existing rule to admin) -- neither is a real topic a
+  // student filed content under on purpose.
+  const isMuted = topic.id === UNSORTED_TOPIC_ID || topic.id === ADMIN_TOPIC_ID;
 
   return (
     <li>
@@ -104,7 +121,7 @@ function TopicRow({
         className={[
           "flex items-center gap-1 rounded-md px-1 py-1",
           selected ? "bg-blue-50 dark:bg-blue-950" : "",
-          isUnsorted ? "text-neutral-400 dark:text-neutral-500" : "",
+          isMuted ? "text-neutral-400 dark:text-neutral-500" : "",
         ].join(" ")}
       >
         <button
@@ -128,7 +145,7 @@ function TopicRow({
             "min-w-0 flex-1 truncate rounded px-1 py-0.5 text-left font-medium",
             selected
               ? "text-blue-700 dark:text-blue-300"
-              : isUnsorted
+              : isMuted
                 ? "italic text-neutral-500 dark:text-neutral-400"
                 : "text-neutral-800 dark:text-neutral-100",
           ].join(" ")}
