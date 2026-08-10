@@ -500,8 +500,21 @@ def _inherit_recording_topics(
     session_factory: sessionmaker[Session], course_id: int, version: int
 ) -> None:
     """For every `media_sources` row of `course_id` with BOTH `material_id`
-    and `transcript_material_id` set, mirror the transcript material's
+    and `transcript_material_id` set, mirror the linked transcript(s)'
     `material_topics` rows at `version` onto the source material.
+
+    Grouped by source material FIRST (review fix): one source material can
+    be linked from SEVERAL `media_sources` rows sharing the same
+    `material_id` -- e.g. an HTML "Recordings" page material where
+    `media/detect.py`'s page-scan created one row per linked video, all
+    pointing `material_id` at that one page. `_inherit_one` below is given
+    every linked transcript for a source at once and does a SINGLE
+    delete-and-rewrite pass over their union -- running one pass per
+    (source, transcript) pair independently would have each later
+    transcript's pass wipe out the previous transcript's inherited rows,
+    leaving the source with only whichever link happened to be processed
+    last (and, with no ordering on the original per-row query, "last"
+    wasn't even deterministic).
 
     One session for the whole course (unlike `_classify_one`'s one-session-
     per-material fan-out above): this is pure DB work with no LLM call to
@@ -512,44 +525,78 @@ def _inherit_recording_topics(
     with session_factory() as session:
         links = list(
             session.execute(
-                select(MediaSource.material_id, MediaSource.transcript_material_id).where(
+                select(MediaSource.material_id, MediaSource.transcript_material_id)
+                .where(
                     MediaSource.course_id == course_id,
                     MediaSource.material_id.is_not(None),
                     MediaSource.transcript_material_id.is_not(None),
                 )
+                # Deterministic grouping order -- not load-bearing for
+                # correctness (the union/tie-break below doesn't depend on
+                # it), but keeps behavior reproducible run to run.
+                .order_by(MediaSource.material_id, MediaSource.transcript_material_id, MediaSource.id)
             ).all()
         )
+        by_source: dict[int, list[int]] = {}
         for source_material_id, transcript_material_id in links:
-            _inherit_one(session, source_material_id, transcript_material_id, version)
+            by_source.setdefault(source_material_id, []).append(transcript_material_id)
+
+        for source_material_id, transcript_material_ids in by_source.items():
+            _inherit_one(session, source_material_id, transcript_material_ids, version)
         session.commit()
 
 
 def _inherit_one(
-    session: Session, source_material_id: int, transcript_material_id: int, version: int
+    session: Session, source_material_id: int, transcript_material_ids: list[int], version: int
 ) -> None:
-    """Mirror `transcript_material_id`'s `material_topics` rows at `version`
-    onto `source_material_id`, same version.
+    """Mirror the UNION of `transcript_material_ids`' `material_topics` rows
+    at `version` onto `source_material_id`, same version, in a single
+    delete-and-rewrite pass.
+
+    When more than one linked transcript assigns the SAME topic, the
+    highest-confidence row wins -- mirrors `taxonomy_apply.py`'s
+    `_carry_over_assignments` tie-break exactly (`> `, not `>=`); a tie
+    keeps whichever is seen first, which the `order_by` below (by
+    transcript material id, then topic id, then row id) makes deterministic
+    across re-runs regardless of dict/query iteration order.
 
     Idempotent by delete-and-rewrite: every existing `method='inherited'`
-    row for `source_material_id` at `version` is dropped and rewritten fresh
-    from the transcript's CURRENT assignments, rather than a per-row upsert
-    -- simpler, and correct even when the transcript's own topics changed
-    since the last run (a stale inherited row for a topic the transcript no
-    longer carries must not survive a re-run). Non-inherited rows (`'llm'`
-    from the source's own thin-pseudo-doc classification, or `'user'` from a
-    manual edit) are never touched or shadowed -- inheritance only fills
-    topics the source lacks.
+    row for `source_material_id` at `version` is dropped and rewritten
+    fresh from the transcripts' CURRENT assignments, rather than a per-row
+    upsert -- simpler, and correct even when a linked transcript's own
+    topics changed since the last run (a stale inherited row for a topic no
+    linked transcript carries anymore must not survive a re-run).
+    Non-inherited rows (`'llm'` from the source's own thin-pseudo-doc
+    classification, or `'user'` from a manual edit) are never touched or
+    shadowed -- inheritance only fills topics the source lacks.
+
+    If NONE of the linked transcripts have rows at `version` yet, this is a
+    no-op that leaves any existing inherited rows exactly as they are --
+    deliberately: "never classified at this version" and "classified but
+    matched zero topics" are indistinguishable from here (a transcript that
+    matched nothing simply has no `material_topics` rows, same as one never
+    classified), and wiping the source's last-known-good inherited rows on
+    every transient zero-topic reclassification would be worse than
+    leaving them briefly stale.
     """
     transcript_rows = list(
         session.execute(
-            select(MaterialTopic).where(
-                MaterialTopic.material_id == transcript_material_id,
+            select(MaterialTopic)
+            .where(
+                MaterialTopic.material_id.in_(transcript_material_ids),
                 MaterialTopic.taxonomy_version == version,
             )
+            .order_by(MaterialTopic.material_id, MaterialTopic.topic_id, MaterialTopic.id)
         ).scalars().all()
     )
     if not transcript_rows:
-        return  # transcript isn't classified at this version (yet) -- nothing to mirror
+        return  # no linked transcript is classified at this version (yet) -- nothing to mirror
+
+    best: dict[int, MaterialTopic] = {}
+    for row in transcript_rows:
+        existing = best.get(row.topic_id)
+        if existing is None or (row.confidence or 0.0) > (existing.confidence or 0.0):
+            best[row.topic_id] = row
 
     direct_topic_ids = set(
         session.execute(
@@ -570,13 +617,13 @@ def _inherit_one(
     )
 
     wrote_any = False
-    for row in transcript_rows:
-        if row.topic_id in direct_topic_ids:
+    for topic_id, row in best.items():
+        if topic_id in direct_topic_ids:
             continue  # a direct assignment on the source wins; never shadowed
         session.add(
             MaterialTopic(
                 material_id=source_material_id,
-                topic_id=row.topic_id,
+                topic_id=topic_id,
                 taxonomy_version=version,
                 confidence=row.confidence,
                 rationale="inherited from the lecture transcript",

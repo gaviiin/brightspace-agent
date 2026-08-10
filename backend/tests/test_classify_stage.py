@@ -917,6 +917,82 @@ def test_inheritance_rerun_is_idempotent_no_duplicate_rows(session_factory, back
     assert {row.confidence for row in second} == {row.confidence for row in first}
 
 
+def test_one_source_material_linked_to_two_transcripts_gets_the_union_at_highest_confidence(
+    session_factory, course_id
+):
+    """Review fix: a source material can be linked from SEVERAL
+    media_sources rows sharing the same material_id -- e.g. an HTML
+    "Recordings" page material where detect.py's page-scan created one row
+    per linked video, all pointing material_id at that one page. Each
+    linked transcript's assignments must be UNIONED onto the source in one
+    pass, not applied one transcript at a time (which would have each
+    later transcript's delete-and-rewrite wipe out the previous one's
+    inherited rows -- and with no deterministic ordering, "which transcript
+    wins" wasn't even reproducible)."""
+    topic_ids = _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    source_id = _add_material(
+        session_factory, course_id, title="Recordings Page", kind="link", status="fetched",
+    )
+    transcript_a_id = _add_material(
+        session_factory, course_id, title="Video 1 (transcript)", kind="transcript",
+    )
+    transcript_b_id = _add_material(
+        session_factory, course_id, title="Video 2 (transcript)", kind="transcript",
+    )
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=transcript_a_id,
+        url="https://zoom.us/rec/share/video1",
+    )
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=transcript_b_id,
+        url="https://zoom.us/rec/share/video2",
+    )
+
+    def _result(user):
+        # Transcript A: a topic it shares with B (at a LOWER confidence --
+        # B's must win) plus one it alone carries.
+        if "Video 1 (transcript)" in user:
+            return ClassificationOut(
+                assignments=[
+                    TopicAssignment(topic_slug="arrays-and-lists", confidence=0.6, rationale="video 1: arrays"),
+                    TopicAssignment(topic_slug="graph-algorithms", confidence=0.7, rationale="video 1: graphs"),
+                ]
+            )
+        # Transcript B: the shared topic at a HIGHER confidence, plus one
+        # it alone carries.
+        if "Video 2 (transcript)" in user:
+            return ClassificationOut(
+                assignments=[
+                    TopicAssignment(topic_slug="arrays-and-lists", confidence=0.9, rationale="video 2: arrays"),
+                    TopicAssignment(topic_slug="sorting-algorithms", confidence=0.5, rationale="video 2: sorting"),
+                ]
+            )
+        raise AssertionError(f"unexpected prompt: {user[:200]}")
+
+    stub = _StubBackend(_result)
+
+    _run(session_factory, stub, course_id)
+
+    source_rows = _rows(session_factory, material_id=source_id)
+    by_topic = {row.topic_id: row for row in source_rows}
+    assert set(by_topic) == {
+        topic_ids["arrays-and-lists"], topic_ids["graph-algorithms"], topic_ids["sorting-algorithms"],
+    }  # the union of both transcripts' topics
+    assert all(row.method == "inherited" for row in source_rows)
+    # The overlapping topic keeps the HIGHER of the two transcripts' confidences.
+    assert by_topic[topic_ids["arrays-and-lists"]].confidence == pytest.approx(0.9)
+    assert by_topic[topic_ids["graph-algorithms"]].confidence == pytest.approx(0.7)
+    assert by_topic[topic_ids["sorting-algorithms"]].confidence == pytest.approx(0.5)
+
+    # Deterministic across re-runs: same union, same winning confidence,
+    # still no duplicates.
+    _run(session_factory, stub, course_id)
+    rerun_rows = _rows(session_factory, material_id=source_id)
+    assert len(rerun_rows) == 3
+    rerun_by_topic = {row.topic_id: row.confidence for row in rerun_rows}
+    assert rerun_by_topic == {topic_id: row.confidence for topic_id, row in by_topic.items()}
+
+
 def test_media_source_with_null_material_id_or_null_transcript_material_id_is_a_noop(
     session_factory, backend, course_id
 ):
