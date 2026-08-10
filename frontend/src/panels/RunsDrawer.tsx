@@ -9,6 +9,7 @@ const STAGE_LABELS: Record<string, string> = {
   classify: "Classify",
   assemble: "Assemble",
   enrich: "Enrich",
+  media: "Process recordings",
 };
 
 function formatUsd(amount: number): string {
@@ -26,14 +27,20 @@ function formatWhen(iso: string): string {
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString();
 }
 
-function StatusBadge({ status }: { status: string }) {
-  const tone =
-    status === "complete"
+/** Exported so other status-badge users (RecordingsDrawer's media statuses,
+ * a six-value set that doesn't fit this complete/running/error 3-way
+ * default) can supply their own color via `tone` instead of duplicating the
+ * badge's shape. Omitting `tone` keeps this component's original behavior
+ * verbatim. */
+export function StatusBadge({ status, tone }: { status: string; tone?: string }) {
+  const resolvedTone =
+    tone ??
+    (status === "complete"
       ? "bg-green-100 text-green-700 dark:bg-green-950 dark:text-green-300"
       : status === "running"
         ? "bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-300"
-        : "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300";
-  return <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs ${tone}`}>{status}</span>;
+        : "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300");
+  return <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs ${resolvedTone}`}>{status}</span>;
 }
 
 function SyncRunRow({ run }: { run: SyncRunSummary }) {

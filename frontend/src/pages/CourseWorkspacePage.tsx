@@ -15,6 +15,7 @@ import type { BsaEvent, DryRunResponse, TaxonomyApplyResponse } from "../api/typ
 import { GraphView } from "../graph/GraphView";
 import { DetailPanel } from "../panels/DetailPanel";
 import { OutlinePanel } from "../panels/OutlinePanel";
+import { RecordingsDrawer } from "../panels/RecordingsDrawer";
 import { RunsDrawer } from "../panels/RunsDrawer";
 import { TaxonomyEditor } from "../panels/TaxonomyEditor";
 import { useUiStore } from "../state/uiStore";
@@ -25,6 +26,14 @@ import { useUiStore } from "../state/uiStore";
  * through, so the read models must be refreshed for all of these -- not just
  * the happy one. */
 const ENRICHMENT_TERMINAL_STATUSES = new Set(["complete", "aborted", "failed"]);
+
+/** Every status a media run can END on (runner.py's `_MediaRunHooks.
+ * on_finish` / `reconcile_orphaned_rows`; per-source statuses like
+ * "fetching"/"done" always carry `sourceId` and never reach this set). A
+ * finished batch may have ingested new transcript materials, so -- like a
+ * finished pipeline run -- the graph/course read models need refreshing
+ * too, not just the media list. */
+const MEDIA_RUN_TERMINAL_STATUSES = new Set(["complete", "failed"]);
 
 export function CourseWorkspacePage() {
   const { courseId: courseIdParam } = useParams<{ courseId: string }>();
@@ -40,6 +49,7 @@ export function CourseWorkspacePage() {
   const [confirmDryRun, setConfirmDryRun] = useState(false);
   const [taxonomyEditorOpen, setTaxonomyEditorOpen] = useState(false);
   const [runsOpen, setRunsOpen] = useState(false);
+  const [recordingsOpen, setRecordingsOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
   const courseQuery = useQuery({
@@ -148,6 +158,21 @@ export function CourseWorkspacePage() {
           queryClient.invalidateQueries({ queryKey: ["topic-enrichment"] });
         }
       }
+      // M2.5: a media event always refreshes the Recordings drawer's own
+      // list (a source-level status change like 'fetching'/'done', or the
+      // run-level 'run-started' that flips `active`); a run-level terminal
+      // status also refreshes the graph/course (new transcript materials
+      // change material counts) and pipeline-status (mirrors the pipeline/
+      // enrichment branches above -- `active` is shared across all three
+      // run kinds, so a finished media run un-disables the same buttons).
+      if (event.type === "media" && event.courseId === courseId) {
+        queryClient.invalidateQueries({ queryKey: ["media", courseId] });
+        if (event.sourceId === undefined && MEDIA_RUN_TERMINAL_STATUSES.has(event.status)) {
+          queryClient.invalidateQueries({ queryKey: ["pipeline-status", courseId] });
+          queryClient.invalidateQueries({ queryKey: ["graph", courseId] });
+          queryClient.invalidateQueries({ queryKey: ["course", courseId] });
+        }
+      }
     });
     return () => source.close();
   }, [courseId, courseIdValid, queryClient]);
@@ -213,6 +238,14 @@ export function CourseWorkspacePage() {
           className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800"
         >
           Runs
+        </button>
+        <button
+          type="button"
+          disabled={!courseIdValid}
+          onClick={() => setRecordingsOpen(true)}
+          className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800"
+        >
+          Recordings
         </button>
         <button
           type="button"
@@ -282,6 +315,10 @@ export function CourseWorkspacePage() {
       )}
 
       {runsOpen && <RunsDrawer courseId={courseId} onClose={() => setRunsOpen(false)} />}
+
+      {recordingsOpen && (
+        <RecordingsDrawer courseId={courseId} onClose={() => setRecordingsOpen(false)} />
+      )}
 
       {taxonomyEditorOpen && graphQuery.data && (
         <TaxonomyEditor

@@ -157,4 +157,27 @@ describe("RunsDrawer", () => {
 
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+
+  it("labels a 'media' stage pipeline run as 'Process recordings' (M2.5)", async () => {
+    mockedGetRuns.mockResolvedValue({
+      syncRuns: [],
+      pipelineRuns: [
+        {
+          id: 9,
+          stage: "media",
+          status: "complete",
+          startedAt: "2026-08-06T23:06:00+00:00",
+          finishedAt: "2026-08-06T23:07:00+00:00",
+          inputTokens: 0,
+          outputTokens: 0,
+          estCostUsd: 0,
+          error: null,
+        },
+      ],
+    });
+
+    renderDrawer();
+
+    expect(await screen.findByText("Process recordings")).toBeTruthy();
+  });
 });

@@ -12,6 +12,11 @@ import type {
   EnrichmentStatus,
   GraphPayload,
   MaterialDetail,
+  MediaDetectResponse,
+  MediaListResponse,
+  MediaRunResponse,
+  MediaSourceSummary,
+  MediaSourceUpdateRequest,
   PipelineRunResponse,
   PipelineStatusResponse,
   RunsResponse,
@@ -154,6 +159,46 @@ export function setEnrichmentStatus(resourceId: number, status: EnrichmentStatus
  * browser+CORS rules as other GETs and doesn't need the CSRF header. */
 export function enrichDryRun(courseId: number): Promise<EnrichDryRunResponse> {
   return request<EnrichDryRunResponse>(`/api/courses/${courseId}/enrich/dry-run`);
+}
+
+// ---------------------------------------------------------------------------
+// Media (api/media.py) -- M2.5
+// ---------------------------------------------------------------------------
+
+export function getMedia(courseId: number): Promise<MediaListResponse> {
+  return request<MediaListResponse>(`/api/courses/${courseId}/media`);
+}
+
+export function detectMedia(courseId: number): Promise<MediaDetectResponse> {
+  return request<MediaDetectResponse>(`/api/courses/${courseId}/media/detect`, {
+    method: "POST",
+    headers: CSRF_HEADERS,
+  });
+}
+
+export function processMedia(courseId: number): Promise<MediaRunResponse> {
+  return request<MediaRunResponse>(`/api/courses/${courseId}/media/process`, {
+    method: "POST",
+    headers: CSRF_HEADERS,
+  });
+}
+
+export function processMediaSource(sourceId: number): Promise<MediaRunResponse> {
+  return request<MediaRunResponse>(`/api/media/${sourceId}/process`, {
+    method: "POST",
+    headers: CSRF_HEADERS,
+  });
+}
+
+export function updateMediaSource(
+  sourceId: number,
+  body: MediaSourceUpdateRequest,
+): Promise<MediaSourceSummary> {
+  return request<MediaSourceSummary>(`/api/media/${sourceId}`, {
+    method: "PUT",
+    headers: { ...CSRF_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 /** Subscribe to the backend's SSE event stream. Returns the EventSource so
