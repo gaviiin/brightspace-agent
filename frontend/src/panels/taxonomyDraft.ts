@@ -10,7 +10,7 @@
 // operation addresses a topic by `key`, and `toRequest` resolves `key`s back
 // into array indexes only at the very end, exactly once.
 import type { GraphPayload, TaxonomyEditRequest, TopicEdgeRelation } from "../api/types";
-import { UNSORTED_TOPIC_ID } from "../api/types";
+import { ADMIN_TOPIC_ID, UNSORTED_TOPIC_ID } from "../api/types";
 
 export type EdgeRelation = TopicEdgeRelation;
 
@@ -64,12 +64,18 @@ function edgeTriple(fromId: number, toId: number, relation: string): string {
 // ---------------------------------------------------------------------------
 
 /** Builds an editable draft from a course's current graph. The synthetic
- * "Unsorted" topic (id 0, see graph/build.py) is never editable and is
- * dropped here, along with any edge that happens to touch it (it never has
- * one in practice, but dropping defensively costs nothing). */
+ * "Unsorted" topic (id 0) and "Logistics & admin" topic (id -1, M3.5a --
+ * see graph/build.py) are never editable and are dropped here, along with
+ * any edge that happens to touch either one (neither has one in practice,
+ * but dropping defensively costs nothing). Missing either id here means it
+ * flows into `toRequest`'s PUT body, which `taxonomy_apply.py` rejects as
+ * an unknown topic id -- the whole editor 422s for any course that has so
+ * much as one material in that bucket. */
 export function initDraft(payload: GraphPayload): Draft {
+  const isSynthetic = (id: number) => id === UNSORTED_TOPIC_ID || id === ADMIN_TOPIC_ID;
+
   const realTopics = [...payload.topics]
-    .filter((topic) => topic.id !== UNSORTED_TOPIC_ID)
+    .filter((topic) => !isSynthetic(topic.id))
     .sort((a, b) => a.orderIndex - b.orderIndex);
 
   const topics: DraftTopic[] = realTopics.map((topic) => ({
@@ -84,7 +90,7 @@ export function initDraft(payload: GraphPayload): Draft {
 
   const keyById = new Map(topics.map((topic) => [topic.id as number, topic.key]));
   const realEdges = payload.topicEdges.filter(
-    (edge) => edge.fromTopicId !== UNSORTED_TOPIC_ID && edge.toTopicId !== UNSORTED_TOPIC_ID,
+    (edge) => !isSynthetic(edge.fromTopicId) && !isSynthetic(edge.toTopicId),
   );
   const edges: DraftEdge[] = realEdges
     .map((edge, index) => ({

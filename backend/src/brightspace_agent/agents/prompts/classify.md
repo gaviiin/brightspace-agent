@@ -10,12 +10,20 @@ Return the topics this material **substantively teaches or practices**, each wit
 ## Choosing topics
 
 - Assign **1 to 3** topics. Most materials belong to one or two; three is for a material that genuinely spans that many. Never assign more than three.
-- Judge by the summary, not the title. "Homework 5" tells you nothing; the summary saying it asks students to implement Dijkstra's algorithm tells you everything. A title that names a topic the summary never covers is not evidence.
+- Judge by the summary, not the title, whenever the summary actually has something to judge. "Homework 5" tells you nothing; the summary saying it asks students to implement Dijkstra's algorithm tells you everything. A title that names a topic the summary never covers is not evidence — for a material with a real, substantive summary. (See "Thin summaries" below for when the summary itself has nothing to offer.)
 - Assign a topic only if the material would actually help a student studying it. A passing mention of a term, a one-line recap, or a prerequisite reminder is not coverage.
 - If two topics both look right, prefer the one whose description matches the material's specifics; add the second only if the material really does teach both.
 - A review sheet, practice exam, or cheat sheet that spans much of the course: pick the two or three topics it actually emphasizes, or return none if its coverage is uniformly thin.
 - Position in the topic list means nothing. It is course order, not relevance order.
 - Use the slugs **exactly** as written in the topic list. Never invent a slug, never modify one, never assign a topic that is not in the list.
+
+## Thin summaries: when the title becomes evidence
+
+Some materials genuinely have nothing to judge from — a dropbox assignment whose instructions field was left blank, a link the extractor could only describe from its title and URL, anything upstream could only produce a metadata-only guess for. When the summary is thin (roughly under 40 words that actually say something, not counting boilerplate like "no further text available") or generic enough that it could describe almost any material in the course, the "judge by the summary, not the title" rule does not apply — there is no real summary to judge by.
+
+In that narrow case, the title and key terms become legitimate evidence. A title that plainly names one of the course's own topics (e.g. "Assignment 5: Databases + Basic SQL" against a topic list that includes a databases/SQL topic) may be filed on that basis, but only at **moderate confidence** (0.4–0.6 — see Confidence below): you are inferring from a label, not from verified coverage, so never file a thin-summary, title-only match at 0.85+.
+
+This exception is narrow and does not relax anything else: it exists only because discarding a title that plainly names the course's own vocabulary, purely because the pipeline couldn't extract more text, throws away real signal for no reason. A title that names something the topic list does NOT contain is still not evidence of anything. And the instant the summary says something substantive, this section stops applying — go back to judging by the summary, not the title.
 
 ## Confidence
 
