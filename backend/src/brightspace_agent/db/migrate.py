@@ -2,7 +2,10 @@
 
 `schema.sql` is the DDL source of truth for the current schema; it is applied
 as migration 1. Future schema changes should be appended to MIGRATIONS as
-additional (version, sql) entries rather than editing schema.sql in place.
+additional (version, sql) entries rather than editing schema.sql in place --
+with a version strictly greater than the last one, which
+`check_migration_versions` enforces at import (see its docstring for the
+stacked-branch hazard that guards against).
 """
 
 from importlib import resources
@@ -155,6 +158,38 @@ MIGRATIONS: list[tuple[int, str]] = [
     (5, _MATERIALS_IS_ADMINISTRATIVE_COLUMN),
     (6, _MATERIAL_TOPICS_METHOD_INHERITED),
 ]
+
+
+def check_migration_versions(migrations: list[tuple[int, str]]) -> None:
+    """Raise unless `migrations`' versions are unique and strictly increasing.
+
+    Called at import (below) on MIGRATIONS itself, so a bad list is a loud
+    failure the first time anything touches the database rather than a
+    subtle one at runtime.
+
+    The hazard is stacked branches, and it is not hypothetical: two branches
+    developed in parallel each append "the next" migration, both pick
+    version 5, and the merge produces a list with 5 twice. `migrate()` skips
+    every entry whose version is `<= current_version`, so on a database that
+    reaches 5 the second entry is silently skipped forever -- its column
+    never exists, and the failure surfaces far away as an
+    OperationalError("no such column") at startup on developer machines that
+    happened to migrate in the wrong order. A non-increasing version has the
+    same shape. Cheap to check, and there is no valid reason to write one.
+
+    A raise rather than `assert`: `python -O` strips assertions, and this is
+    a data-integrity guard, not a debugging aid.
+    """
+    versions = [version for version, _sql in migrations]
+    for previous, current in zip(versions, versions[1:], strict=False):
+        if current <= previous:
+            raise ValueError(
+                f"MIGRATIONS versions must be unique and strictly increasing; "
+                f"found {previous} followed by {current} in {versions}"
+            )
+
+
+check_migration_versions(MIGRATIONS)
 
 
 def migrate(connection: Connection) -> None:

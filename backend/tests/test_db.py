@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
-from brightspace_agent.db.migrate import MIGRATIONS, migrate
+from brightspace_agent.db.migrate import MIGRATIONS, check_migration_versions, migrate
 from brightspace_agent.db.models import Course, EnrichmentResource, Material, MediaSource, Module, Topic
 from brightspace_agent.db.session import init_db
 
@@ -66,6 +66,24 @@ def test_migrate_called_twice_is_a_noop(db_path):
 
     assert first_version == MIGRATIONS[-1][0]
     assert second_version == first_version
+
+
+def test_duplicate_or_decreasing_migration_versions_raise(db_path):
+    """The stacked-branch hazard `check_migration_versions` exists for: two
+    branches each append "the next" migration, both pick the same number,
+    and the merged list carries it twice. `migrate()` skips anything
+    `<= current_version`, so the second entry would never run on a database
+    that already reached that version -- surfacing much later as a missing
+    column at startup."""
+    del db_path  # this guard is pure list validation; no database involved
+
+    check_migration_versions(MIGRATIONS)  # the real list is well-formed
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        check_migration_versions([(1, "SELECT 1;"), (2, "SELECT 1;"), (2, "SELECT 1;")])
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        check_migration_versions([(1, "SELECT 1;"), (3, "SELECT 1;"), (2, "SELECT 1;")])
 
 
 def test_foreign_key_enforced_bogus_course_id_raises(db_path):
@@ -621,6 +639,109 @@ def test_migration_6_adds_inherited_to_material_topics_method_check(db_path, tmp
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
         after2 = conn.execute(f"SELECT {columns} FROM material_topics ORDER BY id").fetchall()
         assert after2 == before_second_migrate
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Migrations 5 and 6 in ONE migrate() call. The tests above each start from
+# the version immediately before their own migration, so neither exercises
+# what an actual M3.5 upgrade does: a v4 database (the last shipped version)
+# taking an ADD COLUMN on `materials` and a full table rebuild of
+# `material_topics` back to back, with real rows in both. Migration 6's
+# rebuild copies `material_topics` by explicit column list while migration 5
+# has just altered a different table -- a combination only a combined run
+# can get wrong.
+# --------------------------------------------------------------------------
+
+
+def test_migrations_5_and_6_apply_together_on_a_v4_database_with_data(db_path, tmp_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        for version, sql in MIGRATIONS[:4]:
+            conn.executescript(f"BEGIN;\n{sql}\nPRAGMA user_version = {version};\nCOMMIT;\n")
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert "is_administrative" not in _table_columns(conn, "materials")
+
+        # Rows in BOTH affected tables: two materials, and a material_topics
+        # row per pre-existing method value (one with both nullable columns
+        # NULL), so the byte-identical checks below cover every column of
+        # the rebuilt table.
+        conn.executescript(
+            """
+            INSERT INTO courses (d2l_org_unit_id, tenant_origin, name)
+                VALUES (1, 'school.d2l.com', 'Intro to CS');
+            INSERT INTO materials (course_id, title, kind, status)
+                VALUES (1, 'Office Hours Moved', 'announcement', 'summarized');
+            INSERT INTO materials (course_id, title, kind, status)
+                VALUES (1, 'Lecture 1', 'slides', 'summarized');
+            INSERT INTO topics (course_id, taxonomy_version, slug, name)
+                VALUES (1, 1, 'arrays', 'Arrays');
+            INSERT INTO topics (course_id, taxonomy_version, slug, name)
+                VALUES (1, 1, 'sorting', 'Sorting');
+            INSERT INTO material_topics (material_id, topic_id, taxonomy_version, confidence, rationale, method, review_status)
+                VALUES (2, 1, 1, 0.9, 'model said so', 'llm', 'auto');
+            INSERT INTO material_topics (material_id, topic_id, taxonomy_version, confidence, rationale, method, review_status)
+                VALUES (2, 2, 1, NULL, NULL, 'user', 'confirmed');
+            """
+        )
+
+        material_columns = "id, course_id, title, kind, status"
+        topic_columns = (
+            "id, material_id, topic_id, taxonomy_version, confidence, rationale, method, review_status"
+        )
+        materials_before = conn.execute(
+            f"SELECT {material_columns} FROM materials ORDER BY id"
+        ).fetchall()
+        topics_before = conn.execute(f"SELECT {topic_columns} FROM material_topics ORDER BY id").fetchall()
+        assert len(materials_before) == 2 and len(topics_before) == 2  # preconditions really held
+
+        migrate(conn)  # ONE call, applying 5 and 6 back to back
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert MIGRATIONS[-1][0] == 6  # nothing newer has been appended without updating this test
+
+        # Migration 5's change is present...
+        assert "is_administrative" in _table_columns(conn, "materials")
+        assert conn.execute("SELECT id, is_administrative FROM materials ORDER BY id").fetchall() == [
+            (1, 0), (2, 0),
+        ]
+        # ...and migration 6's, on a table migration 5 never touched.
+        conn.execute(
+            "INSERT INTO material_topics (material_id, topic_id, taxonomy_version, confidence, rationale, method, review_status) "
+            "VALUES (2, 1, 2, 0.9, 'inherited from the lecture transcript', 'inherited', 'auto')"
+        )
+        conn.commit()
+
+        # Every pre-existing row in both tables survives byte-identical.
+        assert conn.execute(f"SELECT {material_columns} FROM materials ORDER BY id").fetchall() == materials_before
+        assert conn.execute(
+            f"SELECT {topic_columns} FROM material_topics WHERE taxonomy_version = 1 ORDER BY id"
+        ).fetchall() == topics_before
+
+        # Both tables match what a fresh database gets.
+        fresh_path = tmp_path / "fresh.db"
+        init_db(fresh_path)
+        fresh_conn = sqlite3.connect(fresh_path)
+        try:
+            assert _table_columns(conn, "materials") == _table_columns(fresh_conn, "materials")
+            assert _table_columns(conn, "material_topics") == _table_columns(fresh_conn, "material_topics")
+        finally:
+            fresh_conn.close()
+
+        # A second migrate() is a no-op: version and data both unchanged.
+        materials_before_second = conn.execute(
+            "SELECT id, title, is_administrative FROM materials ORDER BY id"
+        ).fetchall()
+        topics_before_second = conn.execute(f"SELECT {topic_columns} FROM material_topics ORDER BY id").fetchall()
+        migrate(conn)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute(
+            "SELECT id, title, is_administrative FROM materials ORDER BY id"
+        ).fetchall() == materials_before_second
+        assert conn.execute(
+            f"SELECT {topic_columns} FROM material_topics ORDER BY id"
+        ).fetchall() == topics_before_second
     finally:
         conn.close()
 
