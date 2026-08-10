@@ -70,7 +70,9 @@ class MediaSource(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     course_id: Mapped[int] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"))
-    material_id: Mapped[int] = mapped_column(ForeignKey("materials.id", ondelete="CASCADE"))
+    # Nullable as of M2.6a: a manually-added URL/channel row (api/media.py's
+    # POST .../media/add) has no backing `materials` row.
+    material_id: Mapped[int | None] = mapped_column(ForeignKey("materials.id", ondelete="CASCADE"))
     platform: Mapped[str]
     url: Mapped[str]
     passcode: Mapped[str | None]

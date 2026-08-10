@@ -53,10 +53,17 @@ CREATE UNIQUE INDEX ux_materials_course_topic ON materials(course_id, d2l_topic_
 -- to done/failed/skipped and point transcript_material_id at the transcript
 -- they produce. IF NOT EXISTS: also reapplied as migration 3 for databases
 -- that predate this table (see migrate.py).
+--
+-- M2.6a: `material_id` is nullable -- a manually-added URL/channel entry
+-- (api/media.py's POST .../media/add) has no backing `materials` row (the
+-- whole point: it's for a recording the sync couldn't see in the first
+-- place, e.g. one sitting behind an LTI-embedded channel). Databases that
+-- predate this are brought up to it by migration 4, a table rebuild (SQLite
+-- can't drop a NOT NULL constraint in place).
 CREATE TABLE IF NOT EXISTS media_sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-    material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+    material_id INTEGER REFERENCES materials(id) ON DELETE CASCADE,
     platform TEXT NOT NULL CHECK(platform IN ('mediasite','zoom','gdrive')),
     url TEXT NOT NULL,
     passcode TEXT,

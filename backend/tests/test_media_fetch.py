@@ -11,6 +11,7 @@ downloading anything.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -18,6 +19,7 @@ import pytest
 
 from brightspace_agent.config import Settings
 from brightspace_agent.media.fetch import (
+    ExpandedEntry,
     FetchResult,
     FetchSpec,
     MediaFetchError,
@@ -83,6 +85,13 @@ def _ok(stderr: str = "", write: list[tuple[Path, bytes]] | None = None):
 def _fail(stderr: str):
     def react(argv, kwargs):
         return subprocess.CompletedProcess(argv, returncode=1, stdout="", stderr=stderr)
+
+    return react
+
+
+def _ok_json(stdout: str):
+    def react(argv, kwargs):
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=stdout, stderr="")
 
     return react
 
@@ -453,6 +462,115 @@ def test_which_returns_none_raises_not_installed(dest_dir, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# expand() -- M2.6a channel/catalog expansion. `yt-dlp -J --flat-playlist
+# --no-warnings <url>`, parsed from stdout JSON; no dest_dir/download
+# involved, so these specs use a throwaway dest_dir the fake `run` never
+# writes into.
+# --------------------------------------------------------------------------
+
+
+def test_expand_playlist_json_yields_one_entry_per_element(dest_dir):
+    playlist_json = json.dumps(
+        {
+            "_type": "playlist",
+            "entries": [
+                {"url": "https://mediasite.example.edu/Mediasite/Play/one", "title": "Lecture 1"},
+                {"webpage_url": "https://mediasite.example.edu/Mediasite/Play/two", "title": "Lecture 2"},
+            ],
+        }
+    )
+    fake_run = _FakeRun(_ok_json(playlist_json))
+    fetcher = YtDlpFetcher(Settings(), run=fake_run)
+
+    entries = fetcher.expand("https://mediasite.example.edu/Mediasite/Catalog/full/abc")
+
+    assert entries == [
+        ExpandedEntry(url="https://mediasite.example.edu/Mediasite/Play/one", title="Lecture 1"),
+        ExpandedEntry(url="https://mediasite.example.edu/Mediasite/Play/two", title="Lecture 2"),
+    ]
+    argv, kwargs = fake_run.calls[0]
+    assert argv[0] == "/usr/bin/yt-dlp"
+    assert "-J" in argv
+    assert "--flat-playlist" in argv
+    assert "--no-warnings" in argv
+    assert "https://mediasite.example.edu/Mediasite/Catalog/full/abc" in argv
+    assert "--cookies-from-browser" in argv and "chrome" in argv
+    assert kwargs.get("capture_output") is True
+    assert kwargs.get("text") is True
+    assert kwargs.get("timeout") == Settings().media_fetch_timeout_s
+
+
+def test_expand_single_video_json_yields_one_entry(dest_dir):
+    single_json = json.dumps({"_type": "video", "webpage_url": "https://zoom.us/rec/share/abc", "title": "Week 1"})
+    fake_run = _FakeRun(_ok_json(single_json))
+    fetcher = YtDlpFetcher(Settings(), run=fake_run)
+
+    entries = fetcher.expand("https://zoom.us/rec/share/abc")
+
+    assert entries == [ExpandedEntry(url="https://zoom.us/rec/share/abc", title="Week 1")]
+
+
+def test_expand_single_video_json_without_webpage_url_falls_back_to_input(dest_dir):
+    single_json = json.dumps({"title": "Week 1"})  # no _type, no webpage_url
+    fake_run = _FakeRun(_ok_json(single_json))
+    fetcher = YtDlpFetcher(Settings(), run=fake_run)
+
+    entries = fetcher.expand("https://zoom.us/rec/share/abc")
+
+    assert entries == [ExpandedEntry(url="https://zoom.us/rec/share/abc", title="Week 1")]
+
+
+def test_expand_playlist_entries_missing_or_relative_urls_are_skipped(dest_dir):
+    playlist_json = json.dumps(
+        {
+            "_type": "playlist",
+            "entries": [
+                {"url": "https://mediasite.example.edu/Mediasite/Play/kept", "title": "Kept"},
+                {"title": "No url or webpage_url at all"},
+                {"url": "/relative/path/not/absolute", "title": "Relative url"},
+                {"webpage_url": "not-a-url-either", "title": "Garbage webpage_url"},
+            ],
+        }
+    )
+    fake_run = _FakeRun(_ok_json(playlist_json))
+    fetcher = YtDlpFetcher(Settings(), run=fake_run)
+
+    entries = fetcher.expand("https://mediasite.example.edu/Mediasite/Catalog/full/abc")
+
+    assert entries == [ExpandedEntry(url="https://mediasite.example.edu/Mediasite/Play/kept", title="Kept")]
+
+
+def test_expand_empty_playlist_yields_empty_list(dest_dir):
+    playlist_json = json.dumps({"_type": "playlist", "entries": []})
+    fake_run = _FakeRun(_ok_json(playlist_json))
+    fetcher = YtDlpFetcher(Settings(), run=fake_run)
+
+    assert fetcher.expand("https://mediasite.example.edu/Mediasite/Catalog/full/empty") == []
+
+
+def test_expand_nonzero_exit_maps_error(dest_dir):
+    fake_run = _FakeRun(_fail("ERROR: Please sign in to access this recording; login required"))
+    fetcher = YtDlpFetcher(Settings(), run=fake_run)
+
+    with pytest.raises(MediaFetchError) as exc_info:
+        fetcher.expand("https://zoom.us/rec/share/abc")
+
+    assert exc_info.value.kind == "auth_expired"
+
+
+def test_expand_which_returns_none_raises_not_installed(dest_dir, monkeypatch):
+    monkeypatch.setattr("brightspace_agent.media.fetch.shutil.which", lambda name: None)
+    fake_run = _FakeRun()  # must never be called
+    fetcher = YtDlpFetcher(Settings(), run=fake_run)
+
+    with pytest.raises(MediaFetchError) as exc_info:
+        fetcher.expand("https://zoom.us/rec/share/abc")
+
+    assert exc_info.value.kind == "not_installed"
+    assert fake_run.calls == []
+
+
+# --------------------------------------------------------------------------
 # MockMediaFetcher
 # --------------------------------------------------------------------------
 
@@ -498,6 +616,39 @@ def test_mock_fetcher_otherwise_writes_placeholder_audio(dest_dir):
     assert result.kind == "audio"
     assert result.path == dest_dir / "audio.m4a"
     assert result.path.read_bytes()  # a few bytes, non-empty
+
+
+def test_mock_fetcher_expand_channel_url_yields_three_mediasite_entries():
+    fetcher = MockMediaFetcher()
+
+    entries = fetcher.expand("https://mock.mediasite.example/mock-channel/abc")
+
+    assert len(entries) == 3
+    urls = [entry.url for entry in entries]
+    assert urls == [
+        "https://mock.mediasite.example/Mediasite/Play/one",
+        "https://mock.mediasite.example/Mediasite/Play/two",
+        "https://mock.mediasite.example/Mediasite/Play/three",
+    ]
+    assert len(set(urls)) == 3  # distinct URLs -- dedup-by-url on the API side has something to dedup against
+    assert all(entry.title for entry in entries)  # each entry carries a (non-empty) title
+
+
+def test_mock_fetcher_expand_fail_url_raises_matching_kind():
+    fetcher = MockMediaFetcher()
+
+    with pytest.raises(MediaFetchError) as exc_info:
+        fetcher.expand("https://zoom.us/rec/share/mock-fail-auth_expired")
+
+    assert exc_info.value.kind == "auth_expired"
+
+
+def test_mock_fetcher_expand_otherwise_echoes_the_url():
+    fetcher = MockMediaFetcher()
+
+    entries = fetcher.expand("https://mediasite.example.edu/Mediasite/Play/xyz")
+
+    assert entries == [ExpandedEntry(url="https://mediasite.example.edu/Mediasite/Play/xyz", title=None)]
 
 
 # --------------------------------------------------------------------------

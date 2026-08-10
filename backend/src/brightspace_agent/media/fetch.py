@@ -24,6 +24,7 @@ Two things worth knowing before touching `YtDlpFetcher`:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
@@ -64,6 +65,19 @@ class FetchResult:
     path: Path  # the .vtt file (captions) or audio file
 
 
+@dataclass(frozen=True)
+class ExpandedEntry:
+    """One row `expand()` wants added to `media_sources` -- M2.6a manual
+    URL add. `url` is the entry's own page URL (not necessarily the input
+    `url` -- a channel/catalog page expands into one entry per lecture);
+    `title`, when known, is a hint for a manually-added row's display name
+    (there is no backing `materials` row to read a title from -- see
+    `ingest_transcript`'s NULL-source-material fallback)."""
+
+    url: str
+    title: str | None
+
+
 class MediaFetchError(Exception):
     """kind in: 'not_installed' | 'auth_expired' | 'wrong_passcode' |
     'downloads_disabled' | 'not_found' | 'extractor_error'. `user_message`
@@ -78,6 +92,8 @@ class MediaFetchError(Exception):
 
 class MediaFetcher(Protocol):
     def fetch(self, spec: FetchSpec) -> FetchResult: ...
+
+    def expand(self, url: str) -> list[ExpandedEntry]: ...
 
 
 # --------------------------------------------------------------------------
@@ -112,6 +128,43 @@ class YtDlpFetcher:
                 return captions
 
         return self._fetch_audio(binary, spec)
+
+    # -- channel/catalog expansion (M2.6a) -----------------------------------
+
+    def expand(self, url: str) -> list[ExpandedEntry]:
+        """`yt-dlp -J --flat-playlist --no-warnings <url>`: a flat (no
+        per-entry network round-trip) JSON dump of either one video or a
+        playlist/channel/catalog's entries. No `dest_dir`/download involved
+        -- this only inspects what's *there*, unlike `fetch`."""
+        binary = shutil.which("yt-dlp")
+        if binary is None:
+            raise MediaFetchError(
+                "not_installed",
+                "yt-dlp is not installed. Run `uv sync --group media` to install it, then try again.",
+            )
+
+        # A throwaway spec purely to reuse `_run_yt_dlp`/`_map_error`'s
+        # timeout handling and error mapping -- `platform`/`passcode` don't
+        # apply pre-classification (that happens after expansion, in
+        # api/media.py), and `dest_dir` is never read by either method.
+        spec = FetchSpec(platform="unknown", url=url, passcode=None, dest_dir=Path())
+        argv = [binary, "-J", "--flat-playlist", "--no-warnings", url, *self._cookie_args()]
+        result = self._run_yt_dlp(argv, spec)
+        if result.returncode != 0:
+            raise self._map_error(spec, result.stderr or "")
+
+        data = json.loads(result.stdout)
+        if data.get("_type") == "playlist":
+            entries: list[ExpandedEntry] = []
+            for entry in data.get("entries") or []:
+                entry_url = _first_absolute_http_url(entry.get("url"), entry.get("webpage_url"))
+                if entry_url is None:
+                    continue
+                entries.append(ExpandedEntry(url=entry_url, title=entry.get("title")))
+            return entries
+
+        single_url = data.get("webpage_url") or url
+        return [ExpandedEntry(url=single_url, title=data.get("title"))]
 
     # -- phase 1: captions ------------------------------------------------
 
@@ -277,6 +330,20 @@ def _redacted(url: str) -> str:
     return urlunsplit((scheme, netloc, path, "", ""))
 
 
+def _first_absolute_http_url(*candidates: str | None) -> str | None:
+    """First of `candidates` that's an absolute http(s) URL, else None --
+    `expand`'s playlist entries carry both `url` and `webpage_url`, and only
+    one (or neither) of the two is reliably a real page URL depending on the
+    extractor."""
+    for candidate in candidates:
+        if not candidate:
+            continue
+        parsed = urlsplit(candidate)
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            return candidate
+    return None
+
+
 def _pick_caption(vtt_files: list[Path]) -> Path:
     """Preference order: filename containing "transcript", else "cc", else
     ".en", else the first file in sorted order. `vtt_files` is expected
@@ -325,6 +392,23 @@ class MockMediaFetcher:
         path = spec.dest_dir / "audio.m4a"
         path.write_bytes(b"mock-audio")
         return FetchResult(kind="audio", path=path)
+
+    def expand(self, url: str) -> list[ExpandedEntry]:
+        if "mock-channel" in url:
+            return [
+                ExpandedEntry(
+                    url=f"https://mock.mediasite.example/Mediasite/Play/{word}",
+                    title=f"Mock Lecture {word.capitalize()}",
+                )
+                for word in ("one", "two", "three")
+            ]
+
+        marker_at = url.find(_MOCK_FAIL_MARKER)
+        if marker_at != -1:
+            kind = url[marker_at + len(_MOCK_FAIL_MARKER) :]
+            raise MediaFetchError(kind, f"mock {kind}")
+
+        return [ExpandedEntry(url=url, title=None)]
 
 
 # --------------------------------------------------------------------------
