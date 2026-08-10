@@ -487,6 +487,33 @@ def _check_transcript_reached_the_graph(graph: dict, media: dict) -> None:
         _assert(material["kind"] == "transcript", "transcript material has the wrong kind", material)
 
 
+def _check_link_material_flows_to_summarized_and_classified(graph: dict) -> None:
+    """M3.5a regression: a link-kind material (toc_sample's TOPIC-1003, "the
+    fake tenant already has link topics") has no sha256/blob at all, so
+    before the metadata pseudo-document pass existed it sat at
+    status='fetched' forever -- never entering S1's worklist, therefore
+    never reaching S3, therefore always landing in Unsorted with no
+    confidence. It must now flow all the way to 'summarized' and get a real
+    classification like any other material.
+    """
+    links = [m for m in graph["materials"] if m["kind"] == "link"]
+    _assert(links, "expected at least one kind='link' material in the graph", graph["materials"])
+
+    for link in links:
+        _assert(
+            link["status"] == "summarized",
+            f"link material {link['id']!r} ({link['title']!r}) never reached 'summarized' "
+            f"(status={link['status']!r}) -- the metadata pseudo-document pass didn't pick it up",
+            link,
+        )
+        _assert(
+            link["maxConfidence"] is not None,
+            f"link material {link['id']!r} ({link['title']!r}) has no classification "
+            "(maxConfidence is null) -- it never made it into S3's worklist",
+            link,
+        )
+
+
 def _check_graph_invariants(graph: dict, course: dict) -> None:
     real_topics = [t for t in graph["topics"] if t["id"] != 0]
     _assert(len(real_topics) >= 3, f"expected >= 3 non-Unsorted topics, got {len(real_topics)}", real_topics)
@@ -576,6 +603,7 @@ async def run_main_scenario() -> None:
                 course_detail1 = await _get_course(backend, course_id)
                 _check_graph_invariants(graph1, course_detail1)
                 _check_transcript_reached_the_graph(graph1, media)
+                _check_link_material_flows_to_summarized_and_classified(graph1)
                 print(f"[e2e] media OK: {len(media['sources'])} recording(s) transcribed and in the graph")
                 print(
                     f"[e2e] first run OK: {len(graph1['topics'])} topics, "

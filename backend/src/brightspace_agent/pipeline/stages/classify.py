@@ -21,6 +21,17 @@ Two things worth knowing:
   Since `material.sha256` is content-addressed and therefore shared across
   courses, the digest is also what stops two courses that happen to hold the
   same file from reading each other's answers.
+
+M3.5a: the model also returns `is_administrative` per material (grades,
+scheduling, office hours, logistics -- never course content). A material the
+model marks administrative gets the flag written and NO `material_topics`
+rows, regardless of what `assignments` it also returned -- S4 (graph/build.py)
+files it under its own "Logistics & admin" bucket instead of a real topic or
+Unsorted. The flag isn't versioned by taxonomy (materials.is_administrative is
+a single column), but it's re-derived every time this stage actually
+processes the material -- which, since an administrative material never gets
+material_topics rows, is every run until reclassified into real content (see
+`_select_worklist`).
 """
 
 from __future__ import annotations
@@ -53,7 +64,7 @@ from brightspace_agent.pipeline.stats import StageStats
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "s3.v1"
+PROMPT_VERSION = "s3.v2"  # M3.5a: adds is_administrative to the output schema
 _STAGE = "classify"
 _TIER: Tier = "fast"
 _MAX_ASSIGNMENTS = 3  # classify.md asks for 1-3; this is what enforces it
@@ -264,24 +275,43 @@ def _classify_one(
             else:
                 stats.cached_hits += 1
 
-            assignments = _validate(classification, context, material_id)
-            for topic_id, confidence, rationale in assignments:
-                session.add(
-                    MaterialTopic(
-                        material_id=material_id,
-                        topic_id=topic_id,
-                        taxonomy_version=context.version,
-                        confidence=confidence,
-                        rationale=rationale,
-                        method="llm",
-                        review_status="auto",
+            # M3.5a: administrative materials (grades, scheduling, office
+            # hours, logistics) get the flag and NO material_topics rows --
+            # S4 files them under their own bucket instead of a real topic
+            # or Unsorted. `material.is_administrative` is always written
+            # explicitly (both branches), not just when true, so a material
+            # that used to be administrative and is re-classified as real
+            # content has its stale flag cleared right here, the same run
+            # that gives it real assignments.
+            if classification.is_administrative:
+                material.is_administrative = 1
+                assignments: list[tuple[int, float, str]] = []
+            else:
+                material.is_administrative = 0
+                assignments = _validate(classification, context, material_id)
+                for topic_id, confidence, rationale in assignments:
+                    session.add(
+                        MaterialTopic(
+                            material_id=material_id,
+                            topic_id=topic_id,
+                            taxonomy_version=context.version,
+                            confidence=confidence,
+                            rationale=rationale,
+                            method="llm",
+                            review_status="auto",
+                        )
                     )
-                )
             session.commit()
 
         if assignments:
             stats.classified += 1
             stats.assignments += len(assignments)
+        elif classification.is_administrative:
+            stats.unassigned += 1
+            logger.info(
+                "classify: material %s is administrative; filed in the logistics/admin bucket",
+                material_id,
+            )
         else:
             stats.unassigned += 1
             logger.info(

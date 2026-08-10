@@ -83,10 +83,18 @@ class TopicAssignment(BaseModel):
 
 
 class ClassificationOut(BaseModel):
-    """S3 classify-stage output for one material. An empty list is a valid
-    answer -- the material is then filed as unsorted by S4."""
+    """S3 classify-stage output for one material. An empty `assignments` list
+    is a valid answer -- the material is then filed as unsorted by S4, unless
+    `is_administrative` is true, in which case S4 files it under its own
+    "Logistics & admin" bucket instead. `is_administrative` and real
+    `assignments` are mutually exclusive in practice (classify.py drops any
+    assignments the model returns alongside `is_administrative=True`), but
+    both are on the wire so a validation error on one never masks the other."""
 
     assignments: list[TopicAssignment] = Field(default_factory=list)  # 1-3 typical
+    # M3.5a: grades, scheduling, office hours, logistics, course mechanics --
+    # never a material about course CONTENT. See prompts/classify.md.
+    is_administrative: bool = False
 
 
 # --------------------------------------------------------------------------

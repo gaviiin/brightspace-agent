@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import select
 
 from brightspace_agent.agents.llm import MockBackend
-from brightspace_agent.db.models import Course, LlmCache, Material
+from brightspace_agent.db.models import Course, LlmCache, Material, Module
 from brightspace_agent.db.session import init_db
 from brightspace_agent.ingest.store import BlobStore
 from brightspace_agent.pipeline.stages.summarize import PROMPT_VERSION, run_summarize_stage
@@ -92,9 +92,11 @@ class _CountingBackend:
     def __init__(self, inner) -> None:
         self._inner = inner
         self.calls = 0
+        self.prompts: list[str] = []
 
     def structured_call(self, schema, *, system, user, tier):
         self.calls += 1
+        self.prompts.append(user)
         return self._inner.structured_call(schema, system=system, user=user, tier=tier)
 
     def model_for_tier(self, tier):
@@ -317,6 +319,168 @@ def test_poisoned_cache_row_is_treated_as_a_miss_and_replaced(
         rows = list(session.execute(select(LlmCache).where(LlmCache.stage == "summarize")).scalars().all())
     assert len(rows) == 1  # replaced in place, not duplicated
     assert json.loads(rows[0].output_json)["key_terms"]  # and it's usable again
+
+
+# --------------------------------------------------------------------------
+# Pass 3 (M3.5a): metadata pseudo-document for text-less materials
+# --------------------------------------------------------------------------
+
+
+def _add_module(session_factory, course_id, *, title, d2l_module_id=1) -> int:
+    with session_factory() as session:
+        module = Module(course_id=course_id, d2l_module_id=d2l_module_id, title=title)
+        session.add(module)
+        session.commit()
+        return module.id
+
+
+def test_metadata_pass_summarizes_a_fetched_link_with_no_sha(session_factory, blob_store, course_id):
+    module_id = _add_module(session_factory, course_id, title="Week 1 -- Intro")
+    counting = _CountingBackend(MockBackend())
+    material_id = _add_material(
+        session_factory, course_id,
+        kind="link", title="Case #2: The Weather Channel (Big Data)",
+        source_url="https://example.edu/big-data-case", module_id=module_id, status="fetched",
+    )
+
+    stats = _run_stage(session_factory, blob_store, counting, course_id)
+
+    material = _get_material(session_factory, material_id)
+    assert material.status == "summarized"
+    assert material.summary
+    # Never set to the pseudo-doc hash -- see _promote_metadata_one's
+    # docstring for why (compute_needed's re-fetch retry signal).
+    assert material.sha256 is None
+    meta = json.loads(material.summary_meta_json)
+    assert meta["prompt_version"] == PROMPT_VERSION
+    assert isinstance(meta["key_terms"], list)
+
+    assert counting.calls == 1
+    assert "Title: Case #2: The Weather Channel (Big Data)" in counting.prompts[0]
+    assert "Kind: link" in counting.prompts[0]
+    assert "Module: Week 1 -- Intro" in counting.prompts[0]
+    assert "URL: https://example.edu/big-data-case" in counting.prompts[0]
+
+    with session_factory() as session:
+        cache_row = session.execute(
+            select(LlmCache).where(LlmCache.stage == "summarize", LlmCache.prompt_version == PROMPT_VERSION)
+        ).scalar_one()
+    assert cache_row.sha256 != ""  # keyed on the pseudo-doc's own hash, not material.sha256 (which is None)
+
+    assert stats.summarized == 1
+    assert stats.extracted == 0  # nothing was extracted -- there was no file to extract
+    assert stats.cached_hits == 0  # first run, nothing cached yet
+
+
+def test_metadata_pass_no_module_or_url_renders_as_none(session_factory, blob_store, course_id):
+    counting = _CountingBackend(MockBackend())
+    _add_material(
+        session_factory, course_id,
+        kind="other", title="Untitled Stub", status="fetched",
+    )
+
+    _run_stage(session_factory, blob_store, counting, course_id)
+
+    assert "Module: (none)" in counting.prompts[0]
+    assert "URL: (none)" in counting.prompts[0]
+
+
+def test_metadata_pass_second_identical_material_is_a_cache_hit(session_factory, blob_store, course_id):
+    counting = _CountingBackend(MockBackend())
+    module_id = _add_module(session_factory, course_id, title="Week 2")
+    _add_material(
+        session_factory, course_id,
+        kind="link", title="Recommended Reading: Big-O Notation",
+        source_url="https://en.wikipedia.org/wiki/Big_O_notation", module_id=module_id, status="fetched",
+    )
+
+    first_stats = _run_stage(session_factory, blob_store, counting, course_id)
+    assert first_stats.summarized == 1
+    assert counting.calls == 1
+
+    with session_factory() as session:
+        cache_rows_after_first = list(
+            session.execute(select(LlmCache).where(LlmCache.stage == "summarize")).scalars().all()
+        )
+    assert len(cache_rows_after_first) == 1
+
+    # A second material with the exact same title/kind/module/url -- same
+    # pseudo-document, same cache key, even though it's a distinct material
+    # row (own id, own sha256=None).
+    mirror_id = _add_material(
+        session_factory, course_id,
+        kind="link", title="Recommended Reading: Big-O Notation",
+        source_url="https://en.wikipedia.org/wiki/Big_O_notation", module_id=module_id, status="fetched",
+    )
+
+    second_stats = _run_stage(session_factory, blob_store, counting, course_id)
+
+    assert counting.calls == 1  # the cache hit never reached the backend
+    assert second_stats.cached_hits == 1
+    with session_factory() as session:
+        cache_rows_after_second = list(
+            session.execute(select(LlmCache).where(LlmCache.stage == "summarize")).scalars().all()
+        )
+    assert len(cache_rows_after_second) == 1  # no duplicate row from the cache hit
+
+    mirror = _get_material(session_factory, mirror_id)
+    assert mirror.status == "summarized"
+    assert mirror.summary  # populated from the cache, not a fresh call
+
+
+def test_metadata_pseudo_doc_cache_key_changes_when_title_changes(session_factory, blob_store, course_id):
+    counting = _CountingBackend(MockBackend())
+    _add_material(
+        session_factory, course_id, kind="link", title="Reading A",
+        source_url="https://example.edu/a", status="fetched",
+    )
+    _add_material(
+        session_factory, course_id, kind="link", title="Reading B",  # only the title differs
+        source_url="https://example.edu/a", status="fetched",
+    )
+
+    _run_stage(session_factory, blob_store, counting, course_id)
+
+    assert counting.calls == 2  # two distinct pseudo-docs, two distinct cache misses
+    with session_factory() as session:
+        shas = {
+            row.sha256
+            for row in session.execute(select(LlmCache).where(LlmCache.stage == "summarize")).scalars()
+        }
+    assert len(shas) == 2  # different titles -> different pseudo-doc hashes -> different cache keys
+
+
+def test_metadata_pass_ignores_kinds_outside_the_allowlist(session_factory, blob_store, course_id):
+    """A 'document'/'slides'/etc. material stuck at 'fetched' with no
+    sha256 is a genuine gap (an upload that never completed), not something
+    pass 3 should paper over with a title-only guess."""
+    counting = _CountingBackend(MockBackend())
+    material_id = _add_material(
+        session_factory, course_id, kind="document", title="Never Uploaded", status="fetched",
+    )
+
+    stats = _run_stage(session_factory, blob_store, counting, course_id)
+
+    assert counting.calls == 0
+    assert stats.summarized == 0
+    material = _get_material(session_factory, material_id)
+    assert material.status == "fetched"  # untouched, left for a real upload to fix
+
+
+@pytest.mark.parametrize("kind", ["link", "assignment", "announcement", "other"])
+def test_metadata_pass_covers_every_allowlisted_kind(session_factory, blob_store, course_id, kind):
+    counting = _CountingBackend(MockBackend())
+    material_id = _add_material(
+        session_factory, course_id, kind=kind, title=f"A {kind} with no content", status="fetched",
+    )
+
+    stats = _run_stage(session_factory, blob_store, counting, course_id)
+
+    assert counting.calls == 1
+    assert stats.summarized == 1
+    material = _get_material(session_factory, material_id)
+    assert material.status == "summarized"
+    assert material.summary
 
 
 # --------------------------------------------------------------------------

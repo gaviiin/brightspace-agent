@@ -98,11 +98,28 @@ _MEDIA_SOURCES_MATERIAL_ID_NULLABLE = (
     "ALTER TABLE media_sources_new RENAME TO media_sources;"
 )
 
+# Migration 5 (M3.5a) adds materials.is_administrative: a flag S3's classify
+# stage sets for grades/scheduling/office-hours/logistics materials, so S4
+# can file them under their own "Logistics & admin" bucket instead of
+# Unsorted. Deliberately NOT also added to schema.sql's `CREATE TABLE
+# materials` (unlike migrations 2-4's "also in schema.sql" pairing):
+# `ALTER TABLE ... ADD COLUMN` has no `IF NOT EXISTS` form in SQLite, so a
+# fresh database -- which starts at user_version 0 and therefore runs EVERY
+# migration in one `migrate()` call, schema.sql (migration 1) included --
+# would hit "duplicate column name" the moment this ran if schema.sql had
+# already created the column. Keeping it exclusively in this migration
+# (which fresh databases run just like any upgraded one) is what keeps a
+# single, crash-free code path for both.
+_MATERIALS_IS_ADMINISTRATIVE_COLUMN = (
+    "ALTER TABLE materials ADD COLUMN is_administrative INTEGER NOT NULL DEFAULT 0;"
+)
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _SCHEMA_SQL),
     (2, _ENRICHMENT_UNIQUE_INDEX),
     (3, _MEDIA_SOURCES_TABLE),
     (4, _MEDIA_SOURCES_MATERIAL_ID_NULLABLE),
+    (5, _MATERIALS_IS_ADMINISTRATIVE_COLUMN),
 ]
 
 

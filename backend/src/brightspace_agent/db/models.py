@@ -62,6 +62,12 @@ class Material(Base):
     summary_meta_json: Mapped[str | None]
     status: Mapped[str] = mapped_column(server_default=text("'fetched'"))
     error: Mapped[str | None]
+    # M3.5a (migration 5): grades/scheduling/office-hours/logistics, never
+    # course content. S3 sets this and writes no material_topics rows when
+    # true; S4 files it under the synthetic "Logistics & admin" bucket
+    # instead of Unsorted. Plain int (not bool) to mirror every other
+    # SQLite-boolean column in this file (e.g. EnrichmentResource.shared).
+    is_administrative: Mapped[int] = mapped_column(server_default=text("0"))
 
 
 class MediaSource(Base):

@@ -10,6 +10,9 @@
 /** The synthetic "everything unfiled" topic id (see graph/build.py). */
 export const UNSORTED_TOPIC_ID = 0;
 
+/** The synthetic "Logistics & admin" topic id (M3.5a; see graph/build.py). */
+export const ADMIN_TOPIC_ID = -1;
+
 export type MaterialKind =
   | "syllabus"
   | "slides"
@@ -58,7 +61,10 @@ export interface GraphPayload {
   materials: GraphMaterial[];
   topicEdges: GraphEdge[];
   attachments: GraphAttachment[];
-  meta: { taxonomyVersion: number; orphanCount: number };
+  // `adminCount` (M3.5a) is optional here so existing fixtures/tests that
+  // predate it keep type-checking; the backend always sends it. UI wiring
+  // for the admin bucket itself is left to a later task.
+  meta: { taxonomyVersion: number; orphanCount: number; adminCount?: number };
 }
 
 // ---------------------------------------------------------------------------

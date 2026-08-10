@@ -2,7 +2,7 @@
 material and then produce a cached, structured LLM summary for every
 extracted material.
 
-Two passes (`run_summarize_stage`):
+Three passes (`run_summarize_stage`):
 
 1. Extract: `status='fetched'` + `sha256 NOT NULL` -> `extract_text` from the
    blob -> write a text sidecar -> `status='extracted'`. A `None` extraction
@@ -18,8 +18,13 @@ Two passes (`run_summarize_stage`):
    `status='extracted'` with a sidecar written, so they flow into this pass
    the same way as anything the extract pass just produced -- no special
    casing needed.
+3. Metadata pseudo-document (M3.5a): `status='fetched'` materials pass 1
+   never resolves -- no sha256 at all, most commonly a link -- get
+   summarized anyway, from a deterministic `Title:`/`Kind:`/`Module:`/`URL:`
+   string built from the row itself rather than extracted text. See
+   `_promote_metadata_one` for why this never touches `material.sha256`.
 
-Both passes fan out across `concurrency` workers (`asyncio.gather` +
+All three passes fan out across `concurrency` workers (`asyncio.gather` +
 `Semaphore`); each worker opens its own session, does its work, and commits,
 so no session is ever held open across an `await` (the backend call runs via
 `asyncio.to_thread`, since `LLMBackend` is a sync interface).
@@ -28,6 +33,7 @@ so no session is ever held open across an `await` (the backend call runs via
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import threading
@@ -42,17 +48,27 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from brightspace_agent.agents.llm import LLMBackend, LLMCallError, Tier, UsageInfo
 from brightspace_agent.agents.schemas import DocSummary
-from brightspace_agent.db.models import LlmCache, Material
+from brightspace_agent.db.models import LlmCache, Material, Module
 from brightspace_agent.ingest.extract import extract_text
 from brightspace_agent.ingest.store import BlobStore
 from brightspace_agent.pipeline.stats import StageStats
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "s1.v1"
+PROMPT_VERSION = "s1.v2"  # M3.5a: adds the metadata pseudo-document pass (3)
 _STAGE = "summarize"
 _TIER: Tier = "fast"
 _MAX_CHARS = 12000
+
+# M3.5a: kinds eligible for pass 3 (metadata pseudo-document). Every kind
+# that can legitimately have no extractable file text: a link has no blob at
+# all, and assignment/announcement/other cover extras or file-less stubs.
+# 'syllabus'/'slides'/'document'/'video'/'transcript' are deliberately
+# excluded -- those are expected to have real bytes, and a material of one
+# of those kinds still stuck at 'fetched' with no sha256 is a genuine gap
+# worth surfacing as failed/never-fetched, not papering over with a
+# title-only summary.
+_METADATA_KINDS = ("link", "assignment", "announcement", "other")
 
 _SYSTEM_PROMPT = (
     resources.files("brightspace_agent.agents.prompts").joinpath("summarize.md").read_text(encoding="utf-8")
@@ -117,6 +133,26 @@ async def run_summarize_stage(
             _summarize_one,
             session_factory,
             blob_store,
+            backend,
+            material_id,
+            stats,
+            progress,
+            cost_cap_usd,
+            cost_lock,
+        ),
+    )
+
+    # Pass 3 (M3.5a): materials pass 1 never touches -- no sha256 (links) or,
+    # defensively, a sha256 whose text sidecar is missing -- get a fair shot
+    # at classification via a metadata-only pseudo-document instead of
+    # sitting at 'fetched' forever. See `_promote_metadata_one`.
+    metadata_ids = _select_metadata_material_ids(session_factory, blob_store, course_id)
+    await _fan_out(
+        metadata_ids,
+        concurrency,
+        lambda material_id: asyncio.to_thread(
+            _promote_metadata_one,
+            session_factory,
             backend,
             material_id,
             stats,
@@ -273,36 +309,7 @@ def _summarize_one(
 
         doc_summary_data = parsed.model_dump()
         _apply_summary(material, doc_summary_data, model, usage)
-
-        # Upsert, for two reasons (same pair as classify.py's `_write_cache`):
-        #
-        # 1. Cache race: two workers summarizing materials with identical
-        #    bytes both miss the cache above and both call the LLM, so the
-        #    second write here reaches a sha256/stage/prompt_version/model
-        #    the first has already inserted. Without an upsert that's an
-        #    IntegrityError crashing the whole stage over a healthy
-        #    material. Both answers were computed from byte-identical input,
-        #    so either winning is fine.
-        # 2. A row `_read_cache` rejected as unusable has to be replaceable.
-        #    `do_nothing` would leave the bad row there forever, and the
-        #    stage would pay for a fresh call on every single run.
-        output_json = json.dumps(doc_summary_data)
-        created_at = _now_iso()
-        session.execute(
-            sqlite_insert(LlmCache)
-            .values(
-                sha256=sha256,
-                stage=_STAGE,
-                prompt_version=PROMPT_VERSION,
-                model=model,
-                output_json=output_json,
-                created_at=created_at,
-            )
-            .on_conflict_do_update(
-                index_elements=["sha256", "stage", "prompt_version", "model"],
-                set_={"output_json": output_json, "created_at": created_at},
-            )
-        )
+        _upsert_cache_row(session, sha256, model, doc_summary_data)
         stats.summarized += 1
         with cost_lock:
             stats.add_usage(usage)
@@ -310,6 +317,45 @@ def _summarize_one(
 
     if progress:
         progress(f"summarize:{material_id}")
+
+
+def _upsert_cache_row(session: Session, sha256: str, model: str, doc_summary_data: dict) -> None:
+    """Write (or replace) `sha256`'s llm_cache row for this stage.
+
+    Upsert, for two reasons (same pair as classify.py's `_write_cache`):
+
+    1. Cache race: two workers summarizing content with identical bytes (or,
+       for pass 3, an identical pseudo-document) both miss the cache and
+       both call the LLM, so the second write here reaches a
+       sha256/stage/prompt_version/model the first has already inserted.
+       Without an upsert that's an IntegrityError crashing the whole stage
+       over a healthy material. Both answers were computed from
+       byte-identical input, so either winning is fine.
+    2. A row `_read_cache` rejected as unusable has to be replaceable.
+       `do_nothing` would leave the bad row there forever, and the stage
+       would pay for a fresh call on every single run.
+
+    Shared by pass 2 (`_summarize_one`) and pass 3 (`_promote_metadata_one`)
+    -- both key `llm_cache` the same way, the only difference being what
+    `sha256` stands for (a real file's content hash vs. a pseudo-document's).
+    """
+    output_json = json.dumps(doc_summary_data)
+    created_at = _now_iso()
+    session.execute(
+        sqlite_insert(LlmCache)
+        .values(
+            sha256=sha256,
+            stage=_STAGE,
+            prompt_version=PROMPT_VERSION,
+            model=model,
+            output_json=output_json,
+            created_at=created_at,
+        )
+        .on_conflict_do_update(
+            index_elements=["sha256", "stage", "prompt_version", "model"],
+            set_={"output_json": output_json, "created_at": created_at},
+        )
+    )
 
 
 def _read_cache(session: Session, sha256: str, model: str) -> DocSummary | None:
@@ -368,3 +414,153 @@ def _apply_summary(material: Material, doc_summary_data: dict, model: str, usage
     )
     material.status = "summarized"
     material.error = None
+
+
+# --------------------------------------------------------------------------
+# Pass 3 (M3.5a): metadata pseudo-document for materials with no text
+# --------------------------------------------------------------------------
+
+
+def _select_metadata_material_ids(
+    session_factory: sessionmaker[Session], blob_store: BlobStore, course_id: int
+) -> list[int]:
+    """`status='fetched'`, kind in `_METADATA_KINDS`, and no usable text: no
+    sha256 at all (the common case -- a link never gets a blob), or,
+    defensively, a sha256 whose text sidecar is missing. By the time this
+    runs, pass 1 has already resolved every fetched+sha256 material in THIS
+    call to 'extracted' or 'failed', so the sidecar-missing half only ever
+    matters for a material left over from a prior partial run; checked here
+    anyway rather than assumed away.
+    """
+    with session_factory() as session:
+        rows = session.execute(
+            select(Material.id, Material.sha256).where(
+                Material.course_id == course_id,
+                Material.status == "fetched",
+                Material.kind.in_(_METADATA_KINDS),
+            )
+        ).all()
+    return [
+        material_id
+        for material_id, sha256 in rows
+        if not sha256 or blob_store.read_text(sha256) is None
+    ]
+
+
+def _build_pseudo_doc(material: Material, module_title: str | None) -> str:
+    """A deterministic stand-in for "the material's text", built entirely
+    from metadata already on the row (title/kind/module/URL) -- no blob, no
+    extraction. Deterministic in both directions: the exact same material
+    always renders the exact same string (stable cache key), and changing
+    any one field (a retitled link, a moved module) changes it too.
+    """
+    return (
+        f"Title: {material.title}\n"
+        f"Kind: {material.kind}\n"
+        f"Module: {module_title or '(none)'}\n"
+        f"URL: {material.source_url or '(none)'}"
+    )
+
+
+def _module_title(session: Session, module_id: int | None) -> str | None:
+    if module_id is None:
+        return None
+    module = session.get(Module, module_id)
+    return module.title if module is not None else None
+
+
+def _promote_metadata_one(
+    session_factory: sessionmaker[Session],
+    backend: LLMBackend,
+    material_id: int,
+    stats: StageStats,
+    progress: ProgressCallback | None,
+    cost_cap_usd: float | None,
+    cost_lock: threading.Lock,
+) -> None:
+    """Summarize one metadata-only material straight from 'fetched' to
+    'summarized' -- there is no 'extracted' step here, since there's no text
+    to extract. Otherwise a near-mirror of `_summarize_one`: same cache
+    read/write, same cost-cap check, same failure handling. The one real
+    difference is the cache key: with no file sha256 to key on, the
+    pseudo-document's own sha256 (`_build_pseudo_doc` -> hashed here) stands
+    in for it in the `llm_cache` row this writes/reads.
+
+    Deliberately leaves `material.sha256` itself as `None` -- it is NOT set
+    to the pseudo-doc hash. A material eligible for this pass can be kind
+    'other' from a real File-type ToC entry whose upload just hasn't
+    happened yet (a transient network error, a sync that's still catching
+    up): `ingest/diff.py`'s `compute_needed` treats `sha256 IS NULL` as "this
+    file is still needed" specifically so a failed/pending upload always
+    gets retried. Writing a pseudo-doc hash into that column would silence
+    that signal forever -- the real content would never be re-fetched, and
+    this metadata-only guess would masquerade as the finished article. When
+    real content DOES arrive later, `upsert_file_material`'s own
+    sha-changed check (`None` -> a real hash is always "changed") already
+    resets the material back through the normal pipeline with no help
+    needed from this stage. The cost: S3's classify-stage cache is skipped
+    for these materials (its own `if sha256:` guards already handle a `None`
+    sha256 as a plain cache miss, unconditionally caching nothing -- no new
+    code needed there either), which is the trade this stage makes for not
+    quietly breaking re-fetch.
+    """
+    with session_factory() as session:
+        material = session.get(Material, material_id)
+        if (
+            material is None
+            or material.status != "fetched"
+            or material.kind not in _METADATA_KINDS
+        ):
+            return  # raced, or no longer eligible
+
+        pseudo_doc = _build_pseudo_doc(material, _module_title(session, material.module_id))
+        pseudo_sha = hashlib.sha256(pseudo_doc.encode("utf-8")).hexdigest()
+        model = backend.model_for_tier(_TIER)
+
+        cached = _read_cache(session, pseudo_sha, model)
+
+        if cached is not None:
+            usage: UsageInfo = {"model": model, "input_tokens": 0, "output_tokens": 0, "est_cost_usd": 0.0}
+            _apply_summary(material, cached.model_dump(), model, usage)
+            stats.cached_hits += 1
+            stats.summarized += 1
+            session.commit()
+            if progress:
+                progress(f"summarize:cached:{material_id}")
+            return
+
+        # Cost cap: same optimistic-under-concurrency check as pass 2 (see
+        # run_summarize_stage's docstring) -- checked right before the only
+        # paid call here, so a cache hit above never trips it.
+        if cost_cap_usd is not None:
+            with cost_lock:
+                cap_reached = stats.usage_total["est_cost_usd"] >= cost_cap_usd
+            if cap_reached:
+                stats.aborted = True
+                if progress:
+                    progress(f"summarize:cost-cap:{material_id}")
+                return
+
+        try:
+            parsed, usage = backend.structured_call(
+                DocSummary, system=_SYSTEM_PROMPT, user=pseudo_doc, tier=_TIER
+            )
+        except LLMCallError as exc:
+            material.status = "failed"
+            material.error = f"llm-error: {exc}"
+            stats.failed += 1
+            session.commit()
+            if progress:
+                progress(f"summarize:failed:{material_id}")
+            return
+
+        doc_summary_data = parsed.model_dump()
+        _apply_summary(material, doc_summary_data, model, usage)
+        _upsert_cache_row(session, pseudo_sha, model, doc_summary_data)
+        stats.summarized += 1
+        with cost_lock:
+            stats.add_usage(usage)
+        session.commit()
+
+    if progress:
+        progress(f"summarize:{material_id}")

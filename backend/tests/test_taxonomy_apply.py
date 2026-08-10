@@ -91,9 +91,14 @@ def _seed_v1(session_factory, course_id, topics, edges=()):
         return ids
 
 
-def _add_material(session_factory, course_id, *, title="Material", status="summarized") -> int:
+def _add_material(
+    session_factory, course_id, *, title="Material", status="summarized", is_administrative=0
+) -> int:
     with session_factory() as session:
-        material = Material(course_id=course_id, kind="document", title=title, status=status)
+        material = Material(
+            course_id=course_id, kind="document", title=title, status=status,
+            is_administrative=is_administrative,
+        )
         session.add(material)
         session.commit()
         return material.id
@@ -242,6 +247,33 @@ def test_add_topic_is_structural_and_carries_old_assignments(session_factory, ru
     assert by_material[mat_a].topic_id == a2.id
     assert by_material[mat_a].confidence == 0.7
     assert mat_unassigned not in by_material  # stayed unassigned -> reclassify candidate
+
+
+def test_structural_edit_clears_the_administrative_flag(session_factory, runner, course_id):
+    """M3.5a: a structural taxonomy edit must not leave a stale
+    is_administrative=True showing in the graph's admin bucket while the
+    material waits for the classify run the edit just kicked off -- same
+    "unfiled pending reclassification" treatment a real topic assignment
+    gets when it isn't carried forward."""
+    ids = _seed_v1(session_factory, course_id, [("a", "A", "da"), ("b", "B", "db")])
+    admin_material = _add_material(session_factory, course_id, title="Final Grades", is_administrative=1)
+    # A real, classified material -- untouched by the flag reset, and its
+    # own is_administrative=0 stays exactly as it is.
+    real_material = _add_material(session_factory, course_id, title="On A")
+    _add_assignment(session_factory, real_material, ids["a"], 1, confidence=0.7)
+
+    topics = [
+        TopicEditIn(id=ids["a"], name="A", description="da"),
+        TopicEditIn(id=ids["b"], name="B", description="db"),
+        TopicEditIn(id=None, name="C", description="dc"),
+    ]
+
+    result = _apply(session_factory, runner, course_id, topics)
+
+    assert result.taxonomy_version == 2
+    with session_factory() as session:
+        assert session.get(Material, admin_material).is_administrative == 0
+        assert session.get(Material, real_material).is_administrative == 0
 
 
 # --------------------------------------------------------------------------

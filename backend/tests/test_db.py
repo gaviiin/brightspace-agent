@@ -173,12 +173,16 @@ def test_migration_2_dedups_duplicate_topic_url_rows_before_creating_unique_inde
     # without the unique index) that already has a duplicate (topic_id, url)
     # pair -- built from raw SQL, not schema.sql, since schema.sql (as of
     # M3.1) already creates the index for a fresh database and so can't be
-    # used to reproduce the pre-hardening scenario this test targets.
+    # used to reproduce the pre-hardening scenario this test targets. A bare
+    # `materials` stub is included too -- a REAL v1 database always has one
+    # (schema.sql creates it), and migration 5's ALTER TABLE needs it to
+    # exist when migrate() runs every later migration in this same call.
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(
             """
             BEGIN;
+            CREATE TABLE materials (id INTEGER PRIMARY KEY AUTOINCREMENT);
             CREATE TABLE enrichment_resources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 topic_id INTEGER NOT NULL,
@@ -249,11 +253,12 @@ def test_migration_3_adds_media_sources_to_a_v2_database(db_path, tmp_path):
         ).fetchone()
         assert exists is not None
         # migrate() always brings a database to the LATEST version, not just
-        # the next one -- from v2 that's migration 3 (adds the table) then
-        # migration 4 (M2.6a's material_id-nullable rebuild) in the same
-        # call, so the version lands on whatever's newest, not literally 3.
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
-        assert MIGRATIONS[-1][0] == 4  # nothing newer has been appended without updating this test
+        # the next one -- from v2 that's migration 3 (adds the table), then
+        # migration 4 (M2.6a's material_id-nullable rebuild), then migration
+        # 5 (M3.5a's materials.is_administrative column) in the same call,
+        # so the version lands on whatever's newest, not literally 3.
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert MIGRATIONS[-1][0] == 5  # nothing newer has been appended without updating this test
 
         # The migrated table must match what a fresh database gets from
         # schema.sql -- a migration that produces a differently-shaped table
@@ -281,7 +286,7 @@ def test_migration_3_adds_media_sources_to_a_v2_database(db_path, tmp_path):
 
         migrate(conn)
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         row = conn.execute("SELECT url, status FROM media_sources").fetchone()
         assert row == ("https://zoom.us/rec/share/abc", "detected")
     finally:
@@ -359,10 +364,10 @@ def test_migration_4_makes_media_sources_material_id_nullable(db_path, tmp_path)
         before = conn.execute(f"SELECT {columns} FROM media_sources ORDER BY id").fetchall()
         assert len(before) == 2  # the seeded precondition really held
 
-        migrate(conn)  # applies migration 4 on top of this v3 db
+        migrate(conn)  # applies migration 4, then migration 5, on top of this v3 db
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
-        assert MIGRATIONS[-1][0] == 4  # nothing newer has been appended without updating this test
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert MIGRATIONS[-1][0] == 5  # nothing newer has been appended without updating this test
 
         after = conn.execute(f"SELECT {columns} FROM media_sources ORDER BY id").fetchall()
         assert after == before  # every row, every column, survives byte-identical
@@ -404,8 +409,85 @@ def test_migration_4_makes_media_sources_material_id_nullable(db_path, tmp_path)
         # migration 3's test's own post-migration insert-then-remigrate).
         before_second_migrate = conn.execute(f"SELECT {columns} FROM media_sources ORDER BY id").fetchall()
         migrate(conn)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         after2 = conn.execute(f"SELECT {columns} FROM media_sources ORDER BY id").fetchall()
+        assert after2 == before_second_migrate
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# M3.5a's migration 5 (materials.is_administrative). Plain ADD COLUMN, not a
+# rebuild: hand-build a v4 database (materials has no is_administrative
+# column -- schema.sql never gains this column directly; see migrate.py's
+# comment on why) WITH data rows, and prove the column shows up with the
+# right default and every row survives untouched.
+# --------------------------------------------------------------------------
+
+
+def test_migration_5_adds_materials_is_administrative_column(db_path, tmp_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        # Build a v4 database the same way migrate() itself would have,
+        # applying migrations 1-4 only (not migrate(), which would also
+        # apply migration 5 and defeat the point of this test).
+        for version, sql in MIGRATIONS[:4]:
+            conn.executescript(f"BEGIN;\n{sql}\nPRAGMA user_version = {version};\nCOMMIT;\n")
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert "is_administrative" not in _table_columns(conn, "materials")
+
+        conn.executescript(
+            """
+            INSERT INTO courses (d2l_org_unit_id, tenant_origin, name)
+                VALUES (1, 'school.d2l.com', 'Intro to CS');
+            INSERT INTO materials (course_id, title, kind, status)
+                VALUES (1, 'Final Grades', 'announcement', 'summarized');
+            INSERT INTO materials (course_id, title, kind, status)
+                VALUES (1, 'Lecture 1', 'slides', 'summarized');
+            """
+        )
+        before = conn.execute("SELECT id, title FROM materials ORDER BY id").fetchall()
+        assert len(before) == 2  # the seeded precondition really held
+
+        migrate(conn)  # applies migration 5 on top of this v4 db
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert MIGRATIONS[-1][0] == 5  # nothing newer has been appended without updating this test
+
+        assert "is_administrative" in _table_columns(conn, "materials")
+        rows = conn.execute("SELECT id, is_administrative FROM materials ORDER BY id").fetchall()
+        assert rows == [(1, 0), (2, 0)]  # existing rows default to 0, not NULL
+
+        after = conn.execute("SELECT id, title FROM materials ORDER BY id").fetchall()
+        assert after == before  # every row survives, untouched
+
+        # The migrated table must match what a fresh database gets.
+        fresh_path = tmp_path / "fresh.db"
+        init_db(fresh_path)
+        fresh_conn = sqlite3.connect(fresh_path)
+        try:
+            assert _table_columns(conn, "materials") == _table_columns(fresh_conn, "materials")
+        finally:
+            fresh_conn.close()
+
+        # Usable: a new row can set it explicitly.
+        conn.execute(
+            "INSERT INTO materials (course_id, title, kind, status, is_administrative) "
+            "VALUES (1, 'Office Hours Moved', 'announcement', 'summarized', 1)"
+        )
+        conn.commit()
+        new_row = conn.execute(
+            "SELECT is_administrative FROM materials WHERE title = 'Office Hours Moved'"
+        ).fetchone()
+        assert new_row == (1,)
+
+        # A second migrate() is a no-op: version and data both unchanged.
+        before_second_migrate = conn.execute(
+            "SELECT id, title, is_administrative FROM materials ORDER BY id"
+        ).fetchall()
+        migrate(conn)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        after2 = conn.execute("SELECT id, title, is_administrative FROM materials ORDER BY id").fetchall()
         assert after2 == before_second_migrate
     finally:
         conn.close()

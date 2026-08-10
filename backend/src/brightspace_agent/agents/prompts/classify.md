@@ -5,7 +5,7 @@ You will be given:
 - `=== COURSE TOPICS ===` — the course's fixed topic list, numbered, as `slug — name — description`
 - `=== MATERIAL ===` — one material: its title, its kind, its key terms, and its summary
 
-Return the topics this material **substantively teaches or practices**, each with a confidence and a one-line rationale.
+Return the topics this material **substantively teaches or practices**, each with a confidence and a one-line rationale -- plus whether the material is administrative rather than course content at all (see below).
 
 ## Choosing topics
 
@@ -32,17 +32,24 @@ A material can be 0.95 on one topic and 0.45 on another. That is the normal shap
 
 One line, naming the concrete evidence from the summary: the concepts, techniques, or terms that put this material here. "Summary describes partitioning and pivot selection, the core of quicksort." Not "This is about sorting" and not a restatement of the topic description.
 
+## Administrative materials
+
+Some materials are not course content at all: grades, scheduling, office hours, logistics, course mechanics. Set `is_administrative: true` for these and leave `assignments` empty — they get filed in their own bucket, not under any topic.
+
+A material about course **content** is never administrative, no matter what it's titled. An announcement that carries real teaching content classifies normally: `is_administrative: false`, with topics assigned as usual. "Final grades are posted" is administrative; "HW7 covers shortest paths — start early" is not — it teaches something, so classify it on that.
+
+A syllabus or course-outline document spans everything and therefore teaches nothing in particular: `is_administrative: true`. Never spread it across every topic instead.
+
+Set `is_administrative: false` for everything else — including a material that legitimately fits no topic. An empty `assignments` list with `is_administrative: false` is still a common, correct answer; see below.
+
 ## When nothing fits
 
-Return an empty list of assignments. That is a correct answer, not a failure — the material is filed as unsorted and the student can place it themselves.
+Return an empty list of assignments. That is a correct answer, not a failure — the material is filed as unsorted (or, if it's administrative, in that bucket instead — see above) and the student can place it themselves.
 
-Return empty (or only the course's administrative topic, if the list has one) when:
+Return empty, with `is_administrative: false`, when:
 
-- the material is pure logistics: a due-date announcement, a grading policy, a room change, a broken link
 - the summary says the text was unreadable, empty, or garbled
-- the material is about the course rather than its content
-
-A syllabus or course-outline document spans everything and therefore teaches nothing in particular: file it under the administrative topic if the list has one, otherwise return empty. Never spread it across every topic.
+- the material is about the course rather than its content, but isn't administrative either (e.g. a promotional blurb)
 
 The topic list can also simply be missing what this material teaches. That is a real possibility and not a failure on your part — the student is shown unsorted materials and can extend the taxonomy. Returning nothing beats picking the least-wrong neighbour.
 

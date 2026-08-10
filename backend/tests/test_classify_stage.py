@@ -293,6 +293,117 @@ def test_empty_and_all_dropped_assignments_write_nothing(session_factory, course
 
 
 # --------------------------------------------------------------------------
+# (2b) M3.5a: administrative materials
+# --------------------------------------------------------------------------
+
+
+def test_administrative_material_gets_flag_and_no_topic_rows(session_factory, course_id):
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    material_id = _add_material(session_factory, course_id, title="Final Grades Posted")
+    # The model may (wrongly) also return assignments alongside
+    # is_administrative=True -- classify.py must drop them regardless.
+    stub = _StubBackend(
+        ClassificationOut(
+            assignments=[TopicAssignment(topic_slug="graph-algorithms", confidence=0.9, rationale="noise")],
+            is_administrative=True,
+        )
+    )
+
+    stats = _run(session_factory, stub, course_id)
+
+    assert _rows(session_factory, material_id=material_id) == []
+    with session_factory() as session:
+        assert session.get(Material, material_id).is_administrative == 1
+    assert stats.assignments == 0
+    assert stats.classified == 0
+    assert stats.unassigned == 1
+
+
+def test_non_administrative_material_classifies_as_before(session_factory, course_id):
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    material_id = _add_material(session_factory, course_id, title="Lecture 5 Quicksort")
+    stub = _StubBackend(
+        ClassificationOut(
+            assignments=[TopicAssignment(topic_slug="sorting-algorithms", confidence=0.9, rationale="quicksort")],
+            is_administrative=False,
+        )
+    )
+
+    stats = _run(session_factory, stub, course_id)
+
+    rows = _rows(session_factory, material_id=material_id)
+    assert len(rows) == 1
+    assert stats.classified == 1
+    with session_factory() as session:
+        assert session.get(Material, material_id).is_administrative == 0
+
+
+def test_reclassify_clears_then_rederives_the_administrative_flag(session_factory, course_id):
+    """A material re-synced with changed bytes must not keep a stale
+    administrative flag from its old content: reset_pipeline_progress clears
+    it immediately (same lifecycle as material_topics rows), and the next
+    classify run re-derives it fresh from the new content."""
+    from brightspace_agent.ingest import repo
+
+    _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    material_id = _add_material(session_factory, course_id, title="Office Hours Notice", sha256="a" * 64)
+    with session_factory() as session:
+        material = session.get(Material, material_id)
+        material.d2l_topic_id = 2001
+        session.commit()
+
+    admin_stub = _StubBackend(ClassificationOut(assignments=[], is_administrative=True))
+    _run(session_factory, admin_stub, course_id)
+
+    with session_factory() as session:
+        assert session.get(Material, material_id).is_administrative == 1
+
+    # Re-synced with genuinely different bytes -- reset_pipeline_progress
+    # runs, and must clear the stale flag right away, before any
+    # reclassification happens.
+    with session_factory() as session:
+        repo.upsert_file_material(
+            session,
+            course_id=course_id,
+            d2l_topic_id=2001,
+            sha256="b" * 64,
+            mime="text/plain",
+            size_bytes=42,
+            source_url="https://tenant.example/topics/office-hours",
+            title="Office Hours Notice",
+            d2l_updated_at="2026-03-01T00:00:00.000Z",
+        )
+        session.commit()
+
+    with session_factory() as session:
+        material = session.get(Material, material_id)
+        assert material.is_administrative == 0
+        assert material.status == "fetched"
+
+    # S1 would re-summarize the new bytes; simulate that directly so S3 gets
+    # its turn against genuinely different (non-administrative) content.
+    with session_factory() as session:
+        material = session.get(Material, material_id)
+        material.status = "summarized"
+        material.summary = "Covers dynamic array resizing and amortized cost."
+        session.commit()
+
+    content_stub = _StubBackend(
+        ClassificationOut(
+            assignments=[TopicAssignment(topic_slug="arrays-and-lists", confidence=0.8, rationale="resizing")],
+            is_administrative=False,
+        )
+    )
+    stats = _run(session_factory, content_stub, course_id)
+
+    rows = _rows(session_factory, material_id=material_id)
+    assert len(rows) == 1
+    assert stats.classified == 1
+    with session_factory() as session:
+        assert session.get(Material, material_id).is_administrative == 0
+
+
+# --------------------------------------------------------------------------
 # (3) + (4) Cache reuse and idempotent re-runs
 # --------------------------------------------------------------------------
 
