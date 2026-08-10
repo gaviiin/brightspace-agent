@@ -11,6 +11,7 @@ which is skipped unless the real `media` dependency group is installed.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -251,6 +252,120 @@ def test_parakeet_transcriber_engine_exception_raises_engine_error(monkeypatch, 
 
     assert exc_info.value.kind == "engine_error"
     assert "mlx blew up" in exc_info.value.user_message
+
+
+def test_parakeet_transcriber_unrenderable_timestamps_raise_engine_error(monkeypatch, dest_dir, tmp_path):
+    """A garbage timestamp out of the engine (NaN here) blows up in VTT
+    RENDERING, not in the engine call -- so it only maps to the documented
+    'engine_error' contract if rendering/writing is inside the same try.
+    Otherwise a bare ValueError escapes `transcribe()` and the runner
+    records the source as 'internal: ...' instead of a real engine error."""
+    import brightspace_agent.media.transcribe as transcribe_mod
+
+    fake_model = _FakeModel(result=_FakeResult([_FakeSentence(float("nan"), 1.0, "Unrenderable.")]))
+    fake_parakeet = _FakeParakeetModule(fake_model)
+    fake_ffmpeg = _FakeStaticFfmpegModule()
+    monkeypatch.setattr(
+        transcribe_mod, "_import_parakeet_deps", lambda: (fake_parakeet, fake_ffmpeg)
+    )
+
+    audio_path = tmp_path / "lecture.m4a"
+    audio_path.write_bytes(b"fake-audio")
+    transcriber = ParakeetTranscriber(Settings())
+
+    with pytest.raises(MediaTranscribeError) as exc_info:
+        transcriber.transcribe(audio_path, dest_dir)
+
+    assert exc_info.value.kind == "engine_error"
+
+
+def test_parakeet_transcriber_unwritable_dest_raises_engine_error(monkeypatch, tmp_path):
+    """Same contract for the write half: an OS-level failure putting the
+    .vtt on disk is still 'the transcription engine step failed', not an
+    unmapped exception."""
+    import brightspace_agent.media.transcribe as transcribe_mod
+
+    fake_model = _FakeModel(result=_FakeResult([_FakeSentence(0.0, 1.0, "Fine.")]))
+    monkeypatch.setattr(
+        transcribe_mod, "_import_parakeet_deps", lambda: (_FakeParakeetModule(fake_model), _FakeStaticFfmpegModule())
+    )
+
+    audio_path = tmp_path / "lecture.m4a"
+    audio_path.write_bytes(b"fake-audio")
+    missing_dest = tmp_path / "does" / "not" / "exist"  # never created
+    transcriber = ParakeetTranscriber(Settings())
+
+    with pytest.raises(MediaTranscribeError) as exc_info:
+        transcriber.transcribe(audio_path, missing_dest)
+
+    assert exc_info.value.kind == "engine_error"
+
+
+# --------------------------------------------------------------------------
+# Base install (`uv sync`, no `--group media`): importing the app must not
+# need parakeet_mlx/static_ffmpeg at all. Every other test in this file
+# monkeypatches `_import_parakeet_deps`, which would keep passing even if
+# someone hoisted those imports to module level -- this one wouldn't.
+# --------------------------------------------------------------------------
+
+_BASE_INSTALL_SCRIPT = '''
+import sys
+
+BLOCKED = ("parakeet_mlx", "static_ffmpeg")
+
+
+class _NotInstalled:
+    """A meta_path finder that makes the media group look absent even on a
+    machine where it is installed."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".")[0] in BLOCKED:
+            raise ImportError(f"simulated base install: no module named {fullname}")
+        return None
+
+
+for name in [n for n in sys.modules if n.split(".")[0] in BLOCKED]:
+    del sys.modules[name]
+sys.meta_path.insert(0, _NotInstalled())
+
+import brightspace_agent.main  # noqa: F401  -- the whole app's import graph
+from brightspace_agent.config import Settings
+from brightspace_agent.media.transcribe import MediaTranscribeError, ParakeetTranscriber
+
+leaked = sorted(n for n in sys.modules if n.split(".")[0] in BLOCKED)
+assert not leaked, f"media-group modules imported at module level: {leaked}"
+
+# ... and the seam still degrades to the documented, actionable error rather
+# than an ImportError traceback when the engine is genuinely missing.
+from pathlib import Path
+
+try:
+    ParakeetTranscriber(Settings()).transcribe(Path("/nonexistent/audio.m4a"), Path("/nonexistent"))
+except MediaTranscribeError as exc:
+    assert exc.kind == "not_installed", exc.kind
+    assert "uv sync --group media" in exc.user_message
+else:
+    raise AssertionError("expected MediaTranscribeError('not_installed')")
+
+print("BASE_INSTALL_OK")
+'''
+
+
+def test_app_imports_cleanly_without_the_media_dependency_group(tmp_path):
+    """Runs in a SUBPROCESS on purpose: the blocker has to be installed
+    before `brightspace_agent.main` is imported for the first time, and this
+    process imported it long ago (conftest/other tests), so no amount of
+    sys.modules surgery here would exercise the real import path."""
+    import subprocess
+    import sys as _sys
+
+    env = {**os.environ, "BSA_DATA_DIR": str(tmp_path)}
+    result = subprocess.run(
+        [_sys.executable, "-c", _BASE_INSTALL_SCRIPT], capture_output=True, text=True, env=env
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert "BASE_INSTALL_OK" in result.stdout
 
 
 # --------------------------------------------------------------------------

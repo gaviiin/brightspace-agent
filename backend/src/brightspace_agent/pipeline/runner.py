@@ -38,6 +38,26 @@ from brightspace_agent.pipeline.stages.enrich import run_enrich_stage, run_topic
 
 logger = logging.getLogger(__name__)
 
+# What a `media_sources` row left mid-job by a dead process gets as its
+# error (see `_reconcile_orphaned_rows_from_previous_process`). Written to be
+# read by the course owner in the Recordings drawer, so it names the action
+# rather than the internal cause.
+_INTERRUPTED_BY_RESTART = "interrupted by a server restart; press Process to retry"
+
+# Local ASR runs on the one GPU this machine has. `_execute_media` is already
+# sequential *within* a run, but nothing stopped two courses' media jobs
+# (separate asyncio tasks, separate `_active` entries) from reaching the
+# transcriber at the same time and thrashing that GPU. Module-level so the
+# serialization is process-wide -- one semaphore for every PipelineRunner
+# instance, matching the one piece of hardware it's standing in for.
+#
+# Worth knowing if you write a test that makes two runs contend on this: an
+# asyncio.Semaphore binds itself to the running loop the first time an
+# acquire actually has to WAIT, and raises if a later contended acquire
+# happens on a different loop. The app has exactly one loop for its whole
+# life, so this only ever matters across tests that each build their own.
+_ASR_SEMAPHORE = asyncio.Semaphore(1)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -530,13 +550,27 @@ class PipelineRunner:
         task left to eventually reconcile it (the per-run reconciliation in
         `_execute`'s `finally` only covers runs *this* process started), so
         it's swept here instead, once, at startup.
+
+        `media_sources` rows carry the identical property one level down: a
+        row is only `'fetching'`/`'transcribing'` while `_process_media_
+        source` is actively driving it, so at construction time those can
+        only be leftovers too. Left alone they're worse than a stale
+        `pipeline_runs` row -- the Recordings drawer offers no action at all
+        on a row in a mid-job status, so the source would be permanently
+        unprocessable short of hand-editing the database. Failed here with a
+        user-facing hint instead, which puts Process back on the row.
         """
         try:
             with self._session_factory() as session:
                 stale_rows = list(
                     session.execute(select(PipelineRun).where(PipelineRun.status == "running")).scalars().all()
                 )
-                if not stale_rows:
+                stuck_sources = list(
+                    session.execute(
+                        select(MediaSource).where(MediaSource.status.in_(("fetching", "transcribing")))
+                    ).scalars().all()
+                )
+                if not stale_rows and not stuck_sources:
                     return
                 now = _now_iso()
                 for row in stale_rows:
@@ -544,15 +578,24 @@ class PipelineRunner:
                     row.finished_at = now
                     row.error = "orphaned-by-restart"
                     self._last_run_rows.setdefault(row.course_id, []).append(row.id)
+                for source in stuck_sources:
+                    source.status = "failed"
+                    source.error = _INTERRUPTED_BY_RESTART
+                    source.updated_at = now
                 session.commit()
         except Exception:  # noqa: BLE001 -- a DB hiccup here must degrade, not crash boot (matches
             # reconcile_orphaned_rows's own try/except, its per-run sibling)
-            logger.exception("failed to reconcile orphaned pipeline_runs rows from a previous process at startup")
+            logger.exception("failed to reconcile orphaned rows from a previous process at startup")
             return
-        logger.warning(
-            "reconciled %d orphaned 'running' pipeline_runs row(s) left over from a previous process",
-            len(stale_rows),
-        )
+        if stale_rows:
+            logger.warning(
+                "reconciled %d orphaned 'running' pipeline_runs row(s) left over from a previous process",
+                len(stale_rows),
+            )
+        if stuck_sources:
+            logger.warning(
+                "reconciled %d media_sources row(s) left mid-job by a previous process", len(stuck_sources)
+            )
 
     def is_active(self, course_id: int) -> bool:
         """True if a run is currently active for `course_id`. Lets a caller
@@ -938,7 +981,16 @@ class PipelineRunner:
             else:
                 self._set_media_source_status(source_id, status="transcribing", error=None)
                 hooks.emit_source(source_id, "transcribing")
-                vtt_path = await asyncio.to_thread(self.transcriber.transcribe, fetch_result.path, attempt_dir)
+                # Single GPU: `_execute_media` already runs this course's
+                # sources one at a time, but two COURSES' media jobs are two
+                # independent asyncio tasks with independent `_active`
+                # entries, so only this process-wide semaphore keeps their
+                # ASR calls from overlapping. Held across the whole
+                # to_thread, i.e. for the real duration of the transcription.
+                async with _ASR_SEMAPHORE:
+                    vtt_path = await asyncio.to_thread(
+                        self.transcriber.transcribe, fetch_result.path, attempt_dir
+                    )
 
             # ingest_transcript sets status='done' (and clears error) itself
             # on success -- nothing left for this method to write to the row.

@@ -141,16 +141,25 @@ class ParakeetTranscriber:
 
         static_ffmpeg.add_paths()
 
+        # Rendering and writing sit INSIDE the same try as the engine call
+        # on purpose: from a caller's point of view "the transcription step
+        # failed" is one outcome, and `MediaTranscribeError('engine_error')`
+        # is this module's whole contract for it. Left outside, a garbage
+        # timestamp out of the adapter (a NaN blows up in `_format_timestamp`,
+        # not in `model.transcribe`) or an unwritable `dest_dir` would escape
+        # as a bare ValueError/OSError, which pipeline/runner.py's
+        # `_process_media_source` records as an opaque 'internal: ...' rather
+        # than the engine failure it actually is.
         try:
             model = parakeet_mlx.from_pretrained(self._settings.asr_model)
             result = model.transcribe(audio_path)
             segments = [(sentence.start, sentence.end, sentence.text) for sentence in result.sentences]
+            vtt_text = segments_to_vtt(segments)
+            dest_path = dest_dir / f"{audio_path.stem}.vtt"
+            dest_path.write_text(vtt_text, encoding="utf-8")
         except Exception as exc:
             raise MediaTranscribeError("engine_error", str(exc)) from exc
 
-        vtt_text = segments_to_vtt(segments)
-        dest_path = dest_dir / f"{audio_path.stem}.vtt"
-        dest_path.write_text(vtt_text, encoding="utf-8")
         return dest_path
 
 

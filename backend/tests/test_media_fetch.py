@@ -335,9 +335,17 @@ def test_redacted_strips_query_string_keeps_scheme_host_path():
 
 
 def test_error_stderr_tail_log_line_redacts_the_url(dest_dir, caplog):
+    """The stderr TAIL is the leaky half: yt-dlp echoes the URL it was given
+    (query string and all) into its own error output, and the passcode is on
+    the argv it prints too -- so redacting only `spec.url` in the log's first
+    `%s` still writes `?pwd=<passcode>` to disk via the second one."""
     import logging
 
-    fake_run = _FakeRun(_fail("ERROR: boom"))
+    stderr = (
+        "ERROR: unable to download webpage https://zoom.us/rec/share/abc123?pwd=s3cret "
+        "(caused by HTTPError 401); tried --video-password s3cret"
+    )
+    fake_run = _FakeRun(_fail(stderr))
     fetcher = YtDlpFetcher(Settings(), run=fake_run)
     spec = FetchSpec(
         platform="zoom", url="https://zoom.us/rec/share/abc123?pwd=s3cret", passcode="s3cret", dest_dir=dest_dir
@@ -349,8 +357,26 @@ def test_error_stderr_tail_log_line_redacts_the_url(dest_dir, caplog):
 
     warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
     assert any("yt-dlp failed for" in m for m in warnings)
-    assert not any("pwd=s3cret" in m for m in warnings)
+    assert not any("s3cret" in m for m in warnings)  # neither in the URL nor bare on the argv
     assert any("zoom.us/rec/share/abc123" in m for m in warnings)
+    assert any("HTTPError 401" in m for m in warnings)  # the diagnostic itself survives
+
+
+def test_scrub_stderr_strips_query_strings_and_the_passcode_literal():
+    from brightspace_agent.media.fetch import _scrub_stderr
+
+    scrubbed = _scrub_stderr(
+        "ERROR: https://zoom.us/rec/share/x?pwd=s3cret and http://other.example/a?b=c failed for s3cret",
+        "s3cret",
+    )
+
+    assert "s3cret" not in scrubbed
+    assert "b=c" not in scrubbed
+    assert "https://zoom.us/rec/share/x" in scrubbed
+    assert "http://other.example/a" in scrubbed
+
+    # No passcode set: URLs are still stripped, everything else untouched.
+    assert _scrub_stderr("plain message, no urls", None) == "plain message, no urls"
 
 
 def test_timeout_message_redacts_the_url(dest_dir):

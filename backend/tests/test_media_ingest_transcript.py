@@ -10,7 +10,15 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from brightspace_agent.db.models import Course, LlmCache, Material, MediaSource, Module
+from brightspace_agent.db.models import (
+    Course,
+    LlmCache,
+    Material,
+    MaterialTopic,
+    MediaSource,
+    Module,
+    Topic,
+)
 from brightspace_agent.db.session import init_db
 from brightspace_agent.ingest.store import BlobStore
 from brightspace_agent.media.ingest_transcript import ingest_transcript
@@ -105,6 +113,15 @@ def _get_material(session_factory, material_id) -> Material:
         material = session.get(Material, material_id)
         session.expunge(material)
         return material
+
+
+def _material_topic_count(session_factory, material_id) -> int:
+    with session_factory() as session:
+        return len(
+            session.execute(
+                select(MaterialTopic).where(MaterialTopic.material_id == material_id)
+            ).scalars().all()
+        )
 
 
 def _get_media_source(session_factory, media_source_id) -> MediaSource:
@@ -224,11 +241,31 @@ def test_reingest_resets_stale_summary_and_topic_assignments(
     first_vtt = _write_vtt(tmp_path, "first.vtt", "Content before the re-transcribe.")
     material_id = ingest_transcript(session_factory, blob_store, media_source_id, first_vtt)
 
-    # Simulate S1/S3 having already run on the first version.
+    # Simulate S1/S3 having already run on the first version: a summary, a
+    # cache entry, and -- the "topic assignments" half this test's name
+    # promises -- a real material_topics row at the course's taxonomy
+    # version, which is what actually files the transcript under a topic in
+    # the graph. Left behind across a re-transcribe, it would keep the new
+    # content attached to topics derived from the OLD content.
     with session_factory() as session:
         material = session.get(Material, material_id)
         material.status = "summarized"
         material.summary = "An old, now-stale summary."
+        course = session.get(Course, course_id)
+        topic = Topic(
+            course_id=course_id, taxonomy_version=course.taxonomy_version, slug="sorting", name="Sorting"
+        )
+        session.add(topic)
+        session.flush()
+        session.add(
+            MaterialTopic(
+                material_id=material_id,
+                topic_id=topic.id,
+                taxonomy_version=course.taxonomy_version,
+                confidence=0.9,
+                rationale="assigned from the first transcription",
+            )
+        )
         session.add(
             LlmCache(
                 sha256=material.sha256,
@@ -241,12 +278,15 @@ def test_reingest_resets_stale_summary_and_topic_assignments(
         )
         session.commit()
 
+    assert _material_topic_count(session_factory, material_id) == 1  # the precondition really held
+
     second_vtt = _write_vtt(tmp_path, "second.vtt", "Brand new re-transcribed content.")
     ingest_transcript(session_factory, blob_store, media_source_id, second_vtt)
 
     material = _get_material(session_factory, material_id)
     assert material.status == "extracted"
     assert material.summary is None
+    assert _material_topic_count(session_factory, material_id) == 0
 
 
 # --------------------------------------------------------------------------

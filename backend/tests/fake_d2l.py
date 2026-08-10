@@ -98,6 +98,28 @@ NEWS: list[dict[str, Any]] = [
         "IsGlobal": False,
         "IsPublished": True,
     },
+    # The third item exists for the E2E's media stage: an announcement whose
+    # HTML body links a lecture recording is exactly how recordings show up
+    # in a real course (they live outside D2L; the ToC only ever holds the
+    # link), and it's what media/detect.py's HTML-page scan is written
+    # against. The URL's "mock-captions" token is what makes
+    # MockMediaFetcher return a caption track offline -- see its docstring.
+    {
+        "Id": 3,
+        "Title": "Lecture 1 recording posted",
+        "Body": {
+            "Text": "The Week 1 lecture recording is up. Passcode: wk1pass",
+            "Html": (
+                '<p>The Week 1 lecture recording is up: '
+                '<a href="https://zoom.us/rec/share/mock-captions-week1">watch it here</a>. '
+                "Passcode: wk1pass</p>"
+            ),
+        },
+        "StartDate": "2026-01-07T12:00:00.000Z",
+        "EndDate": None,
+        "IsGlobal": False,
+        "IsPublished": True,
+    },
 ]
 DROPBOX: list[dict[str, Any]] = [
     {

@@ -121,6 +121,17 @@ def _wait_for_media_idle(client: TestClient, course_id: int, *, timeout_s: float
     raise AssertionError(f"media still active after {timeout_s}s: {body}")
 
 
+def _wait_for_pipeline_idle(client: TestClient, course_id: int, *, timeout_s: float = 30.0) -> dict:
+    deadline = time.monotonic() + timeout_s
+    body = None
+    while time.monotonic() < deadline:
+        body = client.get(f"/api/courses/{course_id}/pipeline/status").json()
+        if not body["active"] and body["stages"]:
+            return body
+        time.sleep(0.02)
+    raise AssertionError(f"pipeline still active after {timeout_s}s: {body}")
+
+
 # --------------------------------------------------------------------------
 # (1) full happy path: captions + audio sources -> both done, transcripts
 # --------------------------------------------------------------------------
@@ -699,3 +710,76 @@ def test_media_events_sequence_run_started_fetching_done_complete(app, db_sessio
 
     assert events[-1]["status"] == "complete"
     assert "sourceId" not in events[-1]
+
+
+# --------------------------------------------------------------------------
+# (11) The payoff of treating a transcript as just another material: it must
+# flow through the ORDINARY pipeline with no media-specific handling
+# anywhere downstream. Everything above this point stops at "a transcript
+# material row exists"; this is the one test that carries a recording all
+# the way to the graph the student actually reads.
+# --------------------------------------------------------------------------
+
+
+def _add_extracted_material(app, db_session_factory, course_id, *, title, body) -> int:
+    """A material already past the extract pass (status='extracted', text
+    sidecar written) -- the state `ingest_transcript` leaves a transcript
+    in, so the transcript under test isn't the only thing S1/S2 have to work
+    with."""
+    sha256, size = app.state.blob_store.put_bytes(body.encode("utf-8"))
+    app.state.blob_store.write_text(sha256, body)
+    with db_session_factory() as session:
+        material = Material(
+            course_id=course_id, kind="document", title=title, mime="text/plain",
+            sha256=sha256, size_bytes=size, status="extracted",
+        )
+        session.add(material)
+        session.commit()
+        return material.id
+
+
+def test_transcript_flows_through_the_pipeline_into_the_graph(client, app, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    _add_extracted_material(
+        app, db_session_factory, course_id,
+        title="Course Syllabus", body="CS100 syllabus. Week 1 intro. Week 2 sorting algorithms.",
+    )
+    material_id = _add_material(
+        db_session_factory, course_id, title="Lecture 1 Recording",
+        source_url="https://zoom.us/rec/share/mock-captions",
+    )
+    source_id = _add_media_source(
+        db_session_factory, course_id, material_id, url="https://zoom.us/rec/share/mock-captions",
+    )
+
+    assert client.post(f"/api/courses/{course_id}/media/process", headers=CSRF_HEADERS).status_code == 200
+    media_body = _wait_for_media_idle(client, course_id)
+    transcript_material_id = media_body["sources"][0]["transcriptMaterialId"]
+    assert media_body["sources"][0]["status"] == "done"
+    assert transcript_material_id is not None
+
+    with db_session_factory() as session:
+        assert session.get(Material, transcript_material_id).status == "extracted"  # pre-pipeline
+
+    assert client.post(f"/api/courses/{course_id}/pipeline/run", headers=CSRF_HEADERS).status_code == 200
+    status = _wait_for_pipeline_idle(client, course_id)
+    assert [s for s in status["stages"] if s["status"] not in ("complete", "aborted")] == []
+
+    with db_session_factory() as session:
+        transcript = session.get(Material, transcript_material_id)
+        assert transcript.kind == "transcript"
+        assert transcript.status == "summarized"
+        assert transcript.summary
+
+    graph = client.get(f"/api/courses/{course_id}/graph").json()
+    assert transcript_material_id in {m["id"] for m in graph["materials"]}
+    # Attached to a real topic or to Unsorted -- either way it is reachable
+    # from the graph, which is the invariant that matters (a material with
+    # zero attachments is invisible to the student).
+    assert transcript_material_id in {a["materialId"] for a in graph["attachments"]}
+
+    # And the source row still points at it, so the drawer's "Transcript
+    # ready" affordance survives a pipeline run.
+    after = client.get(f"/api/courses/{course_id}/media").json()
+    assert after["sources"][0]["id"] == source_id
+    assert after["sources"][0]["transcriptMaterialId"] == transcript_material_id

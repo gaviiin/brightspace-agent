@@ -25,6 +25,7 @@ Two things worth knowing before touching `YtDlpFetcher`:
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -204,7 +205,7 @@ class YtDlpFetcher:
         the two rules mutually exclusive by construction instead of relying
         on stderr wording never colliding.
         """
-        tail = stderr[-500:]
+        tail = _scrub_stderr(stderr[-500:], spec.passcode)
         logger.warning("yt-dlp failed for %s: %s", _redacted(spec.url), tail)
         lowered = stderr.lower()
 
@@ -242,6 +243,27 @@ class YtDlpFetcher:
             "yt-dlp failed to fetch this recording. Try updating yt-dlp: "
             "`uv lock --upgrade-package yt-dlp` then `uv sync --group media`.",
         )
+
+
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s'\"<>]+")
+
+
+def _scrub_stderr(text: str, passcode: str | None) -> str:
+    """`text` with every URL's query string stripped and, if `passcode` is
+    set, its literal value removed.
+
+    `_redacted` below only covers the URL this module *passes* to yt-dlp.
+    yt-dlp's own stderr is the other half: it echoes back the URL it was
+    given -- `?pwd=<passcode>` and all -- and prints the failing argv, which
+    carries `--video-password <passcode>`. Since that tail is logged
+    verbatim at WARNING, a Zoom passcode would land in the log file from two
+    directions at once. Order matters: query strings go first (they're where
+    the passcode usually hides), then any surviving literal occurrence.
+    """
+    scrubbed = _URL_IN_TEXT_RE.sub(lambda match: _redacted(match.group(0)), text)
+    if passcode:
+        scrubbed = scrubbed.replace(passcode, "***")
+    return scrubbed
 
 
 def _redacted(url: str) -> str:
