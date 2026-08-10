@@ -5,6 +5,7 @@ import { getMaterial } from "../api/client";
 import type { GraphAttachment, GraphPayload, GraphTopic } from "../api/types";
 import { ADMIN_TOPIC_ID, UNSORTED_TOPIC_ID } from "../api/types";
 import { KIND_ICON } from "../graph/nodes/MaterialNode";
+import { isSafeHttpUrl } from "../lib/url";
 import { useUiStore } from "../state/uiStore";
 import { MaterialReader } from "./MaterialReader";
 import { TopicSupplementary } from "./TopicSupplementary";
@@ -314,14 +315,22 @@ function MaterialDetail({ payload, materialId, onSelectTopic, onJumpToMaterial }
 
       {recording && (
         <div className="space-y-1">
-          <a
-            href={recording.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-block text-sm text-blue-600 underline underline-offset-2 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
-          >
-            Open recording ↗
-          </a>
+          {/* Review fix: `recording.url` is backend-supplied and rendered
+           * straight into `href` -- gated on `isSafeHttpUrl` so a
+           * non-http(s) scheme never reaches an anchor (same reasoning as
+           * RecordingsDrawer's Open link). The jump links below don't touch
+           * `href` at all (in-app selection only), so they're unaffected
+           * and still render. */}
+          {isSafeHttpUrl(recording.url) && (
+            <a
+              href={recording.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-block text-sm text-blue-600 underline underline-offset-2 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
+            >
+              Open recording ↗
+            </a>
+          )}
           {sourceMaterialId !== null && (
             <button
               type="button"

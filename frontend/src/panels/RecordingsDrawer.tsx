@@ -10,6 +10,7 @@ import {
   updateMediaSource,
 } from "../api/client";
 import type { MediaHint, MediaSourceStatus, MediaSourceSummary, MediaSourceUpdateRequest } from "../api/types";
+import { isSafeHttpUrl } from "../lib/url";
 import { useUiStore } from "../state/uiStore";
 import { StatusBadge } from "./RunsDrawer";
 
@@ -370,11 +371,16 @@ function SourceRow({
        * so this stays enabled regardless of status -- unlike Process/Skip/
        * Unskip below, which are gated on it. Always rendered (this row's
        * status is no longer what decides whether the actions div shows up
-       * at all). */}
+       * at all). Review fix: `source.url` is backend-supplied and rendered
+       * straight into `href` -- gated on `isSafeHttpUrl` so a non-http(s)
+       * scheme (classify_url now rejects these at write time, but an older
+       * row could still hold one) never reaches an anchor. */}
       <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-        <a href={source.url} target="_blank" rel="noopener noreferrer" className={ACTION_BUTTON_CLASS}>
-          Open ↗
-        </a>
+        {isSafeHttpUrl(source.url) && (
+          <a href={source.url} target="_blank" rel="noopener noreferrer" className={ACTION_BUTTON_CLASS}>
+            Open ↗
+          </a>
+        )}
         {(source.status === "detected" || source.status === "failed") && (
           <>
             <button type="button" disabled={busy} onClick={onProcess} className={ACTION_BUTTON_CLASS}>

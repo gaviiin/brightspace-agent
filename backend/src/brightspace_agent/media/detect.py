@@ -203,6 +203,19 @@ def classify_url(raw_url: str) -> _Candidate | None:
     parsed = urlparse(raw_url)
     if not parsed.scheme or not parsed.netloc:
         return None  # not a fully-qualified URL -- nothing to record verbatim
+    if parsed.scheme.lower() not in ("http", "https"):
+        # Review fix (M3.5c): a non-http(s) scheme still parses a netloc and
+        # path fine (`javascript://zoom.us/rec/share/x` -> scheme
+        # "javascript", host "zoom.us", path "/rec/share/x") -- without this
+        # guard, the platform matching below (host+path for Zoom, PATH ONLY
+        # for Mediasite) would classify it as a real recording URL and
+        # persist it verbatim to `media_sources.url`, which the frontend
+        # renders straight into an `<a href>`. The HTML-scanning path below
+        # feeds this function raw `<a href>` values out of already-synced,
+        # untrusted page HTML with no scheme guard of its own -- this is the
+        # one place both callers (that path, and the manual-add endpoint's
+        # own belt-and-suspenders `_require_absolute_http_url`) share.
+        return None
     host = (parsed.hostname or "").lower()
     path = parsed.path or ""
 

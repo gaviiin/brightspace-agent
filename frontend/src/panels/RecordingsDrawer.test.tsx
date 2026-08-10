@@ -189,6 +189,32 @@ describe("RecordingsDrawer: open recording link", () => {
     expect(link.getAttribute("target")).toBe("_blank");
     expect(link.getAttribute("rel")).toContain("noopener");
   });
+
+  it("renders no Open link when source.url has an unsafe scheme (defense-in-depth review fix)", async () => {
+    // The backend's classify_url now rejects this before it can ever be
+    // persisted (see test_media_detect.py), but this row renders whatever
+    // media_sources.url actually holds -- an older row written before that
+    // fix, say -- so the frontend must never trust it's already safe.
+    mockedGetMedia.mockResolvedValue(
+      fixtureMedia({
+        sources: [
+          source({
+            id: 6,
+            materialId: 60,
+            materialTitle: "Sketchy Row",
+            platform: "zoom",
+            url: "javascript://zoom.us/rec/share/x",
+          }),
+        ],
+      }),
+    );
+
+    renderDrawer();
+    await screen.findByText("Sketchy Row");
+    const row = rowFor("Sketchy Row");
+
+    expect(within(row).queryByRole("link", { name: /open/i })).toBeNull();
+  });
 });
 
 describe("RecordingsDrawer: passcode", () => {

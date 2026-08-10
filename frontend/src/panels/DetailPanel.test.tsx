@@ -254,6 +254,22 @@ describe("DetailPanel: material selected", () => {
 
     expect(useUiStore.getState().selection).toEqual({ type: "material", id: 42 });
   });
+
+  it("renders no Open recording link when recording.url has an unsafe scheme (defense-in-depth review fix)", async () => {
+    // Same reasoning as RecordingsDrawer's equivalent test: the backend's
+    // classify_url now rejects this before persisting it, but this view
+    // renders whatever media_sources.url actually holds.
+    mockedGetMaterial.mockResolvedValue(
+      materialFixture({
+        recording: { url: "javascript://zoom.us/rec/share/x", status: "done", transcriptMaterialId: null },
+      }),
+    );
+    useUiStore.setState({ selection: { type: "material", id: 10 } });
+    renderDetailPanel(fixturePayload());
+
+    await screen.findByText("This lecture covers the basics.");
+    expect(screen.queryByText(/Open recording/)).toBeNull();
+  });
 });
 
 describe("DetailPanel: Supplementary section hidden for synthetic topics (M3.5c)", () => {

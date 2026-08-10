@@ -975,6 +975,27 @@ def test_add_non_http_scheme_url_422(client, db_session_factory):
     assert resp.status_code == 422
 
 
+def test_add_javascript_scheme_zoom_shaped_url_422(client, db_session_factory):
+    """A javascript: URL that is otherwise Zoom-shaped (host+path match --
+    see classify_url's scheme-safety tests in test_media_detect.py) is
+    rejected before it ever reaches classify_url: `add_media_url`'s
+    `_require_absolute_http_url` guard runs first, so this never gets the
+    chance to be misclassified and persisted."""
+    course_id = _add_course(db_session_factory)
+
+    resp = client.post(
+        f"/api/courses/{course_id}/media/add",
+        json={"url": "javascript://zoom.us/rec/share/x"},
+        headers=CSRF_HEADERS,
+    )
+
+    assert resp.status_code == 422
+
+    with db_session_factory() as session:
+        rows = list(session.execute(select(MediaSource).where(MediaSource.course_id == course_id)).scalars().all())
+        assert rows == []
+
+
 def test_add_requires_csrf(client, db_session_factory):
     course_id = _add_course(db_session_factory)
 
