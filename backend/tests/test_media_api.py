@@ -783,3 +783,341 @@ def test_transcript_flows_through_the_pipeline_into_the_graph(client, app, db_se
     after = client.get(f"/api/courses/{course_id}/media").json()
     assert after["sources"][0]["id"] == source_id
     assert after["sources"][0]["transcriptMaterialId"] == transcript_material_id
+
+
+# --------------------------------------------------------------------------
+# (12) M2.6a: POST /api/courses/{course_id}/media/add -- manual URL/channel
+# add. Real-world finding this task starts from: the user's Mediasite
+# recordings sit behind an LTI-embedded channel the sync can't read at all,
+# so the only way in is a URL the user pastes themselves.
+# --------------------------------------------------------------------------
+
+
+def test_add_single_mediasite_url_creates_one_material_less_row(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+
+    resp = client.post(
+        f"/api/courses/{course_id}/media/add",
+        json={"url": "https://mediasite.example.edu/Mediasite/Play/xyz"},
+        headers=CSRF_HEADERS,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["added"] == 1
+    assert body["skipped"] == 0
+    assert body["total"] == 1
+    assert len(body["sources"]) == 1
+    row = body["sources"][0]
+    assert row["materialId"] is None
+    assert row["materialTitle"] is None
+    assert row["platform"] == "mediasite"
+    assert row["url"] == "https://mediasite.example.edu/Mediasite/Play/xyz"
+    assert row["status"] == "detected"
+
+    with db_session_factory() as session:
+        rows = list(session.execute(select(MediaSource).where(MediaSource.course_id == course_id)).scalars().all())
+        assert len(rows) == 1
+        assert rows[0].material_id is None
+
+
+def test_add_mock_channel_url_creates_three_rows(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+
+    resp = client.post(
+        f"/api/courses/{course_id}/media/add",
+        json={"url": "https://mock.mediasite.example/mock-channel/full"},
+        headers=CSRF_HEADERS,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["added"] == 3
+    assert body["skipped"] == 0
+    assert body["total"] == 3
+    assert len(body["sources"]) == 3
+
+    with db_session_factory() as session:
+        rows = list(session.execute(select(MediaSource).where(MediaSource.course_id == course_id)).scalars().all())
+        assert len(rows) == 3
+        assert all(row.material_id is None for row in rows)
+        assert all(row.platform == "mediasite" for row in rows)
+        assert len({row.url for row in rows}) == 3  # distinct URLs, no accidental collapse
+
+
+def test_add_re_add_dedups_added_zero_total_reported(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    url = "https://mediasite.example.edu/Mediasite/Play/xyz"
+    first = client.post(f"/api/courses/{course_id}/media/add", json={"url": url}, headers=CSRF_HEADERS)
+    assert first.status_code == 200
+    assert first.json()["added"] == 1
+
+    second = client.post(f"/api/courses/{course_id}/media/add", json={"url": url}, headers=CSRF_HEADERS)
+
+    assert second.status_code == 200
+    body = second.json()
+    assert body["added"] == 0
+    assert body["total"] == 1
+
+    with db_session_factory() as session:
+        rows = list(session.execute(select(MediaSource).where(MediaSource.course_id == course_id)).scalars().all())
+        assert len(rows) == 1  # not duplicated
+
+
+def test_add_re_add_never_clobbers_existing_status(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    url = "https://mediasite.example.edu/Mediasite/Play/xyz"
+    add_resp = client.post(f"/api/courses/{course_id}/media/add", json={"url": url}, headers=CSRF_HEADERS)
+    source_id = add_resp.json()["sources"][0]["id"]
+    with db_session_factory() as session:
+        row = session.get(MediaSource, source_id)
+        row.status = "done"
+        session.commit()
+
+    resp = client.post(f"/api/courses/{course_id}/media/add", json={"url": url}, headers=CSRF_HEADERS)
+
+    assert resp.status_code == 200
+    with db_session_factory() as session:
+        assert session.get(MediaSource, source_id).status == "done"  # untouched by the re-add
+
+
+def test_add_zoom_url_with_passcode_stores_it(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+
+    resp = client.post(
+        f"/api/courses/{course_id}/media/add",
+        json={"url": "https://zoom.us/rec/share/abc123", "passcode": "s3cret"},
+        headers=CSRF_HEADERS,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["sources"][0]["passcode"] == "s3cret"
+
+    with db_session_factory() as session:
+        row = session.execute(select(MediaSource).where(MediaSource.course_id == course_id)).scalar_one()
+        assert row.passcode == "s3cret"
+
+
+def test_add_unclassifiable_url_400(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+
+    resp = client.post(
+        f"/api/courses/{course_id}/media/add",
+        json={"url": "https://example.com/some/random/page"},
+        headers=CSRF_HEADERS,
+    )
+
+    assert resp.status_code == 400
+    assert "recognized" in resp.json()["detail"].lower()
+
+    with db_session_factory() as session:
+        rows = list(session.execute(select(MediaSource).where(MediaSource.course_id == course_id)).scalars().all())
+        assert rows == []
+
+
+def test_add_relative_url_422(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+
+    resp = client.post(
+        f"/api/courses/{course_id}/media/add",
+        json={"url": "/d2l/common/dialogs/quickLink/quickLink.d2l?ou=524044&type=lti&rcode=abc"},
+        headers=CSRF_HEADERS,
+    )
+
+    assert resp.status_code == 422
+
+
+def test_add_non_http_scheme_url_422(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+
+    resp = client.post(
+        f"/api/courses/{course_id}/media/add", json={"url": "ftp://example.com/x"}, headers=CSRF_HEADERS
+    )
+
+    assert resp.status_code == 422
+
+
+def test_add_requires_csrf(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+
+    resp = client.post(
+        f"/api/courses/{course_id}/media/add",
+        json={"url": "https://mediasite.example.edu/Mediasite/Play/xyz"},
+    )
+
+    assert resp.status_code == 403
+
+
+def test_add_unknown_course_404(client):
+    resp = client.post(
+        "/api/courses/999999/media/add",
+        json={"url": "https://mediasite.example.edu/Mediasite/Play/xyz"},
+        headers=CSRF_HEADERS,
+    )
+    assert resp.status_code == 404
+
+
+def test_add_fetch_error_maps_to_502_with_user_message(client, app, db_session_factory, monkeypatch):
+    from brightspace_agent.media.fetch import MediaFetchError
+
+    def boom(url):
+        raise MediaFetchError("auth_expired", "Your login session for this platform appears to have expired.")
+
+    monkeypatch.setattr(app.state.media_fetcher, "expand", boom)
+    course_id = _add_course(db_session_factory)
+
+    resp = client.post(
+        f"/api/courses/{course_id}/media/add",
+        json={"url": "https://mock.mediasite.example/private/one"},
+        headers=CSRF_HEADERS,
+    )
+
+    assert resp.status_code == 502
+    assert "login session" in resp.json()["detail"].lower()
+
+
+def test_add_not_installed_maps_to_503(client, app, db_session_factory, monkeypatch):
+    from brightspace_agent.media.fetch import MediaFetchError
+
+    def boom(url):
+        raise MediaFetchError("not_installed", "yt-dlp is not installed.")
+
+    monkeypatch.setattr(app.state.media_fetcher, "expand", boom)
+    course_id = _add_course(db_session_factory)
+
+    resp = client.post(
+        f"/api/courses/{course_id}/media/add",
+        json={"url": "https://mock.mediasite.example/private/one"},
+        headers=CSRF_HEADERS,
+    )
+
+    assert resp.status_code == 503
+
+
+def test_get_media_list_includes_material_less_rows(client, db_session_factory):
+    """Regression guard: the GET list query must LEFT (not INNER) join
+    materials, or a manually-added row with material_id=NULL disappears
+    from the list entirely."""
+    course_id = _add_course(db_session_factory)
+    client.post(
+        f"/api/courses/{course_id}/media/add",
+        json={"url": "https://mediasite.example.edu/Mediasite/Play/xyz"},
+        headers=CSRF_HEADERS,
+    )
+
+    body = client.get(f"/api/courses/{course_id}/media").json()
+
+    assert len(body["sources"]) == 1
+    assert body["sources"][0]["materialId"] is None
+    assert body["sources"][0]["materialTitle"] is None
+
+
+def test_manually_added_row_processes_end_to_end_with_fallback_title(client, db_session_factory):
+    """The payoff: a manually-added row (no backing material at all) must
+    flow through fetch -> ingest exactly like a detector-found one, landing
+    on a transcript material whose title falls back sensibly."""
+    course_id = _add_course(db_session_factory)
+    add_resp = client.post(
+        f"/api/courses/{course_id}/media/add",
+        json={"url": "https://zoom.us/rec/share/mock-captions"},
+        headers=CSRF_HEADERS,
+    )
+    assert add_resp.status_code == 200
+    source_id = add_resp.json()["sources"][0]["id"]
+
+    process_resp = client.post(f"/api/media/{source_id}/process", headers=CSRF_HEADERS)
+    assert process_resp.status_code == 200
+
+    body = _wait_for_media_idle(client, course_id)
+    row = body["sources"][0]
+    assert row["status"] == "done"
+    assert row["materialId"] is None
+    assert row["materialTitle"] is None
+    transcript_material_id = row["transcriptMaterialId"]
+    assert transcript_material_id is not None
+
+    with db_session_factory() as session:
+        transcript = session.get(Material, transcript_material_id)
+        assert transcript.kind == "transcript"
+        assert transcript.status == "extracted"
+        assert transcript.title == "mock-captions (transcript)"
+        assert transcript.course_id == course_id
+        assert transcript.module_id is None
+
+
+# --------------------------------------------------------------------------
+# (13) M2.6a: GET .../media `hints` -- LTI-embedded materials that look like
+# recording channels the sync can't read. Real-world shape from the task's
+# validation finding: a Mediasite channel synced as a link material whose
+# source_url is a relative D2L quicklink carrying `type=lti`.
+# --------------------------------------------------------------------------
+
+
+def test_hints_lti_quicklink_titled_like_a_recording_channel(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    _add_material(
+        db_session_factory,
+        course_id,
+        kind="link",
+        title="Mediasite Channel (Stern)",
+        source_url="/d2l/common/dialogs/quickLink/quickLink.d2l?ou=524044&type=lti&rcode=abc123",
+    )
+
+    body = client.get(f"/api/courses/{course_id}/media").json()
+
+    assert len(body["hints"]) == 1
+    assert body["hints"][0]["title"] == "Mediasite Channel (Stern)"
+
+
+def test_hints_plain_link_not_included(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    _add_material(
+        db_session_factory,
+        course_id,
+        kind="link",
+        title="Zoom Recordings",
+        source_url="https://zoom.us/some/plain/link",
+    )
+
+    body = client.get(f"/api/courses/{course_id}/media").json()
+
+    assert body["hints"] == []
+
+
+def test_hints_lti_link_with_unrelated_title_not_included(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    _add_material(
+        db_session_factory,
+        course_id,
+        kind="link",
+        title="Homework portal",
+        source_url="/d2l/common/dialogs/quickLink/quickLink.d2l?ou=1&type=lti&rcode=xyz",
+    )
+
+    body = client.get(f"/api/courses/{course_id}/media").json()
+
+    assert body["hints"] == []
+
+
+def test_hints_case_insensitive_on_both_url_marker_and_title(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    _add_material(
+        db_session_factory,
+        course_id,
+        kind="link",
+        title="ZOOM Lecture Archive",
+        source_url="https://school.d2l.com/d2l/LTI/launch?TYPE=LTI&id=1",
+    )
+
+    body = client.get(f"/api/courses/{course_id}/media").json()
+
+    assert len(body["hints"]) == 1
+
+
+def test_hints_empty_when_no_link_materials(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+
+    body = client.get(f"/api/courses/{course_id}/media").json()
+
+    assert body["hints"] == []

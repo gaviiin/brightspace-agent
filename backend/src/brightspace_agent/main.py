@@ -88,6 +88,7 @@ def create_app() -> FastAPI:
     app.state.event_bus = event_bus
     app.state.runner = runner
     app.state.settings = settings
+    app.state.media_fetcher = media_fetcher
 
     # Registered before CORS/CSRF below, which (Starlette adds each new
     # middleware *outside* the previous one) makes it the innermost of the
