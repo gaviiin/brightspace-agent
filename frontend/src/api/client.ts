@@ -19,6 +19,8 @@ import type {
   MediaRunResponse,
   MediaSourceSummary,
   MediaSourceUpdateRequest,
+  PairApproveResponse,
+  PairPendingResponse,
   PipelineRunResponse,
   PipelineStatusResponse,
   RunsResponse,
@@ -101,6 +103,24 @@ export function getMaterialFileUrl(materialId: number): string {
 
 export function getSettings(): Promise<SettingsResponse> {
   return request<SettingsResponse>("/api/settings");
+}
+
+// ---------------------------------------------------------------------------
+// One-click pairing (api/pair.py) -- M2.7
+// ---------------------------------------------------------------------------
+
+/** SettingsPage polls this every 2s while mounted to drive the "approve
+ * this extension" banner -- a GET, so (like `getSettings`) it needs
+ * neither the CSRF header nor any auth. */
+export function getPairPending(): Promise<PairPendingResponse> {
+  return request<PairPendingResponse>("/api/pair/pending");
+}
+
+export function approvePair(): Promise<PairApproveResponse> {
+  return request<PairApproveResponse>("/api/pair/approve", {
+    method: "POST",
+    headers: CSRF_HEADERS,
+  });
 }
 
 export function getRuns(courseId: number): Promise<RunsResponse> {

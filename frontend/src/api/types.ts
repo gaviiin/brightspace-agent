@@ -425,3 +425,18 @@ export interface SettingsResponse {
   maxCostUsdPerRun: number;
   apiKeyConfigured: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// One-click pairing (api/pair.py) -- M2.7. The frontend's side of the
+// request/approve/claim handshake: it polls `pending` for the Settings
+// banner and POSTs `approve` when the user clicks it. The extension's side
+// (`request`/`claim`) never touches this app.
+// ---------------------------------------------------------------------------
+
+export interface PairPendingResponse {
+  pending: boolean;
+}
+
+export interface PairApproveResponse {
+  approved: boolean;
+}
