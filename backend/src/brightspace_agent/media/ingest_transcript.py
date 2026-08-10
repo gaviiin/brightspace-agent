@@ -45,6 +45,7 @@ Two things worth knowing:
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -70,22 +71,39 @@ def ingest_transcript(
     blob/sha/text/status) rather than a second row being inserted -- calling
     this twice for one media source (a re-transcribe, a later re-detected
     caption) never leaves an orphaned duplicate transcript material behind.
+
+    M2.6a: `media_source.material_id` may be NULL (a manually-added URL/
+    channel entry has no backing `materials` row -- see api/media.py's POST
+    .../media/add). In that case there's no source material to inherit
+    course_id/module_id/title from: course_id comes straight off the
+    `media_sources` row itself, module_id is left NULL, and the title falls
+    back to `_fallback_title` below instead of "<source title> (transcript)".
     """
     with session_factory() as session:
         media_source = session.get(MediaSource, media_source_id)
         if media_source is None:
             raise ValueError(f"no media_sources row with id {media_source_id}")
 
-        source_material = session.get(Material, media_source.material_id)
-        if source_material is None:
-            raise ValueError(f"no materials row with id {media_source.material_id}")
+        if media_source.material_id is None:
+            source_material = None
+        else:
+            source_material = session.get(Material, media_source.material_id)
+            if source_material is None:
+                raise ValueError(f"no materials row with id {media_source.material_id}")
 
         vtt_bytes = vtt_path.read_bytes()
         sha256, size = blob_store.put_bytes(vtt_bytes)
         text = extract_text(blob_store.path_for(sha256), _VTT_MIME, "transcript") or ""
         blob_store.write_text(sha256, text)
 
-        title = f"{source_material.title} (transcript)"
+        if source_material is not None:
+            course_id = source_material.course_id
+            module_id = source_material.module_id
+            title = f"{source_material.title} (transcript)"
+        else:
+            course_id = media_source.course_id
+            module_id = None
+            title = f"{_fallback_title(media_source)} (transcript)"
 
         material = None
         if media_source.transcript_material_id is not None:
@@ -94,8 +112,8 @@ def ingest_transcript(
 
         if material is None:
             material = Material(
-                course_id=source_material.course_id,
-                module_id=source_material.module_id,
+                course_id=course_id,
+                module_id=module_id,
                 d2l_topic_id=None,
                 kind="transcript",
                 title=title,
@@ -103,8 +121,8 @@ def ingest_transcript(
             )
             session.add(material)
 
-        material.course_id = source_material.course_id
-        material.module_id = source_material.module_id
+        material.course_id = course_id
+        material.module_id = module_id
         material.d2l_topic_id = None
         material.kind = "transcript"
         material.title = title
@@ -121,7 +139,7 @@ def ingest_transcript(
             # re-classified from its new content instead of keeping a stale
             # summary forever. Mirrors upsert_file_material/
             # upsert_text_material's identical sha_unchanged gate.
-            reset_pipeline_progress(session, source_material.course_id, material, status="extracted")
+            reset_pipeline_progress(session, course_id, material, status="extracted")
             session.flush()
 
         media_source.transcript_material_id = material.id
@@ -131,3 +149,15 @@ def ingest_transcript(
 
         session.commit()
         return material.id
+
+
+def _fallback_title(media_source: MediaSource) -> str:
+    """Title for a manually-added media source with no backing `materials`
+    row: the source URL's last non-empty path segment (percent-decoded), or
+    "Recording <id>" if the URL has no usable path segment (e.g. a bare
+    host or root path)."""
+    path = urlsplit(media_source.url).path
+    segment = path.rstrip("/").rsplit("/", 1)[-1]
+    if segment:
+        return unquote(segment)
+    return f"Recording {media_source.id}"

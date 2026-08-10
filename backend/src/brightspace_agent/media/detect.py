@@ -16,7 +16,7 @@ Scans two places per course, matching the brief's exact rules:
    BeautifulSoup (no regex-over-HTML), and the page's visible text is also
    scanned for a nearby Zoom passcode.
 
-Classification (`_classify_url`) is pure string/host/path matching -- no
+Classification (`classify_url`) is pure string/host/path matching -- no
 network calls, so a bad or unreachable URL still gets recorded. See that
 function for the exact per-platform rules.
 """
@@ -130,7 +130,7 @@ def _find_candidates(material: Material, blob_store: BlobStore) -> list[_Candida
     if material.kind == "link":
         if not material.source_url:
             return []
-        candidate = _classify_url(material.source_url)
+        candidate = classify_url(material.source_url)
         return [candidate] if candidate else []
 
     # HTML page material (the only other branch `detect_media_sources`
@@ -152,11 +152,11 @@ def _candidates_from_html(raw_html: str) -> list[_Candidate]:
     candidates: list[_Candidate] = []
 
     for a_tag in soup.find_all("a", href=True):
-        candidate = _classify_url(a_tag["href"])
+        candidate = classify_url(a_tag["href"])
         if candidate is None:
             continue
         # Link materials have no surrounding text to search (handled by
-        # `_classify_url`'s query-param check only); HTML pages do -- fill
+        # `classify_url`'s query-param check only); HTML pages do -- fill
         # in a passcode from nearby text unless the URL's own query string
         # already supplied one.
         if candidate.platform == "zoom" and candidate.passcode is None:
@@ -192,7 +192,10 @@ def _clean_passcode(raw: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def _classify_url(raw_url: str) -> _Candidate | None:
+def classify_url(raw_url: str) -> _Candidate | None:
+    """Public as of M2.6a: api/media.py's manual-add endpoint reuses this
+    exact classifier for a user-pasted or channel-expanded URL rather than
+    duplicating the platform rules here."""
     raw_url = raw_url.strip()
     if not raw_url:
         return None

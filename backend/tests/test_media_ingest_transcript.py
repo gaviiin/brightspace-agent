@@ -299,3 +299,109 @@ def test_missing_media_source_id_raises_clear_error(session_factory, blob_store,
 
     with pytest.raises(ValueError, match="404404"):
         ingest_transcript(session_factory, blob_store, 404404, vtt_path)
+
+
+# --------------------------------------------------------------------------
+# M2.6a: media_source.material_id may be NULL (a manually-added URL/channel
+# entry has no backing `materials` row -- see api/media.py's POST
+# .../media/add). ingest_transcript must handle that end to end rather than
+# raising the "no materials row" ValueError meant for a genuinely dangling
+# (non-NULL but unresolved) material_id.
+# --------------------------------------------------------------------------
+
+
+def _add_manual_media_source(session_factory, course_id, url, **overrides) -> int:
+    defaults = dict(
+        course_id=course_id,
+        material_id=None,
+        platform="mediasite",
+        url=url,
+        status="transcribing",
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    defaults.update(overrides)
+    with session_factory() as session:
+        media_source = MediaSource(**defaults)
+        session.add(media_source)
+        session.commit()
+        return media_source.id
+
+
+def test_ingest_with_null_source_material_derives_title_from_url_last_segment(
+    session_factory, blob_store, course_id, tmp_path
+):
+    media_source_id = _add_manual_media_source(
+        session_factory, course_id, "https://mock.mediasite.example/Mediasite/Play/lecture-9"
+    )
+    vtt_path = _write_vtt(tmp_path, "captions.vtt", "A manually-added recording's first cue.")
+
+    material_id = ingest_transcript(session_factory, blob_store, media_source_id, vtt_path)
+
+    material = _get_material(session_factory, material_id)
+    assert material.title == "lecture-9 (transcript)"
+    assert material.course_id == course_id
+    assert material.module_id is None
+    assert material.d2l_topic_id is None
+    assert material.kind == "transcript"
+    assert material.status == "extracted"
+    assert material.sha256 is not None
+
+
+def test_ingest_with_null_source_material_and_no_path_segment_falls_back_to_recording_id(
+    session_factory, blob_store, course_id, tmp_path
+):
+    media_source_id = _add_manual_media_source(session_factory, course_id, "https://mock.mediasite.example")
+    vtt_path = _write_vtt(tmp_path, "captions.vtt", "Another manually-added recording.")
+
+    material_id = ingest_transcript(session_factory, blob_store, media_source_id, vtt_path)
+
+    material = _get_material(session_factory, material_id)
+    assert material.title == f"Recording {media_source_id} (transcript)"
+
+
+def test_ingest_with_null_source_material_url_decodes_the_path_segment(
+    session_factory, blob_store, course_id, tmp_path
+):
+    media_source_id = _add_manual_media_source(
+        session_factory, course_id, "https://mock.mediasite.example/Mediasite/Play/Week%201%20Intro"
+    )
+    vtt_path = _write_vtt(tmp_path, "captions.vtt", "Percent-encoded path segment.")
+
+    material_id = ingest_transcript(session_factory, blob_store, media_source_id, vtt_path)
+
+    material = _get_material(session_factory, material_id)
+    assert material.title == "Week 1 Intro (transcript)"
+
+
+def test_ingest_with_null_source_material_updates_the_media_source_row(
+    session_factory, blob_store, course_id, tmp_path
+):
+    media_source_id = _add_manual_media_source(
+        session_factory, course_id, "https://mock.mediasite.example/Mediasite/Play/abc"
+    )
+    vtt_path = _write_vtt(tmp_path, "captions.vtt", "Some transcribed words.")
+
+    material_id = ingest_transcript(session_factory, blob_store, media_source_id, vtt_path)
+
+    media_source = _get_media_source(session_factory, media_source_id)
+    assert media_source.transcript_material_id == material_id
+    assert media_source.status == "done"
+    assert media_source.error is None
+
+
+def test_reingest_with_null_source_material_updates_same_material_in_place(
+    session_factory, blob_store, course_id, tmp_path
+):
+    media_source_id = _add_manual_media_source(
+        session_factory, course_id, "https://mock.mediasite.example/Mediasite/Play/abc"
+    )
+    first_vtt = _write_vtt(tmp_path, "first.vtt", "The original transcript content.")
+    first_id = ingest_transcript(session_factory, blob_store, media_source_id, first_vtt)
+
+    second_vtt = _write_vtt(tmp_path, "second.vtt", "A completely different re-transcription.")
+    second_id = ingest_transcript(session_factory, blob_store, media_source_id, second_vtt)
+
+    assert second_id == first_id
+    materials = [m for m in _all_materials(session_factory, course_id) if m.kind == "transcript"]
+    assert len(materials) == 1
