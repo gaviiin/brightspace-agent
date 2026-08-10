@@ -438,6 +438,43 @@ def test_get_media_unknown_course_404(client):
     assert resp.status_code == 404
 
 
+def test_get_media_never_reports_idle_with_stale_sources(client, db_session_factory, monkeypatch):
+    """Regression guard for the read model's ordering: a GET whose response
+    says `active: false` must carry the run's FINAL source rows. The handler
+    used to read the sources (then hints) BEFORE `runner.is_active()`, so a
+    request straddling the end of the background media task could pair
+    pre-completion rows (still 'fetching') with `active: false` -- which is
+    exactly what `_wait_for_media_idle` trusts, making every test built on
+    it intermittently observe stale statuses under load.
+
+    The race window (between the sources query and the is_active read) is
+    sub-millisecond in real runs; wrapping `_compute_lti_hints` -- which
+    executes between the two -- with a 100ms sleep widens it enough that the
+    old ordering fails this test every time instead of once in a thousand.
+    """
+    import brightspace_agent.api.media as media_api
+
+    original_hints = media_api._compute_lti_hints
+
+    def slow_hints(session, course_id):
+        time.sleep(0.1)
+        return original_hints(session, course_id)
+
+    monkeypatch.setattr(media_api, "_compute_lti_hints", slow_hints)
+
+    course_id = _add_course(db_session_factory)
+    material_id = _add_material(db_session_factory, course_id, source_url="https://zoom.us/rec/share/mock-captions")
+    source_id = _add_media_source(
+        db_session_factory, course_id, material_id, url="https://zoom.us/rec/share/mock-captions",
+    )
+
+    resp = client.post(f"/api/media/{source_id}/process", headers=CSRF_HEADERS)
+    assert resp.status_code == 200
+
+    body = _wait_for_media_idle(client, course_id, timeout_s=10.0)
+    assert body["sources"][0]["status"] == "done"
+
+
 # --------------------------------------------------------------------------
 # (6) detect endpoint: stats + CSRF
 # --------------------------------------------------------------------------
