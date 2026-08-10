@@ -28,6 +28,7 @@ const courseList = document.getElementById("course-list") as HTMLUListElement;
 const progressBarFill = document.getElementById("progress-bar-fill") as HTMLDivElement;
 const progressText = document.getElementById("progress-text") as HTMLParagraphElement;
 const errorCountText = document.getElementById("error-count") as HTMLParagraphElement;
+const ltiStatusText = document.getElementById("lti-status") as HTMLParagraphElement;
 const needsLoginBanner = document.getElementById("needs-login-banner") as HTMLDivElement;
 const resumeButton = document.getElementById("resume") as HTMLButtonElement;
 
@@ -187,12 +188,45 @@ function renderProgress(progress: SyncProgress | null): void {
   needsLoginBanner.classList.toggle("visible", progress.phase === "needs-login");
 }
 
+// ---------------------------------------------------------------------------
+// LTI resolver progress (M2.7) — one line under sync progress, driven by
+// background.ts's `{evt: "lti-progress"}` messages. No new screens: while a
+// run is in flight this shows "N/M"; once it finishes, background.ts sends
+// one more message carrying the resolved/unrecognized/failed breakdown and
+// this switches to the summary line instead.
+// ---------------------------------------------------------------------------
+
+interface LtiProgressMessage {
+  done: number;
+  total: number;
+  resolved?: number;
+  unrecognized?: number;
+  failed?: number;
+  error?: string;
+}
+
+function renderLtiProgress(msg: LtiProgressMessage): void {
+  if (msg.error) {
+    ltiStatusText.textContent = `Recording link resolution failed: ${msg.error}`;
+    return;
+  }
+  if (msg.resolved !== undefined && msg.unrecognized !== undefined && msg.failed !== undefined) {
+    const needsLook = msg.unrecognized + msg.failed;
+    const parts = [`${msg.resolved} resolved`];
+    if (needsLook > 0) parts.push(`${needsLook} needs a look`);
+    ltiStatusText.textContent = `Recording links: ${parts.join(", ")}`;
+    return;
+  }
+  ltiStatusText.textContent = `Resolving recording links… ${msg.done}/${msg.total}`;
+}
+
 async function startSync(orgUnitId: number): Promise<void> {
   const origin = originInput.value.trim();
   if (!origin) {
     brightspaceStatus.textContent = "Connect to a Brightspace origin first.";
     return;
   }
+  ltiStatusText.textContent = "";
   try {
     const response = await chrome.runtime.sendMessage({ cmd: "sync", origin, orgUnitId });
     if (response?.error) {
@@ -207,6 +241,7 @@ async function startSync(orgUnitId: number): Promise<void> {
 
 resumeButton.addEventListener("click", async () => {
   resumeButton.disabled = true;
+  ltiStatusText.textContent = "";
   try {
     const response = await chrome.runtime.sendMessage({ cmd: "resume" });
     if (response?.error) {
@@ -225,6 +260,8 @@ resumeButton.addEventListener("click", async () => {
 chrome.runtime.onMessage.addListener((message) => {
   if (message && typeof message === "object" && message.evt === "progress") {
     renderProgress(message.progress as SyncProgress);
+  } else if (message && typeof message === "object" && message.evt === "lti-progress") {
+    renderLtiProgress(message as LtiProgressMessage);
   }
 });
 

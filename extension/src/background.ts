@@ -5,6 +5,8 @@
 
 import { BackendClient } from "./lib/backend-client";
 import { D2LClient, RateLimitedFetcher } from "./lib/d2l-client";
+import { resolveLtiCandidates } from "./lib/lti-resolver";
+import type { LtiResolverDeps, TabDriver } from "./lib/lti-resolver";
 import { discover, resume as resumeSync, syncCourse } from "./lib/sync-engine";
 import type { SyncDeps, SyncProgress, SyncState } from "./lib/sync-engine";
 import type { KnownCourse } from "./lib/types";
@@ -71,6 +73,117 @@ function updateBadge(progress: SyncProgress): void {
 }
 
 // ---------------------------------------------------------------------------
+// LTI resolver (M2.7): chrome.tabs adapter + post-sync wiring
+// ---------------------------------------------------------------------------
+
+/** The only chrome-specific machinery lti-resolver.ts needs: open a
+ * background tab, read its URL, close it, and watch chrome.tabs.onUpdated/
+ * onRemoved for the settle policy the pure module hands in (quietMs after a
+ * `status: "complete"`, or a hard timeoutMs cap, or early removal). */
+function createTabDriver(): TabDriver {
+  return {
+    async open(url: string): Promise<number> {
+      const tab = await chrome.tabs.create({ url, active: false });
+      if (tab.id === undefined) throw new Error("chrome.tabs.create returned no tab id");
+      return tab.id;
+    },
+
+    async currentUrl(tabId: number): Promise<string | null> {
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        return tab.url ?? null;
+      } catch {
+        // Tab no longer exists -- most likely the user closed it.
+        return null;
+      }
+    },
+
+    async close(tabId: number): Promise<void> {
+      try {
+        await chrome.tabs.remove(tabId);
+      } catch {
+        // Already gone -- nothing left to close.
+      }
+    },
+
+    onNavigationSettled(tabId: number, quietMs: number, timeoutMs: number): Promise<void> {
+      return new Promise((resolve) => {
+        let quietTimer: ReturnType<typeof setTimeout> | undefined;
+        let settled = false;
+
+        const finish = (): void => {
+          if (settled) return;
+          settled = true;
+          if (quietTimer !== undefined) clearTimeout(quietTimer);
+          clearTimeout(hardCapTimer);
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+          chrome.tabs.onRemoved.removeListener(onRemoved);
+          resolve();
+        };
+
+        const onUpdated = (updatedTabId: number, info: chrome.tabs.OnUpdatedInfo): void => {
+          if (updatedTabId !== tabId) return;
+          if (info.status === "complete") {
+            if (quietTimer !== undefined) clearTimeout(quietTimer);
+            quietTimer = setTimeout(finish, quietMs);
+          } else if (quietTimer !== undefined) {
+            // A new navigation started mid-quiet-period (e.g. an LTI
+            // redirect chain isn't done yet) -- cancel and wait for the
+            // next "complete" instead of settling early.
+            clearTimeout(quietTimer);
+            quietTimer = undefined;
+          }
+        };
+
+        const onRemoved = (removedTabId: number): void => {
+          if (removedTabId === tabId) finish();
+        };
+
+        const hardCapTimer = setTimeout(finish, timeoutMs);
+        chrome.tabs.onUpdated.addListener(onUpdated);
+        chrome.tabs.onRemoved.addListener(onRemoved);
+      });
+    },
+  };
+}
+
+/** Runs the LTI resolver for one course after a completed sync, forwarding
+ * its progress as `{evt: "lti-progress", done, total}` messages (ignored if
+ * no popup is listening, same as sync progress) and a final message
+ * carrying the resolved/unrecognized/failed breakdown so the popup can
+ * render the "N resolved, M needs a look" summary. Wrapped end-to-end: a
+ * resolver failure (e.g. the backend unreachable while fetching candidates)
+ * never turns a completed sync into a failed one -- at worst it reports
+ * `{evt: "lti-progress", error}`. */
+async function runLtiResolver(origin: string, orgUnitId: number): Promise<void> {
+  try {
+    const backend = new BackendClient(BACKEND_URL, getToken);
+    const deps: LtiResolverDeps = {
+      backend,
+      tabs: createTabDriver(),
+      onProgress: (p) => {
+        chrome.runtime.sendMessage({ evt: "lti-progress", done: p.done, total: p.total }).catch(() => {});
+      },
+    };
+    const summary = await resolveLtiCandidates(deps, origin, orgUnitId);
+    if (summary.total > 0) {
+      chrome.runtime
+        .sendMessage({
+          evt: "lti-progress",
+          done: summary.total,
+          total: summary.total,
+          resolved: summary.resolved,
+          unrecognized: summary.unrecognized,
+          failed: summary.failed,
+        })
+        .catch(() => {});
+    }
+  } catch (err) {
+    chrome.runtime.sendMessage({ evt: "lti-progress", error: errorMessage(err) }).catch(() => {});
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Command handlers
 // ---------------------------------------------------------------------------
 
@@ -94,6 +207,9 @@ async function handleSync(origin: string, orgUnitId: number): Promise<{ state: S
   try {
     const deps = makeDeps(origin);
     const state = await syncCourse(deps, origin, orgUnitId);
+    if (state.phase === "complete") {
+      await runLtiResolver(origin, orgUnitId);
+    }
     return { state };
   } finally {
     syncInFlight = false;
@@ -113,6 +229,9 @@ async function handleResume(): Promise<{ state: SyncState } | { error: string }>
   try {
     const deps = makeDeps(origin);
     const resumed = await resumeSync(deps, origin, state);
+    if (resumed.phase === "complete") {
+      await runLtiResolver(origin, resumed.orgUnitId);
+    }
     return { state: resumed };
   } finally {
     syncInFlight = false;
