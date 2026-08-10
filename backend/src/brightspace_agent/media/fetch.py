@@ -31,6 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 from brightspace_agent.config import Settings
 
@@ -188,7 +189,7 @@ class YtDlpFetcher:
         except subprocess.TimeoutExpired as exc:
             raise MediaFetchError(
                 "extractor_error",
-                f"yt-dlp timed out after {self._settings.media_fetch_timeout_s}s fetching {spec.url}.",
+                f"yt-dlp timed out after {self._settings.media_fetch_timeout_s}s fetching {_redacted(spec.url)}.",
             ) from exc
 
     def _map_error(self, spec: FetchSpec, stderr: str) -> MediaFetchError:
@@ -204,7 +205,7 @@ class YtDlpFetcher:
         on stderr wording never colliding.
         """
         tail = stderr[-500:]
-        logger.warning("yt-dlp failed for %s: %s", spec.url, tail)
+        logger.warning("yt-dlp failed for %s: %s", _redacted(spec.url), tail)
         lowered = stderr.lower()
 
         if any(
@@ -241,6 +242,17 @@ class YtDlpFetcher:
             "yt-dlp failed to fetch this recording. Try updating yt-dlp: "
             "`uv lock --upgrade-package yt-dlp` then `uv sync --group media`.",
         )
+
+
+def _redacted(url: str) -> str:
+    """`url` with its query string stripped -- a Zoom URL can carry
+    `?pwd=<passcode>` in `spec.url` itself (`media/detect.py` only strips the
+    fragment, not the query, when it records a Zoom candidate's `url`), and
+    this helper is the one place both call sites above (the stderr-tail
+    WARNING log and the timeout's user-facing message) go through before a
+    URL reaches either. Flagged in M2.2's review."""
+    scheme, netloc, path, _query, _fragment = urlsplit(url)
+    return urlunsplit((scheme, netloc, path, "", ""))
 
 
 def _pick_caption(vtt_files: list[Path]) -> Path:

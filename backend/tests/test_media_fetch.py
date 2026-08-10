@@ -318,6 +318,57 @@ def test_error_stderr_tail_logged_at_warning(dest_dir, caplog):
 
 
 # --------------------------------------------------------------------------
+# Log/message redaction (M2.4 cross-module fix, flagged in M2.2's review): a
+# Zoom URL can carry `?pwd=<passcode>` -- neither a log line nor a
+# user-facing message may ever include it.
+# --------------------------------------------------------------------------
+
+
+def test_redacted_strips_query_string_keeps_scheme_host_path():
+    from brightspace_agent.media.fetch import _redacted
+
+    assert (
+        _redacted("https://zoom.us/rec/share/abc123?pwd=s3cret")
+        == "https://zoom.us/rec/share/abc123"
+    )
+    assert _redacted("https://example.com/path") == "https://example.com/path"
+
+
+def test_error_stderr_tail_log_line_redacts_the_url(dest_dir, caplog):
+    import logging
+
+    fake_run = _FakeRun(_fail("ERROR: boom"))
+    fetcher = YtDlpFetcher(Settings(), run=fake_run)
+    spec = FetchSpec(
+        platform="zoom", url="https://zoom.us/rec/share/abc123?pwd=s3cret", passcode="s3cret", dest_dir=dest_dir
+    )
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(MediaFetchError):
+            fetcher.fetch(spec)
+
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("yt-dlp failed for" in m for m in warnings)
+    assert not any("pwd=s3cret" in m for m in warnings)
+    assert any("zoom.us/rec/share/abc123" in m for m in warnings)
+
+
+def test_timeout_message_redacts_the_url(dest_dir):
+    settings = Settings()
+    fake_run = _FakeRun(_times_out(settings.media_fetch_timeout_s))
+    fetcher = YtDlpFetcher(settings, run=fake_run)
+    spec = FetchSpec(
+        platform="zoom", url="https://zoom.us/rec/share/abc123?pwd=s3cret", passcode="s3cret", dest_dir=dest_dir
+    )
+
+    with pytest.raises(MediaFetchError) as exc_info:
+        fetcher.fetch(spec)
+
+    assert "pwd=s3cret" not in exc_info.value.user_message
+    assert "zoom.us/rec/share/abc123" in exc_info.value.user_message
+
+
+# --------------------------------------------------------------------------
 # Cookies
 # --------------------------------------------------------------------------
 

@@ -19,12 +19,15 @@ from brightspace_agent.api.events import router as events_router
 from brightspace_agent.api.graph import router as graph_router
 from brightspace_agent.api.ingest import router as ingest_router
 from brightspace_agent.api.materials import router as materials_router
+from brightspace_agent.api.media import router as media_router
 from brightspace_agent.api.pipeline import router as pipeline_router
 from brightspace_agent.api.settings import router as settings_router
 from brightspace_agent.api.taxonomy import router as taxonomy_router
 from brightspace_agent.config import Settings, ensure_data_dir
 from brightspace_agent.db.session import init_db
 from brightspace_agent.ingest.store import BlobStore
+from brightspace_agent.media.fetch import make_media_fetcher
+from brightspace_agent.media.transcribe import make_transcriber
 from brightspace_agent.pipeline.runner import EventBus, PipelineRunner
 
 # backend/src/brightspace_agent/main.py -> repo root
@@ -69,9 +72,12 @@ def create_app() -> FastAPI:
     blob_store = BlobStore(settings.blobs_dir, settings.text_dir)
     backend = make_backend(settings)
     web_backend = make_web_backend(settings)
+    media_fetcher = make_media_fetcher(settings)
+    transcriber = make_transcriber(settings)
     event_bus = EventBus()
     runner = PipelineRunner(
-        session_factory, blob_store, backend, settings, web_backend=web_backend, event_bus=event_bus
+        session_factory, blob_store, backend, settings, web_backend=web_backend, event_bus=event_bus,
+        media_fetcher=media_fetcher, transcriber=transcriber,
     )
 
     app = FastAPI()
@@ -120,6 +126,7 @@ def create_app() -> FastAPI:
     app.include_router(courses_router)
     app.include_router(graph_router)
     app.include_router(materials_router)
+    app.include_router(media_router)
     app.include_router(pipeline_router)
     app.include_router(enrichment_router)
     app.include_router(events_router)
