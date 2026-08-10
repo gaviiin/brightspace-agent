@@ -6,7 +6,7 @@ Course material in Brightspace (D2L) is organized the way it was *delivered* —
 
 This project reorganizes a course around its **topics**. It pulls everything out of Brightspace, has an LLM pipeline work out what the course is actually about, assigns every material to the topics it teaches, and renders the result as a graph you can walk.
 
-Milestones 1, 2, and 3 are built: sync, organization, browsing, lecture-recording transcripts, and the web-enrichment agent team (validated against the live API 2026-08-07; see the TIER DECISION note in `pipeline/stages/enrich.py` for the cost lesson that run taught). An MCP server exposing the graph to other AI tools (M4) is designed but not built.
+Milestones 1, 2, 2.7, and 3 are built: sync, organization, browsing, lecture-recording transcripts (plus zero-paste discovery of the ones hiding behind an LTI launch, and one-click pairing), and the web-enrichment agent team (validated against the live API 2026-08-07; see the TIER DECISION note in `pipeline/stages/enrich.py` for the cost lesson that run taught). An MCP server exposing the graph to other AI tools (M4) is designed but not built.
 
 ---
 
@@ -122,7 +122,7 @@ Pipeline progress streams over Server-Sent Events, so the graph refreshes itself
 The threat model is a hostile web page running in the same browser, on a machine where a local service holds your course content and a pairing token.
 
 - The backend **binds to 127.0.0.1 only** and validates the `Host` header, which is what stops DNS rebinding from turning a remote page into a same-origin caller.
-- Ingest endpoints require a **pairing token** (generated on first run, mode 0600, copied into the extension once).
+- Ingest endpoints require a **pairing token** (generated on first run, mode 0600). By default the extension claims it itself — the popup requests a pairing attempt, you approve it once on the Settings page, the popup polls for and stores the token — with copy/paste into the popup's token field as the fallback if that handshake can't complete.
 - Browser-facing mutating endpoints require a custom **`X-BSA-Request` header**, which forces a CORS preflight and blocks drive-by cross-origin POSTs — no random page can trigger LLM spend.
 - CORS is restricted to the dev-server origin.
 - Served blobs are **neutered**: only PDFs are served inline with their real type; everything else is `application/octet-stream` as an attachment, with `nosniff` and a sandbox CSP, so a hostile HTML file in a course cannot execute on the backend's origin.
@@ -154,9 +154,11 @@ Neither was reachable by the tests, because every test injects a mock `fetch` (i
 
 ## Status and what is next
 
-**Working:** sync, storage, the full pipeline, lecture-recording transcripts, the graph UI, the taxonomy editor, offline E2E. **In progress:** first validation against a real tenant — sync works; the pipeline has yet to run against real course material, and the prompts have never been read against real output.
+**Working:** sync, storage, the full pipeline, lecture-recording transcripts, zero-paste LTI-launch discovery, one-click pairing, the graph UI, the taxonomy editor, offline E2E. **In progress:** first validation against a real tenant — sync works; the pipeline has yet to run against real course material, and the prompts have never been read against real output.
 
 **M2 — Lecture media and transcripts.** Recordings live outside Brightspace: at this school they are Mediasite, Zoom cloud recordings, and Google Drive files, linked from a content page or an announcement rather than uploaded to D2L. A deterministic detector (no LLM, no network) scans synced link materials and HTML pages for those three platforms and records what it finds, picking a Zoom passcode out of the surrounding page text when there is one. Fetching is yt-dlp driven by your own browser session cookies, **captions first** — a platform caption track is already a transcript, so it costs one cheap request and no ASR at all — falling back to an audio-only download, never video. Only that fallback reaches the transcriber: `parakeet-mlx` running locally on Apple Silicon, in-process, no API and no audio leaving the machine. Either way the result is one `kind='transcript'` material that enters the pipeline at the summarize pass and flows through it unchanged — which is the payoff of treating everything as a "material". The heavy dependencies are an opt-in group (`make install-media`); the base install imports and runs without them.
+
+**M2.7 — Zero-paste discovery.** The detector above is structurally blind to one shape: a recording embedded behind an LTI launch, where the synced material is a D2L quicklink stub and the real Mediasite/Zoom URL only exists once a logged-in browser performs the launch. After each sync, the extension does exactly that — opens every such stub in a background (non-active) tab, waits for the redirect chain to settle, reads where it landed, closes the tab, and reports the result to the backend, which re-validates it with the same classifier the passive detector uses and expands a recognized channel into one recording per lecture. The Recordings drawer shows the outcome per candidate — resolved, landed somewhere unrecognized (with that URL, for a human to judge), or the attempt failed and will retry next sync — with pasting the real URL as the fallback for whatever it can't reach. Pairing got the same treatment: the popup's **Connect** button requests a pairing attempt, you **Approve** it once on the Settings page, and the popup claims the real token itself — copy/paste stays as the fallback.
 
 **M3 — Web enrichment.** A per-topic research team rather than a single search call: a planner that grounds queries in the course's own terminology, parallel finders each pursuing a different intent (alternative explanation, video, practice problems, visualization), a verifier that actually fetches each candidate to confirm it is live, on-topic, and level-appropriate, a judge that scores against a rubric with a format-diversity constraint, and a feedback loop where your keep/dismiss decisions bias future results.
 
@@ -173,7 +175,7 @@ make frontend                                   # Vite dev server on :5173
 make ext                                        # build extension/dist
 ```
 
-Load `extension/dist` unpacked at `chrome://extensions`, copy the pairing token from the app's Settings page into the popup, connect it to your school's Brightspace origin, discover courses, and sync one. Then run the pipeline from the course workspace — you will be shown a cost estimate before anything is spent.
+Load `extension/dist` unpacked at `chrome://extensions`, click **Connect to BrightSpace Agent** in the popup, then **Approve** it on the app's Settings page — the popup claims the pairing token itself, no copy/paste (Settings still shows the token to paste by hand if the two can't reach each other). Connect the extension to your school's Brightspace origin, discover courses, and sync one. Then run the pipeline from the course workspace — you will be shown a cost estimate before anything is spent.
 
 `make test` runs all three suites; `make e2e` runs the offline end-to-end with no network and no API key.
 

@@ -41,9 +41,13 @@ cd backend && ANTHROPIC_API_KEY=sk-ant-... uv run brightspace-agent
 
 Then:
 
-1. Open <http://127.0.0.1:8730>, go to **Settings**, copy the pairing token.
-2. Open `chrome://extensions`, enable Developer mode, **Load unpacked**,
-   select `extension/dist/`. Paste the pairing token into the extension popup.
+1. Open `chrome://extensions`, enable Developer mode, **Load unpacked**,
+   select `extension/dist/`.
+2. Open the extension popup and click **Connect to BrightSpace Agent**. Back
+   in the app (<http://127.0.0.1:8730>) go to **Settings** and click
+   **Approve** — the popup picks up the pairing token itself, no copying.
+   (If the two can't reach each other, Settings still shows a pairing token
+   you can paste into the popup's token field by hand.)
 3. Log into your school's Brightspace in a normal tab, hit **Discover** in
    the popup, pick a course, **Sync**.
 4. Back in the web app: open the course, **Run pipeline**. You get a cost
@@ -86,12 +90,32 @@ dependencies are heavy, so they live in their own group:
 make install-media        # cd backend && uv sync --group media
 ```
 
-Then open a course, **Recordings** → **Detect** (scans synced pages and
-links for Mediasite / Zoom / Google Drive recordings) → **Process**. A
-platform caption track is used when there is one; otherwise the audio is
-downloaded and transcribed locally with `parakeet-mlx` (Apple Silicon). The
-transcript becomes an ordinary material, so re-running the pipeline files it
-under topics like anything else.
+Discovery is automatic and happens in two passes, no pasting required for
+either:
+
+- **On sync**, a deterministic detector scans every synced page and link for
+  a Mediasite / Zoom / Google Drive URL sitting right there in the page.
+- **After sync**, the extension goes after the URLs Brightspace never
+  exposes directly — a recording embedded behind an LTI launch stub, where
+  the real address only materializes once a logged-in browser actually
+  performs the launch. It opens each such stub in an unobtrusive background
+  tab, follows the redirect to wherever it lands, reports that back, and
+  closes the tab. A landing page the backend recognizes becomes a recording
+  with zero typing.
+
+Open a course's **Recordings** drawer to see what showed up, and **Process**
+to transcribe it. A platform caption track is used when there is one;
+otherwise the audio is downloaded and transcribed locally with
+`parakeet-mlx` (Apple Silicon). The transcript becomes an ordinary material,
+so re-running the pipeline files it under topics like anything else.
+
+**Pasting is the fallback**, for whatever the two passes above can't reach —
+a launch that lands somewhere the backend doesn't recognize, one that never
+got a shot yet, or a background tab that got closed. The drawer names
+exactly what happened per recording and offers a box to paste the real page
+URL yourself (right-click the embedded player → open frame in new tab, copy
+its address) — a single lecture's URL, or a channel/catalog page's, which
+expands into one entry per lecture automatically.
 
 Notes:
 
@@ -119,10 +143,10 @@ make test    # backend (pytest) + extension + frontend (vitest), all offline
 
 No API key or real tenant needed: LLM stages run against a deterministic
 mock (`BSA_MOCK_LLM=1`), and `make e2e` drives a fake D2L tenant through
-sync → recordings → pipeline → graph end to end (the media stage runs
-against mock fetch/transcribe backends, so no yt-dlp or ASR is needed to run
-the suite). See `docs/OVERVIEW.md` for architecture detail and
-`docs/plan.md` for the roadmap (an MCP server is next).
+sync → LTI-launch autodiscovery → recordings → pipeline → graph end to end
+(the media stage runs against mock fetch/transcribe backends, so no yt-dlp
+or ASR is needed to run the suite). See `docs/OVERVIEW.md` for architecture
+detail and `docs/plan.md` for the roadmap (an MCP server is next).
 
 ## Caveats
 
