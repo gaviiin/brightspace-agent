@@ -17,7 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from brightspace_agent.db.models import Course, Material, MediaSource, PipelineRun
+from brightspace_agent.db.models import Course, LtiResolution, Material, MediaSource, PipelineRun
 
 CSRF_HEADERS = {"X-BSA-Request": "1"}
 
@@ -1179,3 +1179,97 @@ def test_hints_empty_when_no_link_materials(client, db_session_factory):
     body = client.get(f"/api/courses/{course_id}/media").json()
 
     assert body["hints"] == []
+
+
+# --------------------------------------------------------------------------
+# (14) M2.7: GET .../media hints[].resolution -- joined from lti_resolutions
+# by material_id. `null` before the extension has ever attempted a launch
+# for that hint; the row's own state after (api/ingest.py's POST
+# /lti-resolution is what actually writes these rows -- see
+# test_ingest_api.py's own coverage of that endpoint).
+# --------------------------------------------------------------------------
+
+
+def _add_lti_resolution(
+    db_session_factory, course_id, material_id, *,
+    status, final_url=None, platform=None, error=None,
+):
+    row = LtiResolution(
+        course_id=course_id, material_id=material_id,
+        launch_url="/d2l/common/dialogs/quickLink/quickLink.d2l?ou=1&type=lti&rcode=abc",
+        final_url=final_url, platform=platform, status=status, error=error,
+        created_at="2026-01-01T00:00:00+00:00", updated_at="2026-01-01T00:00:00+00:00",
+    )
+    with db_session_factory() as session:
+        session.add(row)
+        session.commit()
+        return row.id
+
+
+def test_hints_resolution_null_before_any_resolution_attempt(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    _add_material(
+        db_session_factory, course_id, kind="link", title="Mediasite Channel (Stern)",
+        source_url="/d2l/common/dialogs/quickLink/quickLink.d2l?ou=524044&type=lti&rcode=abc123",
+    )
+
+    body = client.get(f"/api/courses/{course_id}/media").json()
+
+    assert len(body["hints"]) == 1
+    assert body["hints"][0]["resolution"] is None
+
+
+def test_hints_resolution_reflects_resolved_row(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    material_id = _add_material(
+        db_session_factory, course_id, kind="link", title="Mediasite Channel (Stern)",
+        source_url="/d2l/common/dialogs/quickLink/quickLink.d2l?ou=524044&type=lti&rcode=abc123",
+    )
+    _add_lti_resolution(
+        db_session_factory, course_id, material_id, status="resolved",
+        final_url="https://mediasite.example.edu/Mediasite/Play/xyz", platform="mediasite",
+    )
+
+    body = client.get(f"/api/courses/{course_id}/media").json()
+
+    resolution = body["hints"][0]["resolution"]
+    assert resolution == {
+        "status": "resolved",
+        "finalUrl": "https://mediasite.example.edu/Mediasite/Play/xyz",
+        "error": None,
+    }
+
+
+def test_hints_resolution_reflects_unrecognized_row(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    material_id = _add_material(
+        db_session_factory, course_id, kind="link", title="Mediasite Channel (Stern)",
+        source_url="/d2l/common/dialogs/quickLink/quickLink.d2l?ou=524044&type=lti&rcode=abc123",
+    )
+    _add_lti_resolution(
+        db_session_factory, course_id, material_id, status="unrecognized",
+        final_url="https://example.com/some/landing/page",
+    )
+
+    body = client.get(f"/api/courses/{course_id}/media").json()
+
+    resolution = body["hints"][0]["resolution"]
+    assert resolution["status"] == "unrecognized"
+    assert resolution["finalUrl"] == "https://example.com/some/landing/page"
+    assert resolution["error"] is None
+
+
+def test_hints_resolution_reflects_failed_row_with_error(client, db_session_factory):
+    course_id = _add_course(db_session_factory)
+    material_id = _add_material(
+        db_session_factory, course_id, kind="link", title="Mediasite Channel (Stern)",
+        source_url="/d2l/common/dialogs/quickLink/quickLink.d2l?ou=524044&type=lti&rcode=abc123",
+    )
+    _add_lti_resolution(db_session_factory, course_id, material_id, status="failed", error="tab closed")
+
+    body = client.get(f"/api/courses/{course_id}/media").json()
+
+    resolution = body["hints"][0]["resolution"]
+    assert resolution["status"] == "failed"
+    assert resolution["finalUrl"] is None
+    assert resolution["error"] == "tab closed"

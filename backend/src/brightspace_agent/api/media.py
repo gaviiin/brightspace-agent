@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from brightspace_agent.api.deps import get_media_fetcher, get_runner, get_session
-from brightspace_agent.db.models import Course, Material, MediaSource
+from brightspace_agent.db.models import Course, LtiResolution, Material, MediaSource
 from brightspace_agent.ingest.repo import now_iso
 from brightspace_agent.media.detect import classify_url, detect_media_sources
 from brightspace_agent.media.fetch import MediaFetcher, MediaFetchError
@@ -79,6 +79,19 @@ class MediaSourceOut(CamelModel):
     updated_at: str
 
 
+class HintResolutionOut(CamelModel):
+    """M2.7: the extension's LTI-launch resolution attempt for a hint's
+    material, if one has happened yet -- joined from `lti_resolutions` by
+    material_id. `status` mirrors that table's CHECK
+    ('resolved'|'unrecognized'|'failed'); `final_url` is the landing page
+    the launch settled on (diagnostic even for 'unrecognized'/'failed');
+    `error` is set only for 'failed'."""
+
+    status: str
+    final_url: str | None
+    error: str | None
+
+
 class MediaHintOut(CamelModel):
     """A link material that LOOKS like an LTI-embedded recording channel the
     detector structurally cannot see into (its `source_url` is a D2L
@@ -86,6 +99,9 @@ class MediaHintOut(CamelModel):
 
     material_id: int
     title: str
+    # M2.7: None before the extension has ever attempted to resolve this
+    # hint's launch URL.
+    resolution: HintResolutionOut | None
 
 
 class MediaListOut(CamelModel):
@@ -118,20 +134,49 @@ _LTI_URL_MARKERS = ("type=lti", "/lti/")
 _LTI_HINT_TITLE_RE = re.compile(r"(mediasite|zoom|panopto|echo|yuja|kaltura|recording|lecture)", re.IGNORECASE)
 
 
-def _compute_lti_hints(session: Session, course_id: int) -> list[MediaHintOut]:
+def lti_candidate_rows(session: Session, course_id: int) -> list[tuple[int, str, str]]:
+    """(material_id, title, source_url) for every link material in
+    `course_id` that LOOKS like an LTI-embedded recording channel (see the
+    module-level comment on `_LTI_URL_MARKERS`/`_LTI_HINT_TITLE_RE`).
+
+    Public and shared, not duplicated: `_compute_lti_hints` below (the
+    drawer's read model) and api/ingest.py's `GET /lti-candidates` /
+    `POST /lti-resolution` (the extension's autodiscovery worklist and its
+    materialId validity check) all call this SAME query, so the three can
+    never disagree about what counts as an LTI candidate.
+    """
     rows = session.execute(
         select(Material.id, Material.title, Material.source_url).where(
             Material.course_id == course_id, Material.kind == "link", Material.source_url.is_not(None)
         )
     ).all()
-    hints: list[MediaHintOut] = []
+    candidates: list[tuple[int, str, str]] = []
     for material_id, title, source_url in rows:
         lowered_url = source_url.lower()
         if not any(marker in lowered_url for marker in _LTI_URL_MARKERS):
             continue
         if not _LTI_HINT_TITLE_RE.search(title):
             continue
-        hints.append(MediaHintOut(material_id=material_id, title=title))
+        candidates.append((material_id, title, source_url))
+    return candidates
+
+
+def _compute_lti_hints(session: Session, course_id: int) -> list[MediaHintOut]:
+    resolutions = {
+        row.material_id: row
+        for row in session.execute(
+            select(LtiResolution).where(LtiResolution.course_id == course_id)
+        ).scalars()
+    }
+    hints: list[MediaHintOut] = []
+    for material_id, title, _source_url in lti_candidate_rows(session, course_id):
+        resolution = resolutions.get(material_id)
+        resolution_out = (
+            HintResolutionOut(status=resolution.status, final_url=resolution.final_url, error=resolution.error)
+            if resolution is not None
+            else None
+        )
+        hints.append(MediaHintOut(material_id=material_id, title=title, resolution=resolution_out))
     return hints
 
 
@@ -212,9 +257,20 @@ class MediaAddResponse(CamelModel):
     sources: list[MediaSourceOut]
 
 
-def _require_absolute_http_url(url: str) -> None:
+def _is_absolute_http_url(url: str | None) -> bool:
+    """True iff `url` is a fully-qualified http(s) URL. Shared by
+    `_require_absolute_http_url` below and api/ingest.py's `POST
+    /lti-resolution` (M2.7), which needs the same check but as a non-raising
+    predicate: an invalid/absent `finalUrl` there is an ordinary `failed`
+    resolution outcome, not a 422."""
+    if not url:
+        return False
     parsed = urlparse(url)
-    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+    return parsed.scheme.lower() in ("http", "https") and bool(parsed.netloc)
+
+
+def _require_absolute_http_url(url: str) -> None:
+    if not _is_absolute_http_url(url):
         raise HTTPException(status_code=422, detail="url must be an absolute http:// or https:// URL")
 
 
@@ -255,18 +311,22 @@ def _upsert_manual_media_source(
     return existing, False
 
 
-@router.post("/api/courses/{course_id}/media/add", response_model=MediaAddResponse)
-def add_media_url(
-    course_id: int,
-    payload: MediaAddRequest,
-    session: Session = Depends(get_session),
-    fetcher: MediaFetcher = Depends(get_media_fetcher),
-) -> MediaAddResponse:
-    _get_course_or_404(session, course_id)
-    _require_absolute_http_url(payload.url)
-
+def expand_and_upsert_media(
+    session: Session, course_id: int, fetcher: MediaFetcher, url: str, passcode_override: str | None
+) -> tuple[int, int, int, list[MediaSource]]:
+    """`fetcher.expand(url)`, then classify+upsert every entry into
+    `media_sources` for `course_id` -- the core of this endpoint, extracted
+    so api/ingest.py's `POST /lti-resolution` (M2.7's extension-driven
+    discovery) can run the IDENTICAL path against a launch's resolved final
+    URL rather than duplicating it. Raises the same `HTTPException`s this
+    endpoint always has: `_map_expand_error`'s mapping on a
+    `MediaFetchError`, or 400 if nothing in `entries` classified to a
+    supported platform. Returns (added, skipped, total, touched) --
+    `touched` rows are flushed but not yet committed/refreshed; the caller
+    owns the transaction boundary.
+    """
     try:
-        entries = fetcher.expand(payload.url)
+        entries = fetcher.expand(url)
     except MediaFetchError as exc:
         raise _map_expand_error(exc) from exc
 
@@ -282,8 +342,8 @@ def add_media_url(
             continue
 
         passcode = candidate.passcode
-        if candidate.platform == "zoom" and payload.passcode is not None:
-            passcode = payload.passcode
+        if candidate.platform == "zoom" and passcode_override is not None:
+            passcode = passcode_override
 
         row, inserted = _upsert_manual_media_source(session, course_id, candidate.platform, candidate.url, passcode)
         touched.append(row)
@@ -295,6 +355,23 @@ def add_media_url(
             status_code=400,
             detail="That URL wasn't recognized as a supported recording platform (Mediasite, Zoom, or Google Drive).",
         )
+
+    return added, skipped, total, touched
+
+
+@router.post("/api/courses/{course_id}/media/add", response_model=MediaAddResponse)
+def add_media_url(
+    course_id: int,
+    payload: MediaAddRequest,
+    session: Session = Depends(get_session),
+    fetcher: MediaFetcher = Depends(get_media_fetcher),
+) -> MediaAddResponse:
+    _get_course_or_404(session, course_id)
+    _require_absolute_http_url(payload.url)
+
+    added, skipped, total, touched = expand_and_upsert_media(
+        session, course_id, fetcher, payload.url, payload.passcode
+    )
 
     session.commit()
     for row in touched:
