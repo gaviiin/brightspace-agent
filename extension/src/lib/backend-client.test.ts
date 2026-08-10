@@ -151,3 +151,111 @@ describe("BackendClient.health", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// ltiCandidates / reportLtiResolution (M2.7)
+// ---------------------------------------------------------------------------
+
+describe("BackendClient.ltiCandidates", () => {
+  it("GETs /api/ingest/lti-candidates with orgUnitId as a query param and the bearer token", async () => {
+    const body = {
+      courseId: 5,
+      candidates: [{ materialId: 1, title: "Lecture 1", launchUrl: "/d2l/lti/launch/1" }],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(body));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new BackendClient("http://127.0.0.1:8730", async () => "tok123");
+
+    const result = await client.ltiCandidates(42);
+
+    expect(result).toEqual(body);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8730/api/ingest/lti-candidates?orgUnitId=42",
+      expect.objectContaining({ method: "GET" }),
+    );
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit & { headers: Record<string, string> }];
+    expect(init.headers.Authorization).toBe("Bearer tok123");
+  });
+
+  it("throws BackendError on a non-2xx response", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: "unknown course; run handshake first" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new BackendClient("http://127.0.0.1:8730", async () => "tok");
+
+    const error = await client.ltiCandidates(999).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(BackendError);
+    expect((error as BackendError).status).toBe(404);
+  });
+});
+
+describe("BackendClient.reportLtiResolution", () => {
+  it("POSTs the payload to /api/ingest/lti-resolution with the bearer token", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ status: "resolved", platform: "mediasite", added: 3, total: 3 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new BackendClient("http://127.0.0.1:8730", async () => "tok123");
+
+    const result = await client.reportLtiResolution({
+      orgUnitId: 42,
+      materialId: 7,
+      finalUrl: "https://mediasite.example.edu/watch/abc",
+      error: null,
+    });
+
+    expect(result).toEqual({ status: "resolved", platform: "mediasite", added: 3, total: 3 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit & { headers: Record<string, string>; body: string }];
+    expect(url).toBe("http://127.0.0.1:8730/api/ingest/lti-resolution");
+    expect(init.method).toBe("POST");
+    expect(init.headers.Authorization).toBe("Bearer tok123");
+    expect(init.headers["Content-Type"]).toBe("application/json");
+    expect(JSON.parse(init.body)).toEqual({
+      orgUnitId: 42,
+      materialId: 7,
+      finalUrl: "https://mediasite.example.edu/watch/abc",
+      error: null,
+    });
+  });
+
+  it("resolves the parsed body for the 'unrecognized' outcome, with platform/added/total absent (not null)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ status: "unrecognized" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new BackendClient("http://127.0.0.1:8730", async () => "tok");
+
+    const result = await client.reportLtiResolution({
+      orgUnitId: 1,
+      materialId: 2,
+      finalUrl: "https://tenant.example/some/landing",
+      error: null,
+    });
+
+    expect(result).toEqual({ status: "unrecognized" });
+    expect("platform" in result).toBe(false);
+  });
+
+  it("propagates a non-2xx expand failure as BackendError rather than a JSON outcome", async () => {
+    // Per Task 1: an expand failure (e.g. yt-dlp missing) returns a plain
+    // non-2xx, not a {status: ...} body -- the resolver's per-candidate
+    // error isolation must treat this exactly like any other network error.
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: "yt-dlp is not installed" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new BackendClient("http://127.0.0.1:8730", async () => "tok");
+
+    const error = await client
+      .reportLtiResolution({ orgUnitId: 1, materialId: 2, finalUrl: "https://zoom.us/rec/x", error: null })
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(BackendError);
+    expect((error as BackendError).status).toBe(503);
+  });
+});

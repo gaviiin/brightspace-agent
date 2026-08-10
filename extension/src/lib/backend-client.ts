@@ -8,6 +8,9 @@ import type {
   CompletePayload,
   HandshakePayload,
   HandshakeResponse,
+  LtiCandidatesResponse,
+  LtiResolutionPayload,
+  LtiResolutionResponse,
   TocPayload,
   TocResponse,
 } from "./types";
@@ -103,6 +106,20 @@ export class BackendClient {
 
   complete(payload: CompletePayload): Promise<{ status: string }> {
     return this.request<{ status: string }>("POST", "/api/ingest/complete", payload);
+  }
+
+  /** M2.7: still-unresolved LTI quicklinks for one course, for the
+   * background-tab resolver (lti-resolver.ts) to work through. */
+  ltiCandidates(orgUnitId: number): Promise<LtiCandidatesResponse> {
+    return this.request<LtiCandidatesResponse>("GET", `/api/ingest/lti-candidates?orgUnitId=${orgUnitId}`);
+  }
+
+  /** M2.7: reports where a background-tab LTI launch actually landed. A
+   * non-2xx here (e.g. an expand failure on the backend) throws
+   * BackendError like any other method -- the caller's per-candidate error
+   * isolation is responsible for not letting that abort the resolve loop. */
+  reportLtiResolution(payload: LtiResolutionPayload): Promise<LtiResolutionResponse> {
+    return this.request<LtiResolutionResponse>("POST", "/api/ingest/lti-resolution", payload);
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {

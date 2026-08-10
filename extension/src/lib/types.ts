@@ -73,6 +73,43 @@ export interface CompletePayload {
   errors: { d2lTopicId: number | null; message: string }[];
 }
 
+/** One still-unresolved LTI quicklink material — mirrors `LtiCandidateOut`
+ * in api/ingest.py. `launchUrl` may be relative to the tenant origin. */
+export interface LtiCandidate {
+  materialId: number;
+  title: string;
+  launchUrl: string;
+}
+
+/** `GET /api/ingest/lti-candidates` — mirrors `LtiCandidatesResponse`. */
+export interface LtiCandidatesResponse {
+  courseId: number;
+  candidates: LtiCandidate[];
+}
+
+/** `POST /api/ingest/lti-resolution` request body — mirrors
+ * `LtiResolutionRequest`. */
+export interface LtiResolutionPayload {
+  orgUnitId: number;
+  materialId: number;
+  finalUrl: string | null;
+  error: string | null;
+}
+
+export type LtiResolutionStatus = "resolved" | "unrecognized" | "failed";
+
+/** `POST /api/ingest/lti-resolution` response body — mirrors
+ * `LtiResolutionResponse`. The backend route uses
+ * `response_model_exclude_none`, so `platform`/`added`/`total` are ABSENT
+ * (not null) on the 'unrecognized'/'failed' outcomes -- optional here,
+ * never assume they're present without checking `status` first. */
+export interface LtiResolutionResponse {
+  status: LtiResolutionStatus;
+  platform?: string;
+  added?: number;
+  total?: number;
+}
+
 // ---------------------------------------------------------------------------
 // D2L shapes (subset we rely on)
 // ---------------------------------------------------------------------------
