@@ -29,6 +29,8 @@ dev = [
 ]
 media = [
     "yt-dlp>=2026.7.4",
+    "parakeet-mlx>=0.5.2",
+    "static-ffmpeg>=3.0",
 ]
 
 [build-system]

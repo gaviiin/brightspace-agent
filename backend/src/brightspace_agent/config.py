@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     media_fetch_timeout_s: int = 1800
     keep_media: bool = False
 
+    # Transcription (media/transcribe.py, Task M2.3): the Hugging Face model
+    # id `ParakeetTranscriber` loads via parakeet-mlx's `from_pretrained`.
+    # Only read at real-transcribe time -- `make_transcriber` picks the mock
+    # under the same `mock_media`/`mock_llm` rule as `make_media_fetcher`.
+    asr_model: str = "mlx-community/parakeet-tdt-0.6b-v3"
+
     # Pipeline runner (Task 9): a hard-ish per-run spend guard shared across
     # the summarize and classify stages (see pipeline/runner.py). Advisory,
     # like the rest of cost estimation -- see agents/llm.py's cost table.
