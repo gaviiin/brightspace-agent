@@ -253,6 +253,31 @@ class D2LSyncDriver:
 
         return {"syncRunId": sync_run_id, "needed": needed, "errors": errors, "complete": complete_resp.json()}
 
+    # -- M2.7 zero-paste discovery: the extension's own two calls after a
+    #    sync (extension/src/lib/lti-resolver.ts) -- list still-unresolved
+    #    LTI quicklink candidates, then report where a background-tab launch
+    #    landed. Played directly against the backend, same "Python replica
+    #    of the extension's exact call sequence" spirit as `sync_course`
+    #    above, just for these two routes instead of the ToC/file loop.
+
+    async def lti_candidates(self, org_unit_id: int) -> dict:
+        resp = await self._backend.get(
+            f"/api/ingest/lti-candidates?orgUnitId={org_unit_id}", headers=self._auth
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def report_lti_resolution(
+        self, org_unit_id: int, material_id: int, final_url: str | None, error: str | None = None
+    ) -> dict:
+        resp = await self._backend.post(
+            "/api/ingest/lti-resolution",
+            headers=self._auth,
+            json={"orgUnitId": org_unit_id, "materialId": material_id, "finalUrl": final_url, "error": error},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
 
 def _rich_text(value: Any, field: str) -> str | None:
     """`Body`/`CustomInstructions` are `{Text, Html}` objects in Valence,
@@ -443,6 +468,114 @@ async def _run_media_to_completion(backend: httpx.AsyncClient, course_id: int, *
         body["sources"],
     )
     return body
+
+
+async def _run_lti_autodiscovery_leg(
+    driver: D2LSyncDriver, backend: httpx.AsyncClient, course_id: int, org_unit_id: int
+) -> None:
+    """M2.7 zero-paste discovery, played as the extension's own two calls
+    directly against the backend (`D2LSyncDriver.lti_candidates`/
+    `report_lti_resolution`, mirroring extension/src/lib/lti-resolver.ts):
+    list the still-unresolved LTI quicklinks the sync just landed
+    (fake_d2l's two fixture materials, `LTI_HINT_MEDIASITE_TITLE`/
+    `LTI_HINT_ZOOM_TITLE`), resolve one to a mediasite-shaped URL and one to
+    a URL `classify_url` doesn't recognize, and check both outcomes
+    round-trip everywhere a real extension run would look: the candidates
+    worklist, `media_sources`, and the drawer's `hints[].resolution`.
+
+    Run AFTER `_run_media_to_completion` on purpose: the mediasite URL below
+    fans out into 3 more `media_sources` rows (MockMediaFetcher's
+    "mock-channel" expansion), and running this leg first would fold those
+    into `_run_media_to_completion`'s own "detect -> process -> all done"
+    assertions, entangling two independently-meaningful checks. Left
+    unprocessed here (`media/process` is not re-run) -- nothing downstream
+    asserts on `media_sources.status` again.
+    """
+    candidates_body = await driver.lti_candidates(org_unit_id)
+    _assert(candidates_body["courseId"] == course_id, "lti-candidates returned the wrong courseId", candidates_body)
+    by_title = {c["title"]: c for c in candidates_body["candidates"]}
+    _assert(
+        {fake_d2l.LTI_HINT_MEDIASITE_TITLE, fake_d2l.LTI_HINT_ZOOM_TITLE} <= by_title.keys(),
+        "lti-candidates did not surface both fixture LTI-shaped link materials",
+        candidates_body["candidates"],
+    )
+    mediasite_candidate = by_title[fake_d2l.LTI_HINT_MEDIASITE_TITLE]
+    zoom_candidate = by_title[fake_d2l.LTI_HINT_ZOOM_TITLE]
+
+    # -- resolve #1: a mediasite-shaped catalog URL. Recognized by
+    #    classify_url (the "/mediasite/catalog/" path marker) AND matched by
+    #    MockMediaFetcher's "mock-channel" substring, so expand() fans it
+    #    into 3 lecture entries -- same URL test_ingest_api.py's own
+    #    resolution test uses.
+    mediasite_final_url = "https://mediasite.example.edu/Mediasite/Catalog/mock-channel"
+    resolve_resp = await driver.report_lti_resolution(
+        org_unit_id, mediasite_candidate["materialId"], final_url=mediasite_final_url
+    )
+    _assert(
+        resolve_resp == {"status": "resolved", "platform": "mediasite", "added": 3, "total": 3},
+        "lti-resolution did not resolve the mediasite candidate as expected",
+        resolve_resp,
+    )
+
+    media_resp = await backend.get(f"/api/courses/{course_id}/media")
+    media_resp.raise_for_status()
+    media_body = media_resp.json()
+    mediasite_sources = [s for s in media_body["sources"] if s["platform"] == "mediasite"]
+    _assert(len(mediasite_sources) == 3, "lti-resolution's expand did not add 3 media_sources rows", mediasite_sources)
+
+    resolved_hint = next(
+        (h for h in media_body["hints"] if h["materialId"] == mediasite_candidate["materialId"]), None
+    )
+    _assert(resolved_hint is not None, "the resolved candidate no longer has a drawer hint at all", media_body["hints"])
+    _assert(
+        resolved_hint["resolution"] == {"status": "resolved", "finalUrl": mediasite_final_url, "error": None},
+        "the resolved candidate's drawer hint did not carry resolution.status == 'resolved'",
+        resolved_hint,
+    )
+
+    candidates_after = await driver.lti_candidates(org_unit_id)
+    remaining_ids = {c["materialId"] for c in candidates_after["candidates"]}
+    _assert(
+        mediasite_candidate["materialId"] not in remaining_ids,
+        "the resolved candidate did not leave the lti-candidates worklist",
+        candidates_after,
+    )
+    _assert(
+        zoom_candidate["materialId"] in remaining_ids,
+        "the not-yet-resolved zoom candidate unexpectedly left the lti-candidates worklist",
+        candidates_after,
+    )
+
+    # -- resolve #2: a landing page classify_url does not recognize.
+    unrecognized_final_url = "https://example.com/some/landing/page"
+    unrecognized_resp = await driver.report_lti_resolution(
+        org_unit_id, zoom_candidate["materialId"], final_url=unrecognized_final_url
+    )
+    _assert(
+        unrecognized_resp == {"status": "unrecognized"},
+        "lti-resolution did not report the second candidate as unrecognized",
+        unrecognized_resp,
+    )
+
+    media_resp2 = await backend.get(f"/api/courses/{course_id}/media")
+    media_resp2.raise_for_status()
+    media_body2 = media_resp2.json()
+    unrecognized_hint = next(
+        (h for h in media_body2["hints"] if h["materialId"] == zoom_candidate["materialId"]), None
+    )
+    _assert(
+        unrecognized_hint is not None, "the unrecognized candidate no longer has a drawer hint at all", media_body2["hints"]
+    )
+    _assert(
+        unrecognized_hint["resolution"] == {"status": "unrecognized", "finalUrl": unrecognized_final_url, "error": None},
+        "the unrecognized candidate's drawer hint did not round-trip resolution.status == 'unrecognized'",
+        unrecognized_hint,
+    )
+
+    print(
+        "[e2e] LTI autodiscovery OK: 1 resolved (3 media_sources added via mock-fetcher expand), "
+        "1 unrecognized round-tripped"
+    )
 
 
 def _count_llm_cache_rows(data_dir: Path) -> int:
@@ -659,6 +792,7 @@ async def run_main_scenario() -> None:
                 course = await _discover_and_sync(driver)
                 course_id = course["courseId"]
                 media = await _run_media_to_completion(backend, course_id)
+                await _run_lti_autodiscovery_leg(driver, backend, course_id, fake_d2l.ORG_UNIT_ID)
                 await _run_pipeline_to_completion(backend, course_id)
 
                 graph1 = await _get_graph(backend, course_id)
