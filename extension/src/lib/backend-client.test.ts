@@ -259,3 +259,103 @@ describe("BackendClient.reportLtiResolution", () => {
     expect((error as BackendError).status).toBe(503);
   });
 });
+
+// ---------------------------------------------------------------------------
+// pairRequest / pairClaim (M2.7 one-click pairing)
+//
+// Both are called before the extension has a pairing token -- that's the
+// whole point of this flow -- so unlike every method above, neither may
+// attach an Authorization header.
+// ---------------------------------------------------------------------------
+
+describe("BackendClient.pairRequest", () => {
+  it("POSTs to /api/pair/request with the CSRF header and no Authorization header", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ requestId: "abc123" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const getToken = vi.fn().mockResolvedValue("should-not-be-used");
+    const client = new BackendClient("http://127.0.0.1:8730", getToken);
+
+    const result = await client.pairRequest();
+
+    expect(result).toEqual({ requestId: "abc123" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit & { headers?: Record<string, string> }];
+    expect(url).toBe("http://127.0.0.1:8730/api/pair/request");
+    expect(init.method).toBe("POST");
+    expect(init.headers?.["X-BSA-Request"]).toBe("1");
+    expect(init.headers?.Authorization).toBeUndefined();
+    expect(getToken).not.toHaveBeenCalled();
+  });
+
+  it("throws BackendError on a non-2xx response", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: "missing X-BSA-Request header" }), {
+        status: 403,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new BackendClient("http://127.0.0.1:8730", async () => "tok");
+
+    const error = await client.pairRequest().catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(BackendError);
+    expect((error as BackendError).status).toBe(403);
+  });
+});
+
+describe("BackendClient.pairClaim", () => {
+  it("GETs /api/pair/claim with requestId as a query param and no Authorization header", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ status: "pending" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const getToken = vi.fn().mockResolvedValue("should-not-be-used");
+    const client = new BackendClient("http://127.0.0.1:8730", getToken);
+
+    const result = await client.pairClaim("req-id-1");
+
+    expect(result).toEqual({ status: "pending" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit & { headers?: Record<string, string> }];
+    expect(url).toBe("http://127.0.0.1:8730/api/pair/claim?requestId=req-id-1");
+    expect(init.method).toBe("GET");
+    expect(init.headers?.Authorization).toBeUndefined();
+    expect(getToken).not.toHaveBeenCalled();
+  });
+
+  it("URL-encodes the requestId", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ status: "pending" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new BackendClient("http://127.0.0.1:8730", async () => "tok");
+
+    await client.pairClaim("a b+c");
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(url).toBe("http://127.0.0.1:8730/api/pair/claim?requestId=a%20b%2Bc");
+  });
+
+  it("resolves {status: 'approved', pairingToken} once approved", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ status: "approved", pairingToken: "secret-tok" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new BackendClient("http://127.0.0.1:8730", async () => "tok");
+
+    const result = await client.pairClaim("req-id-1");
+
+    expect(result).toEqual({ status: "approved", pairingToken: "secret-tok" });
+  });
+
+  it("throws BackendError on a non-2xx response (e.g. unknown/expired requestId)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: "unknown or expired pairing request" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new BackendClient("http://127.0.0.1:8730", async () => "tok");
+
+    const error = await client.pairClaim("req-id-1").catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(BackendError);
+    expect((error as BackendError).status).toBe(404);
+  });
+});

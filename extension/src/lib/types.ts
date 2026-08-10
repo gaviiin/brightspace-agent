@@ -111,6 +111,30 @@ export interface LtiResolutionResponse {
 }
 
 // ---------------------------------------------------------------------------
+// One-click pairing (api/pair.py, M2.7) — request/approve/claim. Both of
+// these are the extension's side of the handshake and are called BEFORE the
+// extension has a pairing token (that's the entire point of the flow), so
+// BackendClient.pairRequest/pairClaim attach no Authorization header — see
+// backend-client.ts.
+// ---------------------------------------------------------------------------
+
+/** `POST /api/pair/request` response — mirrors `PairRequestResponse`. */
+export interface PairRequestResponse {
+  requestId: string;
+}
+
+export type PairClaimStatus = "pending" | "approved";
+
+/** `GET /api/pair/claim` response — mirrors `PairClaimResponse`. The
+ * backend uses `response_model_exclude_none`, so `pairingToken` is ABSENT
+ * (not null) on the 'pending' outcome — never assume it's present without
+ * checking `status` first. */
+export interface PairClaimResponse {
+  status: PairClaimStatus;
+  pairingToken?: string;
+}
+
+// ---------------------------------------------------------------------------
 // D2L shapes (subset we rely on)
 // ---------------------------------------------------------------------------
 
