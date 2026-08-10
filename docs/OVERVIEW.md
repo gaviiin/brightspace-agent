@@ -6,7 +6,7 @@ Course material in Brightspace (D2L) is organized the way it was *delivered* —
 
 This project reorganizes a course around its **topics**. It pulls everything out of Brightspace, has an LLM pipeline work out what the course is actually about, assigns every material to the topics it teaches, and renders the result as a graph you can walk.
 
-Milestones 1 and 3 are built: sync, organization, browsing, and the web-enrichment agent team (validated against the live API 2026-08-07; see the TIER DECISION note in `pipeline/stages/enrich.py` for the cost lesson that run taught). Lecture recordings and transcripts (M2) and an MCP server exposing the graph to other AI tools (M4) are designed but not built.
+Milestones 1, 2, and 3 are built: sync, organization, browsing, lecture-recording transcripts, and the web-enrichment agent team (validated against the live API 2026-08-07; see the TIER DECISION note in `pipeline/stages/enrich.py` for the cost lesson that run taught). An MCP server exposing the graph to other AI tools (M4) is designed but not built.
 
 ---
 
@@ -154,9 +154,9 @@ Neither was reachable by the tests, because every test injects a mock `fetch` (i
 
 ## Status and what is next
 
-**Working:** sync, storage, the full pipeline, the graph UI, the taxonomy editor, offline E2E. **In progress:** first validation against a real tenant — sync works; the pipeline has yet to run against real course material, and the prompts have never been read against real output.
+**Working:** sync, storage, the full pipeline, lecture-recording transcripts, the graph UI, the taxonomy editor, offline E2E. **In progress:** first validation against a real tenant — sync works; the pipeline has yet to run against real course material, and the prompts have never been read against real output.
 
-**M2 — Lecture media and transcripts.** Recordings live outside Brightspace on Panopto, Kaltura, Echo360, or YuJa, embedded over LTI. The plan is to capture player URLs during sync, prefer the platform's own caption track, and fall back to local Whisper transcription on Apple Silicon. Transcripts then flow through the existing pipeline unchanged — which is the payoff of treating everything as a "material".
+**M2 — Lecture media and transcripts.** Recordings live outside Brightspace: at this school they are Mediasite, Zoom cloud recordings, and Google Drive files, linked from a content page or an announcement rather than uploaded to D2L. A deterministic detector (no LLM, no network) scans synced link materials and HTML pages for those three platforms and records what it finds, picking a Zoom passcode out of the surrounding page text when there is one. Fetching is yt-dlp driven by your own browser session cookies, **captions first** — a platform caption track is already a transcript, so it costs one cheap request and no ASR at all — falling back to an audio-only download, never video. Only that fallback reaches the transcriber: `parakeet-mlx` running locally on Apple Silicon, in-process, no API and no audio leaving the machine. Either way the result is one `kind='transcript'` material that enters the pipeline at the summarize pass and flows through it unchanged — which is the payoff of treating everything as a "material". The heavy dependencies are an opt-in group (`make install-media`); the base install imports and runs without them.
 
 **M3 — Web enrichment.** A per-topic research team rather than a single search call: a planner that grounds queries in the course's own terminology, parallel finders each pursuing a different intent (alternative explanation, video, practice problems, visualization), a verifier that actually fetches each candidate to confirm it is live, on-topic, and level-appropriate, a judge that scores against a rubric with a format-diversity constraint, and a feedback loop where your keep/dismiss decisions bias future results.
 

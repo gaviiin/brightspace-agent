@@ -1,8 +1,15 @@
-.PHONY: install backend frontend ext test e2e e2e-ui
+.PHONY: install install-media backend frontend ext test e2e e2e-ui
 
 install:
 	cd backend && uv sync
 	pnpm install
+
+# Opt-in: the lecture-recording deps (yt-dlp, parakeet-mlx, static-ffmpeg).
+# Everything else works without them. NOTE: any later bare `uv sync` --
+# including the one `make test` implies via `uv run` -- drops this group
+# again; rerun this target after. See the README's "Lecture recordings".
+install-media:
+	cd backend && uv sync --group media
 
 backend:
 	cd backend && uv run brightspace-agent
