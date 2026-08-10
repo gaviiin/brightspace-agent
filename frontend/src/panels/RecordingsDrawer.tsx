@@ -366,37 +366,40 @@ function SourceRow({
       {processError && <p className="mt-1 text-xs text-red-600 dark:text-red-400">{processError}</p>}
       {updateError && <p className="mt-1 text-xs text-red-600 dark:text-red-400">{updateError}</p>}
 
-      {(source.status === "detected" ||
-        source.status === "failed" ||
-        source.status === "skipped" ||
-        source.transcriptMaterialId !== null) && (
-        <div className="mt-1.5 flex flex-wrap gap-1.5">
-          {(source.status === "detected" || source.status === "failed") && (
-            <>
-              <button type="button" disabled={busy} onClick={onProcess} className={ACTION_BUTTON_CLASS}>
-                Process
-              </button>
-              <button type="button" disabled={busy} onClick={onSkip} className={ACTION_BUTTON_CLASS}>
-                Skip
-              </button>
-            </>
-          )}
-          {source.status === "skipped" && (
-            <button type="button" disabled={busy} onClick={onUnskip} className={ACTION_BUTTON_CLASS}>
-              Unskip
+      {/* M3.5c: watching the recording in the browser is always legitimate,
+       * so this stays enabled regardless of status -- unlike Process/Skip/
+       * Unskip below, which are gated on it. Always rendered (this row's
+       * status is no longer what decides whether the actions div shows up
+       * at all). */}
+      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+        <a href={source.url} target="_blank" rel="noopener noreferrer" className={ACTION_BUTTON_CLASS}>
+          Open ↗
+        </a>
+        {(source.status === "detected" || source.status === "failed") && (
+          <>
+            <button type="button" disabled={busy} onClick={onProcess} className={ACTION_BUTTON_CLASS}>
+              Process
             </button>
-          )}
-          {source.transcriptMaterialId !== null && (
-            <button
-              type="button"
-              onClick={() => onSelectTranscript(source.transcriptMaterialId as number)}
-              className={ACTION_BUTTON_CLASS}
-            >
-              Transcript ready
+            <button type="button" disabled={busy} onClick={onSkip} className={ACTION_BUTTON_CLASS}>
+              Skip
             </button>
-          )}
-        </div>
-      )}
+          </>
+        )}
+        {source.status === "skipped" && (
+          <button type="button" disabled={busy} onClick={onUnskip} className={ACTION_BUTTON_CLASS}>
+            Unskip
+          </button>
+        )}
+        {source.transcriptMaterialId !== null && (
+          <button
+            type="button"
+            onClick={() => onSelectTranscript(source.transcriptMaterialId as number)}
+            className={ACTION_BUTTON_CLASS}
+          >
+            Transcript ready
+          </button>
+        )}
+      </div>
     </li>
   );
 }

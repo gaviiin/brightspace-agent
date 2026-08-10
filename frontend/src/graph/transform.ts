@@ -21,6 +21,7 @@
 import type { Edge, Node } from "@xyflow/react";
 
 import type { GraphAttachment, GraphMaterial, GraphPayload, GraphTopic } from "../api/types";
+import { ADMIN_TOPIC_ID } from "../api/types";
 
 export type Selection = { type: "topic"; id: number } | { type: "material"; id: number } | null;
 
@@ -68,13 +69,25 @@ export function toFlow(
   expandedTopicIds: Set<number>,
   selection: Selection,
 ): { nodes: FlowNode[]; edges: FlowEdge[] } {
-  const topics = [...payload.topics].sort((a, b) => a.orderIndex - b.orderIndex);
+  // M3.5c: the Logistics & admin synthetic topic (ADMIN_TOPIC_ID, -1) is
+  // outline-only (see OutlinePanel) -- excluded here from BOTH the topic
+  // node list and the attachments considered for material nodes/edges, so
+  // it can never surface on the graph canvas even indirectly: without the
+  // attachment filter, a material filed only under admin would still gain
+  // a node (and a dangling edge sourced from a topic node that was never
+  // created) the moment -1 ended up in expandedTopicIds -- which
+  // OutlinePanel's own, independent expand toggle for this bucket can do,
+  // since it shares the same `expandedTopicIds` set as the canvas.
+  const topics = [...payload.topics]
+    .filter((topic) => topic.id !== ADMIN_TOPIC_ID)
+    .sort((a, b) => a.orderIndex - b.orderIndex);
   const materials = [...payload.materials].sort(
     (a, b) => a.title.localeCompare(b.title) || a.id - b.id,
   );
 
   const attachmentsByMaterial = new Map<number, GraphAttachment[]>();
   for (const attachment of payload.attachments) {
+    if (attachment.topicId === ADMIN_TOPIC_ID) continue;
     const list = attachmentsByMaterial.get(attachment.materialId);
     if (list) {
       list.push(attachment);

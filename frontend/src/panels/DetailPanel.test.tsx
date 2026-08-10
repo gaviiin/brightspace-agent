@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { GraphPayload, MaterialDetail } from "../api/types";
+import { ADMIN_TOPIC_ID, UNSORTED_TOPIC_ID } from "../api/types";
 import { useUiStore } from "../state/uiStore";
 
 vi.mock("../api/client", async (importOriginal) => {
@@ -116,7 +117,7 @@ describe("DetailPanel: topic selected", () => {
 });
 
 describe("DetailPanel: material selected", () => {
-  function materialFixture(): MaterialDetail {
+  function materialFixture(overrides: Partial<MaterialDetail> = {}): MaterialDetail {
     return {
       id: 10,
       courseId: 1,
@@ -129,6 +130,8 @@ describe("DetailPanel: material selected", () => {
       summary: "This lecture covers the basics.",
       keyTerms: ["alpha", "beta"],
       topicIds: [1],
+      recording: null,
+      ...overrides,
     };
   }
 
@@ -172,5 +175,126 @@ describe("DetailPanel: material selected", () => {
     expect(link?.getAttribute("href")).toBe("https://example.d2l.com/x");
     expect(link?.getAttribute("target")).toBe("_blank");
     expect(link?.getAttribute("rel")).toContain("noopener");
+  });
+
+  it("omits the recording section when the material has no recording", async () => {
+    mockedGetMaterial.mockResolvedValue(materialFixture());
+    useUiStore.setState({ selection: { type: "material", id: 10 } });
+    renderDetailPanel(fixturePayload());
+
+    await screen.findByText("This lecture covers the basics.");
+    expect(screen.queryByText(/Open recording/)).toBeNull();
+  });
+
+  it("shows an Open recording link when the material has a recording", async () => {
+    mockedGetMaterial.mockResolvedValue(
+      materialFixture({
+        recording: { url: "https://mediasite.example.edu/watch/1", status: "done", transcriptMaterialId: null },
+      }),
+    );
+    useUiStore.setState({ selection: { type: "material", id: 10 } });
+    renderDetailPanel(fixturePayload());
+
+    const link = (await screen.findByText(/Open recording/)).closest("a");
+    expect(link?.getAttribute("href")).toBe("https://mediasite.example.edu/watch/1");
+    expect(link?.getAttribute("target")).toBe("_blank");
+    expect(link?.getAttribute("rel")).toContain("noopener");
+  });
+
+  it("shows the Open recording link regardless of the recording's status", async () => {
+    mockedGetMaterial.mockResolvedValue(
+      materialFixture({
+        recording: { url: "https://mediasite.example.edu/watch/1", status: "fetching", transcriptMaterialId: null },
+      }),
+    );
+    useUiStore.setState({ selection: { type: "material", id: 10 } });
+    renderDetailPanel(fixturePayload());
+
+    expect(await screen.findByText(/Open recording/)).toBeTruthy();
+  });
+
+  it("a source material with transcriptMaterialId shows 'View transcript' and jumps selection to it", async () => {
+    mockedGetMaterial.mockResolvedValue(
+      materialFixture({
+        recording: { url: "https://mediasite.example.edu/watch/1", status: "done", transcriptMaterialId: 55 },
+      }),
+    );
+    useUiStore.setState({ selection: { type: "material", id: 10 } });
+    renderDetailPanel(fixturePayload());
+
+    fireEvent.click(await screen.findByText(/View transcript/));
+
+    expect(useUiStore.getState().selection).toEqual({ type: "material", id: 55 });
+  });
+
+  it("omits 'View transcript' when the source has no transcriptMaterialId yet", async () => {
+    mockedGetMaterial.mockResolvedValue(
+      materialFixture({
+        recording: { url: "https://mediasite.example.edu/watch/1", status: "fetching", transcriptMaterialId: null },
+      }),
+    );
+    useUiStore.setState({ selection: { type: "material", id: 10 } });
+    renderDetailPanel(fixturePayload());
+
+    await screen.findByText(/Open recording/);
+    expect(screen.queryByText(/View transcript/)).toBeNull();
+  });
+
+  it("a transcript material shows a 'from recording' jump to the source material", async () => {
+    mockedGetMaterial.mockResolvedValue(
+      materialFixture({
+        kind: "transcript",
+        recording: { url: "https://mediasite.example.edu/watch/1", status: "done", sourceMaterialId: 42 },
+      }),
+    );
+    useUiStore.setState({ selection: { type: "material", id: 10 } });
+    renderDetailPanel(fixturePayload());
+
+    fireEvent.click(await screen.findByText(/from recording/));
+
+    expect(useUiStore.getState().selection).toEqual({ type: "material", id: 42 });
+  });
+});
+
+describe("DetailPanel: Supplementary section hidden for synthetic topics (M3.5c)", () => {
+  function payloadWithSyntheticTopics(): GraphPayload {
+    const payload = fixturePayload();
+    payload.topics.push(
+      { id: UNSORTED_TOPIC_ID, slug: "_unsorted", name: "Unsorted", description: "", orderIndex: 3, materialCount: 0 },
+      {
+        id: ADMIN_TOPIC_ID,
+        slug: "_admin",
+        name: "Logistics & admin",
+        description: "",
+        orderIndex: 4,
+        materialCount: 0,
+      },
+    );
+    return payload;
+  }
+
+  it("does not render the Supplementary section for the Unsorted topic", async () => {
+    useUiStore.setState({ selection: { type: "topic", id: UNSORTED_TOPIC_ID } });
+    renderDetailPanel(payloadWithSyntheticTopics());
+
+    expect(await screen.findByText("Unsorted")).toBeTruthy();
+    expect(screen.queryByText("Supplementary")).toBeNull();
+    expect(mockedGetTopicEnrichment).not.toHaveBeenCalled();
+  });
+
+  it("does not render the Supplementary section for the Logistics & admin topic", async () => {
+    useUiStore.setState({ selection: { type: "topic", id: ADMIN_TOPIC_ID } });
+    renderDetailPanel(payloadWithSyntheticTopics());
+
+    expect(await screen.findByText("Logistics & admin")).toBeTruthy();
+    expect(screen.queryByText("Supplementary")).toBeNull();
+    expect(mockedGetTopicEnrichment).not.toHaveBeenCalled();
+  });
+
+  it("still renders the Supplementary section for a real topic", async () => {
+    useUiStore.setState({ selection: { type: "topic", id: 1 } });
+    renderDetailPanel(payloadWithSyntheticTopics());
+
+    expect(await screen.findByText(/not searched yet/i)).toBeTruthy();
   });
 });

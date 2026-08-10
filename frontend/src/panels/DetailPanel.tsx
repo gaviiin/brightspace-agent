@@ -3,6 +3,7 @@ import { useMemo } from "react";
 
 import { getMaterial } from "../api/client";
 import type { GraphAttachment, GraphPayload, GraphTopic } from "../api/types";
+import { ADMIN_TOPIC_ID, UNSORTED_TOPIC_ID } from "../api/types";
 import { KIND_ICON } from "../graph/nodes/MaterialNode";
 import { useUiStore } from "../state/uiStore";
 import { MaterialReader } from "./MaterialReader";
@@ -33,6 +34,7 @@ export function DetailPanel({ payload, courseId, mockLlm, runActive }: DetailPan
   const selection = useUiStore((state) => state.selection);
   const selectTopic = useUiStore((state) => state.selectTopic);
   const selectMaterial = useUiStore((state) => state.selectMaterial);
+  const setSelection = useUiStore((state) => state.setSelection);
 
   if (selection === null) {
     return (
@@ -57,7 +59,12 @@ export function DetailPanel({ payload, courseId, mockLlm, runActive }: DetailPan
   }
 
   return (
-    <MaterialDetail payload={payload} materialId={selection.id} onSelectTopic={selectTopic} />
+    <MaterialDetail
+      payload={payload}
+      materialId={selection.id}
+      onSelectTopic={selectTopic}
+      onJumpToMaterial={(materialId) => setSelection({ type: "material", id: materialId })}
+    />
   );
 }
 
@@ -185,7 +192,13 @@ function TopicDetail({ payload, topicId, courseId, mockLlm, runActive, onSelectT
         )}
       </div>
 
-      <TopicSupplementary topicId={topicId} courseId={courseId} mockLlm={mockLlm} runActive={runActive} />
+      {/* M3.5c: neither synthetic bucket is a real topic to search the web
+       * for -- Unsorted already carried this rule nowhere (no guard
+       * existed at all before this task), so it's added here for BOTH
+       * Unsorted and the Logistics & admin bucket together. */}
+      {topicId !== UNSORTED_TOPIC_ID && topicId !== ADMIN_TOPIC_ID && (
+        <TopicSupplementary topicId={topicId} courseId={courseId} mockLlm={mockLlm} runActive={runActive} />
+      )}
     </div>
   );
 }
@@ -202,9 +215,16 @@ interface MaterialDetailProps {
   payload: GraphPayload;
   materialId: number;
   onSelectTopic: (topicId: number) => void;
+  /** In-app selection jump (M3.5c) -- backs both the transcript's "from
+   * recording" link and the source material's "View transcript" link.
+   * Wired to `setSelection` (idempotent, non-toggling) rather than
+   * `selectMaterial`, matching how RecordingsDrawer's own "Transcript
+   * ready" jump behaves: a jump should always land on its target, never
+   * toggle it off. */
+  onJumpToMaterial: (materialId: number) => void;
 }
 
-function MaterialDetail({ payload, materialId, onSelectTopic }: MaterialDetailProps) {
+function MaterialDetail({ payload, materialId, onSelectTopic, onJumpToMaterial }: MaterialDetailProps) {
   const materialQuery = useQuery({
     queryKey: ["material", materialId],
     queryFn: () => getMaterial(materialId),
@@ -231,6 +251,15 @@ function MaterialDetail({ payload, materialId, onSelectTopic }: MaterialDetailPr
 
   const material = materialQuery.data;
   const openInBrightspace = material.sourceUrl?.startsWith("http") ? material.sourceUrl : null;
+  const recording = material.recording;
+  // The two `recording` shapes (source vs. transcript, api/materials.py's
+  // `_recording_info`) share only `url`/`status` -- narrow on which id
+  // field is present rather than trusting `material.kind`, since that's a
+  // separate classification the recording linkage doesn't depend on.
+  const transcriptMaterialId =
+    recording && "transcriptMaterialId" in recording ? (recording.transcriptMaterialId ?? null) : null;
+  const sourceMaterialId =
+    recording && "sourceMaterialId" in recording ? (recording.sourceMaterialId ?? null) : null;
 
   return (
     <div className="space-y-4">
@@ -280,6 +309,37 @@ function MaterialDetail({ payload, materialId, onSelectTopic }: MaterialDetailPr
               {term}
             </span>
           ))}
+        </div>
+      )}
+
+      {recording && (
+        <div className="space-y-1">
+          <a
+            href={recording.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-block text-sm text-blue-600 underline underline-offset-2 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
+          >
+            Open recording ↗
+          </a>
+          {sourceMaterialId !== null && (
+            <button
+              type="button"
+              onClick={() => onJumpToMaterial(sourceMaterialId)}
+              className="block text-xs text-neutral-500 underline underline-offset-2 hover:text-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200"
+            >
+              from recording
+            </button>
+          )}
+          {transcriptMaterialId !== null && (
+            <button
+              type="button"
+              onClick={() => onJumpToMaterial(transcriptMaterialId)}
+              className="block text-xs text-neutral-500 underline underline-offset-2 hover:text-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200"
+            >
+              View transcript
+            </button>
+          )}
         </div>
       )}
 

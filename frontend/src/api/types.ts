@@ -71,6 +71,17 @@ export interface GraphPayload {
 // GET /api/materials/{id}  (api/materials.py)
 // ---------------------------------------------------------------------------
 
+/** M3.5c: a material's recording linkage, when it is either end of a
+ * `media_sources` row (api/materials.py's `_recording_info`). The two
+ * shapes share `url`/`status` but never both id fields at once --
+ * `transcriptMaterialId` appears only on the recording's own source
+ * material, `sourceMaterialId` only on its transcript material. Narrow
+ * with `"sourceMaterialId" in recording` / `"transcriptMaterialId" in
+ * recording`, mirroring the backend's plain-dict shape. */
+export type MaterialRecording =
+  | { url: string; status: string; transcriptMaterialId?: number | null }
+  | { url: string; status: string; sourceMaterialId?: number | null };
+
 export interface MaterialDetail {
   id: number;
   courseId: number;
@@ -83,6 +94,8 @@ export interface MaterialDetail {
   summary: string | null;
   keyTerms: string[];
   topicIds: number[];
+  /** Null when this material isn't either end of a recording (M3.5c). */
+  recording: MaterialRecording | null;
 }
 
 // ---------------------------------------------------------------------------

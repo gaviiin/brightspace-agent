@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { GraphPayload } from "../api/types";
+import { ADMIN_TOPIC_ID } from "../api/types";
 import { styleEdge } from "./edges";
 import { materialNodeId, toFlow, topicNodeId } from "./transform";
 
@@ -176,6 +177,51 @@ describe("toFlow + styleEdge: the relation reaches the rendered edge", () => {
       expect(attachment.style).toMatchObject({ stroke: "var(--bsa-edge-attach)" });
       expect(attachment.markerEnd).toBeUndefined(); // no arrowhead: direction is layout-only
     }
+  });
+});
+
+describe("toFlow: admin topic (M3.5c)", () => {
+  it("excludes the admin synthetic topic node from the graph canvas entirely", () => {
+    const payload = fixturePayload();
+    payload.topics.push({
+      id: ADMIN_TOPIC_ID,
+      slug: "_admin",
+      name: "Logistics & admin",
+      description: "Grades, scheduling, etc.",
+      orderIndex: 3,
+      materialCount: 1,
+    });
+    payload.materials.push({ id: 14, title: "Grading Policy", kind: "other", status: "summarized", maxConfidence: null });
+    payload.attachments.push({ topicId: ADMIN_TOPIC_ID, materialId: 14, confidence: null, rationale: null });
+
+    const { nodes } = toFlow(payload, new Set(), null);
+
+    expect(nodes.some((n) => n.id === topicNodeId(ADMIN_TOPIC_ID))).toBe(false);
+    // The other topics (including Unsorted) are unaffected.
+    expect(nodes.some((n) => n.id === topicNodeId(1))).toBe(true);
+    expect(nodes.some((n) => n.id === topicNodeId(0))).toBe(true);
+  });
+
+  it("never renders the admin material node, even if -1 ends up in expandedTopicIds", () => {
+    // OutlinePanel drives the same expandedTopicIds set, and its admin row
+    // is independently expandable -- this guards against a dangling
+    // material node whose "source" topic node doesn't exist on the canvas.
+    const payload = fixturePayload();
+    payload.topics.push({
+      id: ADMIN_TOPIC_ID,
+      slug: "_admin",
+      name: "Logistics & admin",
+      description: "Grades, scheduling, etc.",
+      orderIndex: 3,
+      materialCount: 1,
+    });
+    payload.materials.push({ id: 14, title: "Grading Policy", kind: "other", status: "summarized", maxConfidence: null });
+    payload.attachments.push({ topicId: ADMIN_TOPIC_ID, materialId: 14, confidence: null, rationale: null });
+
+    const { nodes, edges } = toFlow(payload, new Set([ADMIN_TOPIC_ID]), null);
+
+    expect(nodes.some((n) => n.id === materialNodeId(14))).toBe(false);
+    expect(edges.some((e) => e.target === materialNodeId(14))).toBe(false);
   });
 });
 
