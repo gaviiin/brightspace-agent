@@ -153,6 +153,7 @@ export function RecordingsDrawer({ courseId, onClose }: RecordingsDrawerProps) {
                 <SourceRow
                   key={source.id}
                   source={source}
+                  active={active}
                   onProcess={() => processSourceMutation.mutate(source.id)}
                   processPending={
                     processSourceMutation.isPending && processSourceMutation.variables === source.id
@@ -184,6 +185,12 @@ export function RecordingsDrawer({ courseId, onClose }: RecordingsDrawerProps) {
 
 interface SourceRowProps {
   source: MediaSourceSummary;
+  /** `mediaQuery.data.active` -- any course run (pipeline/enrichment/media),
+   * not just a media run, since the backend's PUT/process guards on the
+   * same shared `_active` flag. Disables this row's Process/Skip/Unskip and
+   * the Zoom passcode Save so they don't sit clickable-but-deterministically-
+   * 409 for the whole time another run is in flight. */
+  active: boolean;
   onProcess: () => void;
   processPending: boolean;
   processError: string | null;
@@ -197,6 +204,7 @@ interface SourceRowProps {
 
 function SourceRow({
   source,
+  active,
   onProcess,
   processPending,
   processError,
@@ -207,7 +215,7 @@ function SourceRow({
   updateError,
   onSelectTranscript,
 }: SourceRowProps) {
-  const busy = processPending || updatePending;
+  const busy = processPending || updatePending || active;
 
   return (
     <li className="rounded-md border border-neutral-200 p-2 dark:border-neutral-800">
@@ -230,7 +238,7 @@ function SourceRow({
       )}
 
       {source.platform === "zoom" && (
-        <PasscodeEditor passcode={source.passcode} onSave={onSavePasscode} saving={updatePending} />
+        <PasscodeEditor passcode={source.passcode} onSave={onSavePasscode} saving={updatePending || active} />
       )}
 
       {processError && <p className="mt-1 text-xs text-red-600 dark:text-red-400">{processError}</p>}

@@ -228,6 +228,20 @@ describe("RecordingsDrawer: process", () => {
     await screen.findByText("Lecture 1 (Mediasite)");
 
     expect(screen.getByRole("button", { name: "Process all" }).hasAttribute("disabled")).toBe(true);
+
+    const detectedRow = rowFor("Lecture 1 (Mediasite)");
+    expect(within(detectedRow).getByRole("button", { name: "Process" }).hasAttribute("disabled")).toBe(
+      true,
+    );
+    expect(within(detectedRow).getByRole("button", { name: "Skip" }).hasAttribute("disabled")).toBe(true);
+
+    const zoomFailedRow = rowFor("Lecture 2 (Zoom)");
+    expect(within(zoomFailedRow).getByRole("button", { name: "Save" }).hasAttribute("disabled")).toBe(
+      true,
+    );
+
+    const skippedRow = rowFor("Lecture 4 (Zoom, skipped)");
+    expect(within(skippedRow).getByRole("button", { name: "Unskip" }).hasAttribute("disabled")).toBe(true);
   });
 
   it("does not offer Process/Skip on a done row, or Process on a skipped row", async () => {
