@@ -46,6 +46,28 @@ CREATE TABLE materials (
 
 CREATE UNIQUE INDEX ux_materials_course_topic ON materials(course_id, d2l_topic_id) WHERE d2l_topic_id IS NOT NULL;
 
+-- M2.1: lecture-recording URLs (Mediasite/Zoom/Google Drive) the detector
+-- (media/detect.py) finds in already-synced materials -- link materials'
+-- source_url, plus hrefs inside HTML page materials. One row per distinct
+-- (course, url); later M2 tasks drive status through fetching/transcribing
+-- to done/failed/skipped and point transcript_material_id at the transcript
+-- they produce. IF NOT EXISTS: also reapplied as migration 3 for databases
+-- that predate this table (see migrate.py).
+CREATE TABLE IF NOT EXISTS media_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL CHECK(platform IN ('mediasite','zoom','gdrive')),
+    url TEXT NOT NULL,
+    passcode TEXT,
+    status TEXT NOT NULL CHECK(status IN ('detected','fetching','transcribing','done','failed','skipped')) DEFAULT 'detected',
+    error TEXT,
+    transcript_material_id INTEGER REFERENCES materials(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(course_id, url)
+);
+
 CREATE TABLE topics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,

@@ -39,9 +39,32 @@ _ENRICHMENT_UNIQUE_INDEX = (
     "ON enrichment_resources(topic_id, url);"
 )
 
+# Migration 3 adds the media_sources table (M2.1's recording-URL detector).
+# Same "also in schema.sql via IF NOT EXISTS" shape as migration 2 above: a
+# fresh database gets the table from schema.sql at migration 1, so this
+# statement is a no-op there; it only does real work bringing a database
+# already at version 1 or 2 up to date.
+_MEDIA_SOURCES_TABLE = (
+    "CREATE TABLE IF NOT EXISTS media_sources (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,\n"
+    "    material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,\n"
+    "    platform TEXT NOT NULL CHECK(platform IN ('mediasite','zoom','gdrive')),\n"
+    "    url TEXT NOT NULL,\n"
+    "    passcode TEXT,\n"
+    "    status TEXT NOT NULL CHECK(status IN ('detected','fetching','transcribing','done','failed','skipped')) DEFAULT 'detected',\n"
+    "    error TEXT,\n"
+    "    transcript_material_id INTEGER REFERENCES materials(id) ON DELETE SET NULL,\n"
+    "    created_at TEXT NOT NULL,\n"
+    "    updated_at TEXT NOT NULL,\n"
+    "    UNIQUE(course_id, url)\n"
+    ");"
+)
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _SCHEMA_SQL),
     (2, _ENRICHMENT_UNIQUE_INDEX),
+    (3, _MEDIA_SOURCES_TABLE),
 ]
 
 

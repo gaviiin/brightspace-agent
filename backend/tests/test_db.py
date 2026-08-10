@@ -17,6 +17,7 @@ EXPECTED_TABLES = {
     "topics",
     "topic_edges",
     "material_topics",
+    "media_sources",
     "enrichment_resources",
     "domain_reputation",
     "sync_runs",
