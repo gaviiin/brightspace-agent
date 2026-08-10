@@ -7,7 +7,15 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from brightspace_agent.db.migrate import MIGRATIONS, check_migration_versions, migrate
-from brightspace_agent.db.models import Course, EnrichmentResource, Material, MediaSource, Module, Topic
+from brightspace_agent.db.models import (
+    Course,
+    EnrichmentResource,
+    LtiResolution,
+    Material,
+    MediaSource,
+    Module,
+    Topic,
+)
 from brightspace_agent.db.session import init_db
 
 EXPECTED_TABLES = {
@@ -18,6 +26,7 @@ EXPECTED_TABLES = {
     "topic_edges",
     "material_topics",
     "media_sources",
+    "lti_resolutions",
     "enrichment_resources",
     "domain_reputation",
     "sync_runs",
@@ -289,8 +298,8 @@ def test_migration_3_adds_media_sources_to_a_v2_database(db_path, tmp_path):
         # 5 (M3.5a's materials.is_administrative column), then migration 6
         # (M3.5b's material_topics.method CHECK widening) in the same call,
         # so the version lands on whatever's newest, not literally 3.
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
-        assert MIGRATIONS[-1][0] == 6  # nothing newer has been appended without updating this test
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert MIGRATIONS[-1][0] == 7  # nothing newer has been appended without updating this test
 
         # The migrated table must match what a fresh database gets from
         # schema.sql -- a migration that produces a differently-shaped table
@@ -318,7 +327,7 @@ def test_migration_3_adds_media_sources_to_a_v2_database(db_path, tmp_path):
 
         migrate(conn)
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
         row = conn.execute("SELECT url, status FROM media_sources").fetchone()
         assert row == ("https://zoom.us/rec/share/abc", "detected")
     finally:
@@ -398,8 +407,8 @@ def test_migration_4_makes_media_sources_material_id_nullable(db_path, tmp_path)
 
         migrate(conn)  # applies migration 4, then migrations 5 and 6, on top of this v3 db
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
-        assert MIGRATIONS[-1][0] == 6  # nothing newer has been appended without updating this test
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert MIGRATIONS[-1][0] == 7  # nothing newer has been appended without updating this test
 
         after = conn.execute(f"SELECT {columns} FROM media_sources ORDER BY id").fetchall()
         assert after == before  # every row, every column, survives byte-identical
@@ -441,7 +450,7 @@ def test_migration_4_makes_media_sources_material_id_nullable(db_path, tmp_path)
         # migration 3's test's own post-migration insert-then-remigrate).
         before_second_migrate = conn.execute(f"SELECT {columns} FROM media_sources ORDER BY id").fetchall()
         migrate(conn)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
         after2 = conn.execute(f"SELECT {columns} FROM media_sources ORDER BY id").fetchall()
         assert after2 == before_second_migrate
     finally:
@@ -483,8 +492,8 @@ def test_migration_5_adds_materials_is_administrative_column(db_path, tmp_path):
 
         migrate(conn)  # applies migrations 5 and 6 on top of this v4 db
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
-        assert MIGRATIONS[-1][0] == 6  # nothing newer has been appended without updating this test
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert MIGRATIONS[-1][0] == 7  # nothing newer has been appended without updating this test
 
         assert "is_administrative" in _table_columns(conn, "materials")
         rows = conn.execute("SELECT id, is_administrative FROM materials ORDER BY id").fetchall()
@@ -518,7 +527,7 @@ def test_migration_5_adds_materials_is_administrative_column(db_path, tmp_path):
             "SELECT id, title, is_administrative FROM materials ORDER BY id"
         ).fetchall()
         migrate(conn)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
         after2 = conn.execute("SELECT id, title, is_administrative FROM materials ORDER BY id").fetchall()
         assert after2 == before_second_migrate
     finally:
@@ -588,8 +597,8 @@ def test_migration_6_adds_inherited_to_material_topics_method_check(db_path, tmp
 
         migrate(conn)  # applies migration 6 on top of this v5 db
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
-        assert MIGRATIONS[-1][0] == 6  # nothing newer has been appended without updating this test
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert MIGRATIONS[-1][0] == 7  # nothing newer has been appended without updating this test
 
         after = conn.execute(f"SELECT {columns} FROM material_topics ORDER BY id").fetchall()
         assert after == before  # every row, every column, survives byte-identical
@@ -636,7 +645,7 @@ def test_migration_6_adds_inherited_to_material_topics_method_check(db_path, tmp
         # after the rebuild" check, mirroring migration 4's own test).
         before_second_migrate = conn.execute(f"SELECT {columns} FROM material_topics ORDER BY id").fetchall()
         migrate(conn)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
         after2 = conn.execute(f"SELECT {columns} FROM material_topics ORDER BY id").fetchall()
         assert after2 == before_second_migrate
     finally:
@@ -698,8 +707,8 @@ def test_migrations_5_and_6_apply_together_on_a_v4_database_with_data(db_path, t
 
         migrate(conn)  # ONE call, applying 5 and 6 back to back
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
-        assert MIGRATIONS[-1][0] == 6  # nothing newer has been appended without updating this test
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert MIGRATIONS[-1][0] == 7  # nothing newer has been appended without updating this test
 
         # Migration 5's change is present...
         assert "is_administrative" in _table_columns(conn, "materials")
@@ -735,7 +744,7 @@ def test_migrations_5_and_6_apply_together_on_a_v4_database_with_data(db_path, t
         ).fetchall()
         topics_before_second = conn.execute(f"SELECT {topic_columns} FROM material_topics ORDER BY id").fetchall()
         migrate(conn)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
         assert conn.execute(
             "SELECT id, title, is_administrative FROM materials ORDER BY id"
         ).fetchall() == materials_before_second
@@ -822,3 +831,176 @@ def test_enrichment_resources_unique_index_on_topic_and_url(db_path):
         session.add(EnrichmentResource(topic_id=topic_id, url="https://example.com/a"))
         with pytest.raises(IntegrityError):
             session.commit()
+
+
+# --------------------------------------------------------------------------
+# M2.7's migration 7 (lti_resolutions). Same "brand new table" shape as
+# migration 3's media_sources: a database that predates the table must gain
+# it on migrate(), and a second migrate() must change nothing. Built by
+# applying schema.sql and dropping the table (schema.sql already creates it
+# for a fresh database), same reasoning as migration 3's own test.
+# --------------------------------------------------------------------------
+
+
+def test_migration_7_adds_lti_resolutions_to_a_v6_database(db_path, tmp_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(MIGRATIONS[0][1])
+        conn.executescript("BEGIN;\nDROP TABLE lti_resolutions;\nPRAGMA user_version = 6;\nCOMMIT;\n")
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+
+        migrate(conn)
+
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lti_resolutions'"
+        ).fetchone()
+        assert exists is not None
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert MIGRATIONS[-1][0] == 7  # nothing newer has been appended without updating this test
+
+        # The migrated table must match what a fresh database gets from
+        # schema.sql.
+        fresh_path = tmp_path / "fresh.db"
+        init_db(fresh_path)
+        fresh_conn = sqlite3.connect(fresh_path)
+        try:
+            assert _table_columns(conn, "lti_resolutions") == _table_columns(fresh_conn, "lti_resolutions")
+        finally:
+            fresh_conn.close()
+
+        # Usable, and a second migrate() leaves both the schema and the data
+        # exactly as they are.
+        conn.executescript(
+            """
+            INSERT INTO courses (d2l_org_unit_id, tenant_origin, name)
+                VALUES (1, 'school.d2l.com', 'Intro to CS');
+            INSERT INTO materials (course_id, title) VALUES (1, 'Mediasite Channel');
+            INSERT INTO lti_resolutions (
+                course_id, material_id, launch_url, final_url, platform, status, error,
+                created_at, updated_at
+            ) VALUES (
+                1, 1, 'https://school.d2l.com/d2l/lti/launch?x=1',
+                'https://mediasite.example.edu/Mediasite/Play/xyz', 'mediasite', 'resolved', NULL,
+                '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+            );
+            """
+        )
+
+        migrate(conn)
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        row = conn.execute("SELECT launch_url, final_url, platform, status FROM lti_resolutions").fetchone()
+        assert row == (
+            "https://school.d2l.com/d2l/lti/launch?x=1",
+            "https://mediasite.example.edu/Mediasite/Play/xyz",
+            "mediasite",
+            "resolved",
+        )
+    finally:
+        conn.close()
+
+
+def test_lti_resolutions_unique_on_material_id(db_path):
+    """UNIQUE(material_id): a second row for the same material must raise,
+    matching the "one row per material" upsert contract Task 1's endpoints
+    rely on."""
+    _, Session = init_db(db_path)
+
+    with Session() as session:
+        course = _make_course()
+        session.add(course)
+        session.flush()
+        material = Material(course_id=course.id, title="Mediasite Channel")
+        session.add(material)
+        session.commit()
+        course_id, material_id = course.id, material.id
+
+    with Session() as session:
+        session.add(
+            LtiResolution(
+                course_id=course_id,
+                material_id=material_id,
+                launch_url="https://school.d2l.com/d2l/lti/launch?x=1",
+                status="unrecognized",
+                final_url="https://example.com/landing",
+                created_at="2026-01-01T00:00:00+00:00",
+                updated_at="2026-01-01T00:00:00+00:00",
+            )
+        )
+        session.commit()
+
+    with Session() as session:
+        session.add(
+            LtiResolution(
+                course_id=course_id,
+                material_id=material_id,
+                launch_url="https://school.d2l.com/d2l/lti/launch?x=1",
+                status="failed",
+                error="tab closed",
+                created_at="2026-01-02T00:00:00+00:00",
+                updated_at="2026-01-02T00:00:00+00:00",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+def test_lti_resolutions_status_check_constraint(db_path):
+    _, Session = init_db(db_path)
+
+    with Session() as session:
+        course = _make_course()
+        session.add(course)
+        session.flush()
+        material = Material(course_id=course.id, title="Mediasite Channel")
+        session.add(material)
+        session.commit()
+        course_id, material_id = course.id, material.id
+
+    with Session() as session:
+        session.add(
+            LtiResolution(
+                course_id=course_id,
+                material_id=material_id,
+                launch_url="https://school.d2l.com/d2l/lti/launch?x=1",
+                status="bogus",
+                created_at="2026-01-01T00:00:00+00:00",
+                updated_at="2026-01-01T00:00:00+00:00",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+def test_lti_resolutions_material_fk_cascades(db_path):
+    _, Session = init_db(db_path)
+
+    with Session() as session:
+        course = _make_course()
+        session.add(course)
+        session.flush()
+        material = Material(course_id=course.id, title="Mediasite Channel")
+        session.add(material)
+        session.commit()
+        course_id, material_id = course.id, material.id
+
+    with Session() as session:
+        row = LtiResolution(
+            course_id=course_id,
+            material_id=material_id,
+            launch_url="https://school.d2l.com/d2l/lti/launch?x=1",
+            status="unrecognized",
+            final_url="https://example.com/landing",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        session.add(row)
+        session.commit()
+        row_id = row.id
+
+    with Session() as session:
+        session.execute(text("DELETE FROM materials WHERE id = :id"), {"id": material_id})
+        session.commit()
+
+    with Session() as session:
+        assert session.get(LtiResolution, row_id) is None  # cascaded away with its material

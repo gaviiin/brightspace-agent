@@ -89,6 +89,22 @@ class MediaSource(Base):
     updated_at: Mapped[str]
 
 
+class LtiResolution(Base):
+    __tablename__ = "lti_resolutions"
+    __table_args__ = (UniqueConstraint("material_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    course_id: Mapped[int] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"))
+    material_id: Mapped[int] = mapped_column(ForeignKey("materials.id", ondelete="CASCADE"))
+    launch_url: Mapped[str]
+    final_url: Mapped[str | None]
+    platform: Mapped[str | None]
+    status: Mapped[str]
+    error: Mapped[str | None]
+    created_at: Mapped[str]
+    updated_at: Mapped[str]
+
+
 class Topic(Base):
     __tablename__ = "topics"
     __table_args__ = (UniqueConstraint("course_id", "taxonomy_version", "slug"),)

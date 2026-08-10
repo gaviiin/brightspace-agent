@@ -75,6 +75,36 @@ CREATE TABLE IF NOT EXISTS media_sources (
     UNIQUE(course_id, url)
 );
 
+-- M2.7: one row per material recording an LTI-launch resolution attempt --
+-- the extension performs the launch (the D2L ToC only ever gives us the LTI
+-- quicklink stub; the real Mediasite/Zoom URL only materializes once a
+-- logged-in browser actually launches it), reads the final URL, and POSTs it
+-- here. `launch_url` is the quicklink `classify_url` structurally can't see
+-- through; `final_url`/`platform` are populated once a launch lands
+-- somewhere, NULL for a `failed` attempt (tab closed, off-origin launch URL,
+-- no final URL at all). `status`: 'resolved' (final_url classified to a
+-- supported platform -- media_sources rows follow via the same
+-- expand-and-upsert path manual-add uses), 'unrecognized' (a real landing
+-- page, just not a supported platform -- diagnostic gold for the drawer,
+-- not an error), 'failed' (no usable final_url; re-offered on the next
+-- sync, unlike the other two statuses). UNIQUE(material_id): one row per
+-- material, overwritten on every re-resolution. IF NOT EXISTS: also
+-- reapplied as migration 7 for databases that predate this table (see
+-- migrate.py).
+CREATE TABLE IF NOT EXISTS lti_resolutions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+    launch_url TEXT NOT NULL,
+    final_url TEXT,
+    platform TEXT,
+    status TEXT NOT NULL CHECK(status IN ('resolved','unrecognized','failed')),
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(material_id)
+);
+
 CREATE TABLE topics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
