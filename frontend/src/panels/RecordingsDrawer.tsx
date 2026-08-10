@@ -1,8 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 
-import { detectMedia, getMedia, processMedia, processMediaSource, updateMediaSource } from "../api/client";
-import type { MediaSourceStatus, MediaSourceSummary, MediaSourceUpdateRequest } from "../api/types";
+import {
+  addMediaUrl,
+  detectMedia,
+  getMedia,
+  processMedia,
+  processMediaSource,
+  updateMediaSource,
+} from "../api/client";
+import type { MediaHint, MediaSourceStatus, MediaSourceSummary, MediaSourceUpdateRequest } from "../api/types";
 import { useUiStore } from "../state/uiStore";
 import { StatusBadge } from "./RunsDrawer";
 
@@ -76,7 +83,14 @@ export function RecordingsDrawer({ courseId, onClose }: RecordingsDrawerProps) {
     onSuccess: invalidate,
   });
 
+  const addMutation = useMutation({
+    mutationFn: ({ url, passcode }: { url: string; passcode: string | null }) =>
+      addMediaUrl(courseId, { url, passcode }),
+    onSuccess: invalidate,
+  });
+
   const sources = mediaQuery.data?.sources ?? [];
+  const hints = mediaQuery.data?.hints ?? [];
   const active = mediaQuery.data?.active ?? false;
   const hasProcessable = sources.some((s) => s.status === "detected" || s.status === "failed");
   const detectDisabled = active || detectMutation.isPending;
@@ -140,6 +154,16 @@ export function RecordingsDrawer({ courseId, onClose }: RecordingsDrawerProps) {
             <p className="text-xs text-red-600 dark:text-red-400">{errorMessage(processAllMutation.error)}</p>
           )}
 
+          <AddUrlSection
+            active={active}
+            onAdd={(url, passcode) => addMutation.mutate({ url, passcode })}
+            pending={addMutation.isPending}
+            addedCount={addMutation.isSuccess ? addMutation.data.added : null}
+            errorText={addMutation.isError ? errorMessage(addMutation.error) : null}
+          />
+
+          <HintsSection hints={hints} />
+
           {mediaQuery.data && sources.length === 0 && (
             <div>
               <p className="text-sm text-neutral-500 dark:text-neutral-400">No recordings detected yet.</p>
@@ -181,6 +205,97 @@ export function RecordingsDrawer({ courseId, onClose }: RecordingsDrawerProps) {
           )}
         </div>
       </aside>
+    </div>
+  );
+}
+
+interface AddUrlSectionProps {
+  /** Any run active for the course -- same guard the row-level actions use. */
+  active: boolean;
+  onAdd: (url: string, passcode: string | null) => void;
+  pending: boolean;
+  /** `addMutation.data.added` from the most recent successful add, or null
+   * before any add / while one is in flight. */
+  addedCount: number | null;
+  errorText: string | null;
+}
+
+/** The M2.6a workaround for a recording the sync can't see at all: paste its
+ * page URL (or a channel/catalog page's URL, which expands server-side into
+ * one row per lecture) and an optional Zoom passcode. */
+function AddUrlSection({ active, onAdd, pending, addedCount, errorText }: AddUrlSectionProps) {
+  const [url, setUrl] = useState("");
+  const [passcode, setPasscode] = useState("");
+
+  function submit() {
+    const trimmed = url.trim();
+    if (!trimmed) return;
+    onAdd(trimmed, passcode.trim() === "" ? null : passcode.trim());
+  }
+
+  return (
+    <div className="space-y-1.5 rounded-md border border-neutral-200 p-2 dark:border-neutral-800">
+      <p className="text-xs font-medium text-neutral-700 dark:text-neutral-300">Add recording or channel URL</p>
+      <input
+        type="text"
+        aria-label="Recording or channel URL"
+        value={url}
+        onChange={(event) => setUrl(event.target.value)}
+        placeholder="https://…"
+        className="w-full rounded-md border border-neutral-300 px-1.5 py-1 text-xs text-neutral-900 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-100"
+      />
+      <div className="flex items-center gap-1.5">
+        <input
+          type="text"
+          aria-label="Passcode (optional)"
+          value={passcode}
+          onChange={(event) => setPasscode(event.target.value)}
+          placeholder="passcode (optional)"
+          className="w-28 rounded-md border border-neutral-300 px-1.5 py-0.5 text-xs text-neutral-900 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-100"
+        />
+        <button
+          type="button"
+          disabled={active || pending || url.trim() === ""}
+          onClick={submit}
+          className="rounded-md bg-blue-600 px-2.5 py-1 text-xs font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {pending ? "Adding…" : "Add"}
+        </button>
+      </div>
+      {addedCount !== null && !pending && (
+        <p className="text-xs text-green-700 dark:text-green-400">
+          Added {addedCount} recording{addedCount === 1 ? "" : "s"}
+        </p>
+      )}
+      {errorText && <p className="text-xs text-red-600 dark:text-red-400">{errorText}</p>}
+    </div>
+  );
+}
+
+interface HintsSectionProps {
+  hints: MediaHint[];
+}
+
+/** Points the user at the paste-a-URL workaround above BEFORE they go
+ * looking for it -- link materials that look LTI-embedded and are titled
+ * like a recording channel (api/media.py's `_compute_lti_hints`), i.e. the
+ * exact real-world shape this task started from (Mediasite behind an
+ * LTI-embedded D2L quicklink). */
+function HintsSection({ hints }: HintsSectionProps) {
+  if (hints.length === 0) return null;
+
+  return (
+    <div className="space-y-1 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+      <p className="font-medium">These look like recording channels the sync can't read:</p>
+      <ul className="list-disc space-y-0.5 pl-4">
+        {hints.map((hint) => (
+          <li key={hint.materialId}>{hint.title}</li>
+        ))}
+      </ul>
+      <p>
+        Open it in Brightspace, copy the page URL from the embedded player (right-click → open frame in new tab
+        if needed), and paste it above.
+      </p>
     </div>
   );
 }
@@ -229,7 +344,9 @@ function SourceRow({
           {PLATFORM_LABELS[source.platform] ?? source.platform}
         </span>
         <span className="min-w-0 flex-1 truncate text-sm text-neutral-900 dark:text-neutral-100">
-          {source.materialTitle}
+          {/* A manually-added row (M2.6a) has no backing material at all --
+           * see api/media.py's MediaSourceOut docstring. */}
+          {source.materialTitle ?? "Added manually"}
         </span>
         <StatusBadge status={source.status} tone={MEDIA_STATUS_TONE[source.status]} />
       </div>

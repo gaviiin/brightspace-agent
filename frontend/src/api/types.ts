@@ -319,8 +319,11 @@ export type MediaSourceStatus = "detected" | "fetching" | "transcribing" | "done
 
 export interface MediaSourceSummary {
   id: number;
-  materialId: number;
-  materialTitle: string;
+  /** Both null for a manually-added row (POST .../media/add -- M2.6a): it
+   * has no backing `materials` row at all (see api/media.py's
+   * `MediaSourceOut`). */
+  materialId: number | null;
+  materialTitle: string | null;
   platform: MediaPlatform;
   url: string;
   /** Local single-user app, no masking (see api/media.py's `MediaSourceOut`). */
@@ -331,12 +334,21 @@ export interface MediaSourceSummary {
   updatedAt: string;
 }
 
+/** A link material that looks like an LTI-embedded recording channel the
+ * sync structurally can't read into (api/media.py's `_compute_lti_hints`) --
+ * points the user at the manual-add workaround instead. */
+export interface MediaHint {
+  materialId: number;
+  title: string;
+}
+
 export interface MediaListResponse {
   sources: MediaSourceSummary[];
   /** Any run (pipeline/enrichment/media) active for the course -- runner.py
    * shares one `_active` guard across all three, same meaning as
    * `PipelineStatusResponse.active`. */
   active: boolean;
+  hints: MediaHint[];
 }
 
 export interface MediaDetectResponse {
@@ -347,6 +359,21 @@ export interface MediaDetectResponse {
 
 export interface MediaRunResponse {
   runToken: number;
+}
+
+/** `POST /api/courses/{id}/media/add` body (M2.6a) -- a pasted recording or
+ * channel/catalog URL, with an optional passcode applied to any
+ * zoom-classified row(s) it expands into. */
+export interface MediaAddRequest {
+  url: string;
+  passcode?: string | null;
+}
+
+export interface MediaAddResponse {
+  added: number;
+  skipped: number;
+  total: number;
+  sources: MediaSourceSummary[];
 }
 
 /** `PUT /api/media/{id}` body. Both fields are optional-and-distinct-from-

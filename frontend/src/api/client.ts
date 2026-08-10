@@ -12,6 +12,8 @@ import type {
   EnrichmentStatus,
   GraphPayload,
   MaterialDetail,
+  MediaAddRequest,
+  MediaAddResponse,
   MediaDetectResponse,
   MediaListResponse,
   MediaRunResponse,
@@ -173,6 +175,17 @@ export function detectMedia(courseId: number): Promise<MediaDetectResponse> {
   return request<MediaDetectResponse>(`/api/courses/${courseId}/media/detect`, {
     method: "POST",
     headers: CSRF_HEADERS,
+  });
+}
+
+/** Adds a manually-pasted recording or channel/catalog URL (M2.6a) -- the
+ * workaround for a recording the sync structurally can't see (e.g. behind an
+ * LTI-embedded channel; see the `hints` field `getMedia` returns). */
+export function addMediaUrl(courseId: number, body: MediaAddRequest): Promise<MediaAddResponse> {
+  return request<MediaAddResponse>(`/api/courses/${courseId}/media/add`, {
+    method: "POST",
+    headers: { ...CSRF_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
 }
 

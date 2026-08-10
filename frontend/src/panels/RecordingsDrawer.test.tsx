@@ -12,10 +12,12 @@ vi.mock("../api/client", async (importOriginal) => {
     processMedia: vi.fn(),
     processMediaSource: vi.fn(),
     updateMediaSource: vi.fn(),
+    addMediaUrl: vi.fn(),
   };
 });
 
 import {
+  addMediaUrl,
   ApiError,
   detectMedia,
   getMedia,
@@ -23,7 +25,7 @@ import {
   processMediaSource,
   updateMediaSource,
 } from "../api/client";
-import type { MediaListResponse, MediaSourceSummary } from "../api/types";
+import type { MediaHint, MediaListResponse, MediaSourceSummary } from "../api/types";
 import { useUiStore } from "../state/uiStore";
 import { RecordingsDrawer } from "./RecordingsDrawer";
 
@@ -32,6 +34,7 @@ const mockedDetectMedia = vi.mocked(detectMedia);
 const mockedProcessMedia = vi.mocked(processMedia);
 const mockedProcessMediaSource = vi.mocked(processMediaSource);
 const mockedUpdateMediaSource = vi.mocked(updateMediaSource);
+const mockedAddMediaUrl = vi.mocked(addMediaUrl);
 
 function source(overrides: Partial<MediaSourceSummary> = {}): MediaSourceSummary {
   return {
@@ -82,8 +85,13 @@ function fixtureMedia(overrides: Partial<MediaListResponse> = {}): MediaListResp
       }),
     ],
     active: false,
+    hints: [],
     ...overrides,
   };
+}
+
+function hint(overrides: Partial<MediaHint> = {}): MediaHint {
+  return { materialId: 50, title: "Mediasite Channel (Stern)", ...overrides };
 }
 
 function renderDrawer(onClose = vi.fn()) {
@@ -236,6 +244,139 @@ describe("RecordingsDrawer: detect", () => {
     fireEvent.click(screen.getByRole("button", { name: "Detect" }));
 
     await vi.waitFor(() => expect(mockedDetectMedia).toHaveBeenCalledWith(15));
+  });
+});
+
+describe("RecordingsDrawer: add URL", () => {
+  it("Add calls addMediaUrl with the typed url and passcode", async () => {
+    mockedGetMedia.mockResolvedValue(fixtureMedia());
+    mockedAddMediaUrl.mockResolvedValue({ added: 1, skipped: 0, total: 1, sources: [] });
+
+    renderDrawer();
+    await screen.findByText("Lecture 1 (Mediasite)");
+
+    fireEvent.change(screen.getByLabelText("Recording or channel URL"), {
+      target: { value: "https://mediasite.example.edu/Mediasite/Play/xyz" },
+    });
+    fireEvent.change(screen.getByLabelText("Passcode (optional)"), { target: { value: "s3cret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    await vi.waitFor(() =>
+      expect(mockedAddMediaUrl).toHaveBeenCalledWith(15, {
+        url: "https://mediasite.example.edu/Mediasite/Play/xyz",
+        passcode: "s3cret",
+      }),
+    );
+  });
+
+  it("an empty passcode field is sent as null", async () => {
+    mockedGetMedia.mockResolvedValue(fixtureMedia());
+    mockedAddMediaUrl.mockResolvedValue({ added: 1, skipped: 0, total: 1, sources: [] });
+
+    renderDrawer();
+    await screen.findByText("Lecture 1 (Mediasite)");
+
+    fireEvent.change(screen.getByLabelText("Recording or channel URL"), {
+      target: { value: "https://mediasite.example.edu/Mediasite/Play/xyz" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    await vi.waitFor(() =>
+      expect(mockedAddMediaUrl).toHaveBeenCalledWith(15, {
+        url: "https://mediasite.example.edu/Mediasite/Play/xyz",
+        passcode: null,
+      }),
+    );
+  });
+
+  it("shows the added count on success", async () => {
+    mockedGetMedia.mockResolvedValue(fixtureMedia());
+    mockedAddMediaUrl.mockResolvedValue({ added: 3, skipped: 0, total: 3, sources: [] });
+
+    renderDrawer();
+    await screen.findByText("Lecture 1 (Mediasite)");
+
+    fireEvent.change(screen.getByLabelText("Recording or channel URL"), {
+      target: { value: "https://mock.mediasite.example/mock-channel/full" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    await screen.findByText("Added 3 recordings");
+  });
+
+  it("400/502 detail renders inline", async () => {
+    mockedGetMedia.mockResolvedValue(fixtureMedia());
+    mockedAddMediaUrl.mockRejectedValue(
+      new ApiError(400, "That URL wasn't recognized as a supported recording platform."),
+    );
+
+    renderDrawer();
+    await screen.findByText("Lecture 1 (Mediasite)");
+
+    fireEvent.change(screen.getByLabelText("Recording or channel URL"), {
+      target: { value: "https://example.com/not-a-recording" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    await screen.findByText("That URL wasn't recognized as a supported recording platform.");
+  });
+
+  it("disables the Add button while a run is active", async () => {
+    mockedGetMedia.mockResolvedValue(fixtureMedia({ active: true }));
+
+    renderDrawer();
+    await screen.findByText("Lecture 1 (Mediasite)");
+
+    expect(screen.getByRole("button", { name: "Add" }).hasAttribute("disabled")).toBe(true);
+  });
+});
+
+describe("RecordingsDrawer: LTI channel hints", () => {
+  it("renders the hint title and instruction when hints are non-empty", async () => {
+    mockedGetMedia.mockResolvedValue(
+      fixtureMedia({ hints: [hint({ materialId: 50, title: "Mediasite Channel (Stern)" })] }),
+    );
+
+    renderDrawer();
+
+    await screen.findByText("These look like recording channels the sync can't read:");
+    expect(screen.getByText("Mediasite Channel (Stern)")).toBeTruthy();
+    expect(
+      screen.getByText(
+        /Open it in Brightspace, copy the page URL from the embedded player/,
+      ),
+    ).toBeTruthy();
+  });
+
+  it("renders nothing when hints are empty", async () => {
+    mockedGetMedia.mockResolvedValue(fixtureMedia({ hints: [] }));
+
+    renderDrawer();
+    await screen.findByText("Lecture 1 (Mediasite)");
+
+    expect(screen.queryByText("These look like recording channels the sync can't read:")).toBeNull();
+  });
+});
+
+describe("RecordingsDrawer: manually-added rows", () => {
+  it("shows 'Added manually' when materialTitle is null", async () => {
+    mockedGetMedia.mockResolvedValue(
+      fixtureMedia({
+        sources: [
+          source({
+            id: 5,
+            materialId: null,
+            materialTitle: null,
+            platform: "mediasite",
+            url: "https://mediasite.example.edu/Mediasite/Play/manual",
+          }),
+        ],
+      }),
+    );
+
+    renderDrawer();
+
+    expect(await screen.findByText("Added manually")).toBeTruthy();
   });
 });
 
