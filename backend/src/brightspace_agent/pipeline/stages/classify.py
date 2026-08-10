@@ -571,13 +571,14 @@ def _inherit_one(
     shadowed -- inheritance only fills topics the source lacks.
 
     If NONE of the linked transcripts have rows at `version` yet, this is a
-    no-op that leaves any existing inherited rows exactly as they are --
-    deliberately: "never classified at this version" and "classified but
-    matched zero topics" are indistinguishable from here (a transcript that
-    matched nothing simply has no `material_topics` rows, same as one never
-    classified), and wiping the source's last-known-good inherited rows on
-    every transient zero-topic reclassification would be worse than
-    leaving them briefly stale.
+    no-op that leaves any existing inherited rows (and the source's
+    `is_administrative` flag) exactly as they are -- deliberately: "never
+    classified at this version" and "classified but matched zero topics" are
+    indistinguishable from here (a transcript that matched nothing simply
+    has no `material_topics` rows, same as one never classified), and wiping
+    the source's last-known-good inherited rows on every transient
+    zero-topic reclassification would be worse than leaving them briefly
+    stale.
     """
     transcript_rows = list(
         session.execute(
@@ -616,7 +617,6 @@ def _inherit_one(
         )
     )
 
-    wrote_any = False
     for topic_id, row in best.items():
         if topic_id in direct_topic_ids:
             continue  # a direct assignment on the source wins; never shadowed
@@ -631,18 +631,22 @@ def _inherit_one(
                 review_status="auto",
             )
         )
-        wrote_any = True
 
-    if wrote_any:
-        # M3.5a's admin flag (task-A review fix: S3 may have flagged a bare
-        # recording link as administrative from its thin pseudo-doc): if it
-        # stays, S4's admin exclusion silently hides the topics just
-        # inherited here. Mirrors classify.py's own per-material rule
-        # (`_classify_one` above) of always writing the flag explicitly the
-        # moment a material gets real topics, not just leaving a stale
-        # `True` in place -- the recording material usually never goes
-        # through that pass itself, so this is the only place that clears
-        # it for one.
-        source_material = session.get(Material, source_material_id)
-        if source_material is not None:
-            source_material.is_administrative = 0
+    # M3.5a's admin flag (task-A review fix: S3 may have flagged a bare
+    # recording link as administrative from its thin pseudo-doc): if it
+    # stays, S4's admin exclusion silently hides this material's topics --
+    # inherited or direct -- and files it under Logistics & admin instead.
+    # Mirrors classify.py's own per-material rule (`_classify_one` above) of
+    # always writing the flag explicitly the moment a material has real
+    # topics, not just leaving a stale `True` in place; the recording
+    # material usually never goes through that pass itself, so this is the
+    # only place that clears it for one.
+    #
+    # Keyed on "a linked transcript IS classified at this version" (the
+    # `transcript_rows` guard above), NOT on "inheritance wrote a row" -- a
+    # source whose direct assignments already cover every topic its
+    # transcript carries writes nothing here and is still, demonstrably, not
+    # administrative.
+    source_material = session.get(Material, source_material_id)
+    if source_material is not None:
+        source_material.is_administrative = 0

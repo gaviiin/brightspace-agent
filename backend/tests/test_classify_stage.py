@@ -846,6 +846,7 @@ def test_inheritance_adds_only_missing_topics_and_preserves_direct_assignments(
     topic_ids = _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
     source_id = _add_material(
         session_factory, course_id, title="Lecture 5 Recording", kind="link", status="summarized",
+        is_administrative=1,
     )
     transcript_id = _add_material(
         session_factory, course_id, title="Lecture 5 Recording (transcript)", kind="transcript",
@@ -890,6 +891,56 @@ def test_inheritance_adds_only_missing_topics_and_preserves_direct_assignments(
     assert inherited.method == "inherited"
     assert inherited.rationale == "inherited from the lecture transcript"
     assert inherited.confidence == pytest.approx(0.4)
+
+    with session_factory() as session:
+        assert session.get(Material, source_id).is_administrative == 0  # cleared
+
+
+def test_inheritance_clears_the_admin_flag_even_when_every_topic_is_already_direct(
+    session_factory, backend, course_id
+):
+    """The admin flag has to be cleared off the back of "this source's
+    transcript IS classified", not "inheritance happened to write a row".
+
+    A source whose direct assignments already cover every topic its
+    transcript carries needs no inherited rows -- but it is demonstrably not
+    administrative, and a stale `is_administrative=1` makes S4 (graph/
+    build.py) file it in the Logistics & admin bucket and drop its
+    assignments from every real topic. The material then reads as unfiled to
+    the student even though it is perfectly well classified.
+    """
+    topic_ids = _write_taxonomy(session_factory, course_id, 1, TAXONOMY_V1)
+    source_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording", kind="link", status="fetched",
+        is_administrative=1,
+    )
+    transcript_id = _add_material(
+        session_factory, course_id, title="Lecture 5 Recording (transcript)", kind="transcript",
+    )
+    _add_media_source(
+        session_factory, course_id, material_id=source_id, transcript_material_id=transcript_id,
+        url="https://zoom.us/rec/share/lecture5",
+    )
+    with session_factory() as session:
+        # Direct rows on the source for BOTH topics MockBackend gives the
+        # transcript, so `_inherit_one` finds nothing left to write.
+        for slug in ("arrays-and-lists", "sorting-algorithms"):
+            session.add(
+                MaterialTopic(
+                    material_id=source_id, topic_id=topic_ids[slug], taxonomy_version=1,
+                    confidence=0.5, rationale="direct", method="llm", review_status="auto",
+                )
+            )
+        session.commit()
+
+    _run(session_factory, backend, course_id)
+
+    source_rows = _rows(session_factory, material_id=source_id)
+    assert len(source_rows) == 2
+    assert all(row.method == "llm" for row in source_rows)  # nothing was inherited
+
+    with session_factory() as session:
+        assert session.get(Material, source_id).is_administrative == 0
 
 
 def test_inheritance_rerun_is_idempotent_no_duplicate_rows(session_factory, backend, course_id):
