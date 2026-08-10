@@ -27,6 +27,9 @@ dev = [
     "pytest",
     "httpx",
 ]
+media = [
+    "yt-dlp>=2026.7.4",
+]
 
 [build-system]
 requires = ["hatchling"]

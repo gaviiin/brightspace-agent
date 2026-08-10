@@ -30,6 +30,21 @@ class Settings(BaseSettings):
     smart_model: str = "claude-sonnet-5"
     mock_llm: bool = False
 
+    # Media layer (media/fetch.py, Task M2.2). yt-dlp cookie source for
+    # gated recordings (Zoom/Drive) -- `cookies_file` (a Netscape cookies.txt
+    # exported by the user) wins when set; otherwise yt-dlp reads live
+    # cookies straight out of the named browser's profile. `mock_media`
+    # forces the offline fetcher even when yt-dlp is installed (same idea as
+    # `mock_llm`); `make_media_fetcher` also treats `mock_llm` as forcing it,
+    # so an offline test/e2e run never spawns a subprocess either way.
+    # `keep_media` is read by a later task (M2.4's cleanup step) -- just the
+    # setting lives here for now.
+    cookies_from_browser: str = "chrome"
+    cookies_file: Path | None = None
+    mock_media: bool = False
+    media_fetch_timeout_s: int = 1800
+    keep_media: bool = False
+
     # Pipeline runner (Task 9): a hard-ish per-run spend guard shared across
     # the summarize and classify stages (see pipeline/runner.py). Advisory,
     # like the rest of cost estimation -- see agents/llm.py's cost table.
@@ -79,6 +94,10 @@ class Settings(BaseSettings):
     @property
     def text_dir(self) -> Path:
         return self.data_dir / "text"
+
+    @property
+    def media_dir(self) -> Path:
+        return self.data_dir / "media"
 
 
 def ensure_data_dir(settings: Settings) -> dict:
