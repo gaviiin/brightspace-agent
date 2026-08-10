@@ -914,13 +914,21 @@ class PipelineRunner:
         exception escape -- `MediaFetchError`/`MediaTranscribeError` and any
         other exception are all handled the same way (status='failed', the
         error recorded, an SSE event emitted) so the batch loop in
-        `_execute_media` always continues to the next source."""
-        self._set_media_source_status(source_id, status="fetching", error=None)
-        hooks.emit_source(source_id, "fetching")
-
+        `_execute_media` always continues to the next source. That includes
+        the initial status write and the attempt-dir `mkdir` itself (an
+        OS-level failure there -- ENOSPC, permission denied on
+        `media_dir` -- must strand this one source as 'failed', not crash
+        the whole batch and leave the row stuck at 'fetching' forever);
+        `attempt_dir`'s Path object is the only thing built outside the
+        try, since constructing it is pure string joining with no I/O.
+        """
         attempt_dir = self._settings.media_dir / str(source_id) / _attempt_token()
-        attempt_dir.mkdir(parents=True, exist_ok=True)
         try:
+            self._set_media_source_status(source_id, status="fetching", error=None)
+            hooks.emit_source(source_id, "fetching")
+
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+
             platform, url, passcode = self._read_media_source_spec(source_id)
             spec = FetchSpec(platform=platform, url=url, passcode=passcode, dest_dir=attempt_dir)
             fetch_result = await asyncio.to_thread(self.media_fetcher.fetch, spec)

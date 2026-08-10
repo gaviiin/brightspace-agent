@@ -190,10 +190,20 @@ def update_media_source(
 ) -> MediaSourceOut:
     source = _get_media_source_or_404(session, source_id)
 
+    fields_set = payload.model_fields_set
+    # `status` is typed `Literal["skipped", "detected"] | None` only so an
+    # ABSENT field (the "leave it alone" case `fields_set` distinguishes
+    # from an explicit value, same as `passcode` below) parses -- the
+    # contract itself never allows an explicit `null`, which would
+    # otherwise reach `media_sources.status`, a NOT NULL column, and 500 on
+    # commit. Rejected here, before touching the row or the active-run
+    # guard, since it's a malformed request regardless of server state.
+    if "status" in fields_set and payload.status is None:
+        raise HTTPException(status_code=422, detail="status cannot be null; use 'skipped' or 'detected'")
+
     if runner.is_active(source.course_id):
         raise HTTPException(status_code=409, detail="a run is already active for this course")
 
-    fields_set = payload.model_fields_set
     if "status" in fields_set:
         if source.status not in _EDITABLE_STATUSES:
             raise HTTPException(

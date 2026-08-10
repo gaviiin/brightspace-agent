@@ -259,6 +259,57 @@ def test_ingest_failure_after_a_successful_fetch_counts_as_failed_only(client, a
     assert usage["transcribed"] == 0
 
 
+def test_attempt_dir_mkdir_failure_for_one_source_is_isolated(client, app, db_session_factory, monkeypatch):
+    """An OS-level failure building the attempt dir (ENOSPC, permission
+    denied on media_dir, ...) for ONE source must be handled the same way
+    as any other per-source failure: that source ends 'failed' with an
+    'internal: ...' error, and the batch continues to -- and completes --
+    the remaining sources, rather than escaping to the batch handler and
+    abandoning the rest."""
+    import pathlib
+
+    course_id = _add_course(db_session_factory)
+    bad_material = _add_material(db_session_factory, course_id, source_url="https://zoom.us/rec/share/mock-captions")
+    bad_source = _add_media_source(
+        db_session_factory, course_id, bad_material, url="https://zoom.us/rec/share/mock-captions",
+    )
+    good_material = _add_material(
+        db_session_factory, course_id, source_url="https://zoom.us/rec/share/mock-captions-2",
+    )
+    good_source = _add_media_source(
+        db_session_factory, course_id, good_material, url="https://zoom.us/rec/share/mock-captions-2",
+    )
+
+    media_dir = app.state.settings.media_dir
+    bad_source_dir = media_dir / str(bad_source)
+    original_mkdir = pathlib.Path.mkdir
+
+    def flaky_mkdir(self, *args, **kwargs):
+        try:
+            self.relative_to(bad_source_dir)
+        except ValueError:
+            return original_mkdir(self, *args, **kwargs)
+        raise OSError("simulated ENOSPC")
+
+    monkeypatch.setattr(pathlib.Path, "mkdir", flaky_mkdir)
+
+    resp = client.post(f"/api/courses/{course_id}/media/process", headers=CSRF_HEADERS)
+    assert resp.status_code == 200
+
+    body = _wait_for_media_idle(client, course_id)
+    by_id = {s["id"]: s for s in body["sources"]}
+    assert by_id[bad_source]["status"] == "failed"
+    assert by_id[bad_source]["error"].startswith("internal:")
+    assert by_id[good_source]["status"] == "done"
+
+    runs = _pipeline_runs(db_session_factory, course_id)
+    media_run = [r for r in runs if r.stage == "media"][0]
+    assert media_run.status == "complete"
+    usage = json.loads(media_run.usage_json)
+    assert usage["done"] == 1
+    assert usage["failed"] == 1
+
+
 # --------------------------------------------------------------------------
 # (3) keep_media
 # --------------------------------------------------------------------------
@@ -578,6 +629,22 @@ def test_put_409_for_disallowed_transition_while_fetching(client, db_session_fac
 def test_put_unknown_source_404(client):
     resp = client.put("/api/media/999999", json={"status": "skipped"}, headers=CSRF_HEADERS)
     assert resp.status_code == 404
+
+
+def test_put_explicit_null_status_is_rejected_not_500(client, db_session_factory):
+    """The contract only allows `status: 'skipped'|'detected'` -- an
+    explicit `"status": null` must be rejected cleanly, never reach the
+    NOT NULL `media_sources.status` column (which would 500 on commit)."""
+    course_id = _add_course(db_session_factory)
+    material_id = _add_material(db_session_factory, course_id, source_url="https://zoom.us/rec/share/x")
+    source_id = _add_media_source(db_session_factory, course_id, material_id, url="https://zoom.us/rec/share/x")
+
+    resp = client.put(f"/api/media/{source_id}", json={"status": None}, headers=CSRF_HEADERS)
+    assert resp.status_code in (400, 422)
+
+    with db_session_factory() as session:
+        row = session.get(MediaSource, source_id)
+        assert row.status == "detected"  # unchanged
 
 
 # --------------------------------------------------------------------------
