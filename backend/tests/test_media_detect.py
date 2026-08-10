@@ -302,7 +302,6 @@ def test_redetect_no_duplicates_status_untouched_passcode_filled_only_when_null(
 def app(data_dir, monkeypatch):
     monkeypatch.setenv("BSA_MOCK_LLM", "1")
     from brightspace_agent.main import create_app
-    from brightspace_agent.main import create_app
 
     return create_app()
 
