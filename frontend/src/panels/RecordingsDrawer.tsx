@@ -165,7 +165,9 @@ export function RecordingsDrawer({ courseId, onClose }: RecordingsDrawerProps) {
                   }
                   onSkip={() => updateMutation.mutate({ id: source.id, body: { status: "skipped" } })}
                   onUnskip={() => updateMutation.mutate({ id: source.id, body: { status: "detected" } })}
-                  onSavePasscode={(passcode) => updateMutation.mutate({ id: source.id, body: { passcode } })}
+                  onSavePasscode={(passcode) =>
+                    updateMutation.mutateAsync({ id: source.id, body: { passcode } })
+                  }
                   updatePending={updateMutation.isPending && updateMutation.variables?.id === source.id}
                   updateError={
                     updateMutation.isError && updateMutation.variables?.id === source.id
@@ -196,7 +198,10 @@ interface SourceRowProps {
   processError: string | null;
   onSkip: () => void;
   onUnskip: () => void;
-  onSavePasscode: (passcode: string | null) => void;
+  /** Resolves on a successful save, rejects on failure -- PasscodeEditor
+   * needs that distinction to decide whether the typed value may be
+   * replaced by the server's. */
+  onSavePasscode: (passcode: string | null) => Promise<unknown>;
   updatePending: boolean;
   updateError: string | null;
   onSelectTranscript: (materialId: number) => void;
@@ -281,7 +286,7 @@ function SourceRow({
 
 interface PasscodeEditorProps {
   passcode: string | null;
-  onSave: (passcode: string | null) => void;
+  onSave: (passcode: string | null) => Promise<unknown>;
   saving: boolean;
 }
 
@@ -290,7 +295,13 @@ interface PasscodeEditorProps {
  * `MediaSourceOut`'s docstring: local single-user app). Saving an emptied
  * field sends `null` (clears the stored passcode) rather than `""`.
  * Re-syncs from the prop when it changes (e.g. after a successful save
- * refetches the row) unless that would clobber an in-progress edit. */
+ * refetches the row) unless that would clobber an in-progress edit.
+ *
+ * `dirty` is cleared only once the save has actually SUCCEEDED. Clearing it
+ * on click instead (which is what this did originally) let the re-sync
+ * effect below overwrite the typed value with the stored one the moment a
+ * save failed -- so a 409 both lost the passcode the user had just typed
+ * and made the failure look like a success. */
 function PasscodeEditor({ passcode, onSave, saving }: PasscodeEditorProps) {
   const [value, setValue] = useState(passcode ?? "");
   const [dirty, setDirty] = useState(false);
@@ -317,8 +328,12 @@ function PasscodeEditor({ passcode, onSave, saving }: PasscodeEditorProps) {
         type="button"
         disabled={saving}
         onClick={() => {
-          setDirty(false);
-          onSave(value === "" ? null : value);
+          onSave(value === "" ? null : value)
+            .then(() => setDirty(false))
+            // Swallowed on purpose: the mutation's own error state is what
+            // renders the message (SourceRow's `updateError`), and an
+            // uncaught rejection here would just be noise.
+            .catch(() => undefined);
         }}
         className={ACTION_BUTTON_CLASS}
       >

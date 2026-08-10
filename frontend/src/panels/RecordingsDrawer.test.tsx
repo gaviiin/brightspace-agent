@@ -170,6 +170,50 @@ describe("RecordingsDrawer: passcode", () => {
     );
   });
 
+  it("keeps the typed passcode in the input when the save fails", async () => {
+    // A 409 (another run started between opening the drawer and pressing
+    // Save) is the realistic failure here. Silently reverting to the stored
+    // passcode would make the retry the user is being told to do impossible
+    // without retyping -- and would look like the save had succeeded.
+    mockedGetMedia.mockResolvedValue(fixtureMedia());
+    mockedUpdateMediaSource.mockRejectedValue(
+      new ApiError(409, "a run is already active for this course"),
+    );
+
+    renderDrawer();
+    await screen.findByText("Lecture 2 (Zoom)");
+
+    const input = within(rowFor("Lecture 2 (Zoom)")).getByDisplayValue("1234");
+    fireEvent.change(input, { target: { value: "5678" } });
+    fireEvent.click(within(rowFor("Lecture 2 (Zoom)")).getByRole("button", { name: "Save" }));
+
+    await screen.findByText("a run is already active for this course");
+    const afterFailure = within(rowFor("Lecture 2 (Zoom)")).getByLabelText(
+      "Passcode",
+    ) as HTMLInputElement;
+    expect(afterFailure.value).toBe("5678");
+  });
+
+  it("re-syncs from the server value after a successful save", async () => {
+    mockedGetMedia.mockResolvedValue(fixtureMedia());
+    mockedUpdateMediaSource.mockResolvedValue(source({ id: 2, passcode: "5678", status: "failed" }));
+
+    renderDrawer();
+    await screen.findByText("Lecture 2 (Zoom)");
+
+    const input = within(rowFor("Lecture 2 (Zoom)")).getByDisplayValue("1234");
+    fireEvent.change(input, { target: { value: "5678" } });
+    fireEvent.click(within(rowFor("Lecture 2 (Zoom)")).getByRole("button", { name: "Save" }));
+
+    await vi.waitFor(() => expect(mockedUpdateMediaSource).toHaveBeenCalled());
+    // getMedia still reports "1234" (the fixture is static), so a
+    // re-synced editor proves the dirty flag really was cleared on success.
+    await vi.waitFor(() => {
+      const field = within(rowFor("Lecture 2 (Zoom)")).getByLabelText("Passcode") as HTMLInputElement;
+      expect(field.value).toBe("1234");
+    });
+  });
+
   it("does not render a passcode editor for non-Zoom platforms", async () => {
     mockedGetMedia.mockResolvedValue(fixtureMedia());
 
