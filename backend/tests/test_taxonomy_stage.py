@@ -306,6 +306,33 @@ def test_prompt_carries_syllabus_module_outline_and_summaries(session_factory, b
     assert "Data Structures and Algorithms" in prompt  # course name
 
 
+def test_prompt_omits_metadata_only_summaries(session_factory, blob_store, backend, course_id):
+    """M3.5a: a material S1 summarized from a metadata pseudo-document
+    (`sha256 IS NULL`) is left out of the prompt. Its summary restates the
+    title the outline already carries, and letting it in re-digests the
+    taxonomy -- a new version, and a full-course re-classify, for zero new
+    signal. See `_material_summary_lines`."""
+    _seed_course_content(session_factory, blob_store, course_id)
+    with session_factory() as session:
+        session.add(
+            Material(
+                course_id=course_id, kind="link", title="PSEUDO-DOC-LINK",
+                source_url="https://example.edu/reading",
+                summary="A link titled PSEUDO-DOC-LINK.\nNothing else is known about it.",
+                summary_meta_json=json.dumps({"key_terms": ["pseudo", "doc"]}),
+                status="summarized",  # summarized, but with no sha256: pass 3's output
+            )
+        )
+        session.commit()
+    counting = _CountingBackend(backend)
+
+    _run(session_factory, counting, course_id, blob_store)
+
+    prompt = counting.prompts[0]
+    assert "PSEUDO-DOC-LINK" not in prompt
+    assert '[slides] "Lecture 5: Quicksort"' in prompt  # real materials still listed
+
+
 # --------------------------------------------------------------------------
 # (2) Slug normalization + dedupe
 # --------------------------------------------------------------------------

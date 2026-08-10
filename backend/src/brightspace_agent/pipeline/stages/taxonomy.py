@@ -7,9 +7,11 @@ to come out of it:
 
 1. Gather (one session): syllabus text (sidecar preferred, summary as a
    fallback), the module tree rendered as an indented outline, and one
-   compact line per summarized material, ordered so the model sees the
-   course roughly in teaching order. The prompt is capped at
-   `_PROMPT_MAX_CHARS`; summaries past the cap are dropped and logged.
+   compact line per summarized material that has real content, ordered so
+   the model sees the course roughly in teaching order (metadata-only
+   summaries are excluded -- see `_material_summary_lines`). The prompt is
+   capped at `_PROMPT_MAX_CHARS`; summaries past the cap are dropped and
+   logged.
 2. Cache: key on a hash of the assembled prompt itself (system + user +
    model), so an unchanged course never pays twice -- and two courses can
    never collide, however similar their module titles look.
@@ -337,12 +339,30 @@ def _syllabus_text(session: Session, course_id: int, blob_store: BlobStore | Non
 def _material_summary_lines(
     session: Session, course_id: int, module_rank: dict[int, int]
 ) -> list[str]:
+    """One compact line per summarized material that has real content.
+
+    `sha256 IS NULL` materials are deliberately excluded (M3.5a): those are
+    exactly the ones S1's pass 3 summarized from a metadata pseudo-document
+    (`_promote_metadata_one` leaves `sha256` None on purpose), and such a
+    summary is a restatement of the title the outline already carries -- no
+    taxonomy signal, only noise.
+
+    The cost of including them is not just a slightly worse prompt. Adding
+    them changes the proposal, which digests differently from the taxonomy
+    the course is already on, which mints a new version -- so the first run
+    after this feature shipped would silently re-version and re-classify
+    (full-course re-bill) every course that has ever had a link in it. The
+    materials themselves are still summarized and still classified against
+    the existing taxonomy; they just don't get a vote on what that taxonomy
+    is.
+    """
     materials = list(
         session.execute(
             select(Material).where(
                 Material.course_id == course_id,
                 Material.status == "summarized",
                 Material.summary.is_not(None),
+                Material.sha256.is_not(None),
             )
         ).scalars().all()
     )
