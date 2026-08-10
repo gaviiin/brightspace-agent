@@ -357,12 +357,28 @@ export interface MediaSourceSummary {
   updatedAt: string;
 }
 
+/** `HintResolutionOut` (api/media.py) -- M2.7: the extension's background-tab
+ * LTI-launch attempt for a hint's material, if one has happened yet.
+ * `finalUrl` is the landing page the launch settled on (diagnostic even for
+ * `unrecognized`/`failed`); `error` is set only for `failed`. */
+export type LtiResolutionStatus = "resolved" | "unrecognized" | "failed";
+
+export interface HintResolution {
+  status: LtiResolutionStatus;
+  finalUrl: string | null;
+  error: string | null;
+}
+
 /** A link material that looks like an LTI-embedded recording channel the
- * sync structurally can't read into (api/media.py's `_compute_lti_hints`) --
- * points the user at the manual-add workaround instead. */
+ * sync structurally can't read into (api/media.py's `_compute_lti_hints`).
+ * `resolution` is null until the extension's background-tab resolver
+ * (M2.7) has attempted this material's launch at least once -- see
+ * RecordingsDrawer's `HintsSection`/`HintStatus` for how each state renders,
+ * and the manual-add workaround (`AddUrlSection`) it falls back to. */
 export interface MediaHint {
   materialId: number;
   title: string;
+  resolution: HintResolution | null;
 }
 
 export interface MediaListResponse {
