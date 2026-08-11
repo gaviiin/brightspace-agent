@@ -1196,3 +1196,145 @@ def test_lti_resolution_resolved_material_disappears_from_candidates(client, aut
 
     resp = client.get(f"/api/ingest/lti-candidates?orgUnitId={ORG_UNIT_ID}", headers=auth_headers)
     assert resp.json()["candidates"] == []
+
+
+# -- 12c. lti-resolution POST: expand_and_upsert_media failure must still --
+# leave a durable `failed` row (fix-wave item 1). On a DEFAULT install (no
+# `--group media`), every recognized Mediasite/Zoom channel hits the
+# not_installed 503 below -- if that path left no row, the drawer would say
+# "Will resolve automatically on your next sync" forever while the extension
+# re-launches a background tab on every single sync.
+
+
+def test_lti_resolution_expand_not_installed_leaves_failed_row_and_503(
+    client, app, auth_headers, db_session_factory, monkeypatch
+):
+    from brightspace_agent.media.fetch import MediaFetchError
+
+    def boom(url):
+        raise MediaFetchError("not_installed", "yt-dlp is not installed. Run `uv sync --group media` to install it.")
+
+    monkeypatch.setattr(app.state.media_fetcher, "expand", boom)
+
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+
+    resp = _resolve(
+        client, auth_headers, material_id=material_id,
+        final_url="https://mediasite.example.edu/Mediasite/Play/xyz",
+    )
+
+    assert resp.status_code == 503
+    assert "yt-dlp is not installed" in resp.json()["detail"]
+
+    with db_session_factory() as session:
+        from brightspace_agent.db.models import MediaSource
+
+        assert session.execute(select(MediaSource)).scalars().all() == []
+        resolution = session.execute(
+            select(LtiResolution).where(LtiResolution.material_id == material_id)
+        ).scalar_one()
+        assert resolution.status == "failed"
+        assert resolution.final_url == "https://mediasite.example.edu/Mediasite/Play/xyz"
+        assert resolution.error is not None
+        assert "yt-dlp is not installed" in resolution.error
+
+    # Visible in the drawer's hints resolution state, not just the raw row.
+    hints = client.get(f"/api/courses/{course_id}/media").json()["hints"]
+    hint = next(h for h in hints if h["materialId"] == material_id)
+    assert hint["resolution"]["status"] == "failed"
+    assert "yt-dlp is not installed" in hint["resolution"]["error"]
+
+
+def test_lti_resolution_expand_nothing_classified_leaves_failed_row_and_400(
+    client, app, auth_headers, db_session_factory, monkeypatch
+):
+    from brightspace_agent.media.fetch import ExpandedEntry
+
+    def expand_to_unclassifiable(url):
+        return [ExpandedEntry(url="https://example.com/some/random/page", title=None)]
+
+    monkeypatch.setattr(app.state.media_fetcher, "expand", expand_to_unclassifiable)
+
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+
+    resp = _resolve(
+        client, auth_headers, material_id=material_id,
+        # Classifies at the top-level classify_url gate, so expand() runs --
+        # its (mocked) entries are what fails to classify.
+        final_url="https://mediasite.example.edu/Mediasite/Play/xyz",
+    )
+
+    assert resp.status_code == 400
+    assert "recognized" in resp.json()["detail"].lower()
+
+    with db_session_factory() as session:
+        from brightspace_agent.db.models import MediaSource
+
+        assert session.execute(select(MediaSource)).scalars().all() == []
+        resolution = session.execute(
+            select(LtiResolution).where(LtiResolution.material_id == material_id)
+        ).scalar_one()
+        assert resolution.status == "failed"
+        assert resolution.final_url == "https://mediasite.example.edu/Mediasite/Play/xyz"
+        assert resolution.error is not None
+        assert "recognized" in resolution.error.lower()
+
+
+def test_lti_resolution_failed_expand_row_overwritten_by_later_success(
+    client, app, auth_headers, db_session_factory, monkeypatch
+):
+    """A `failed` row from an expand failure is exactly as retryable as any
+    other `failed` row -- a later successful re-resolution overwrites it."""
+    from brightspace_agent.media.fetch import MediaFetchError
+
+    real_expand = app.state.media_fetcher.expand
+
+    def boom(url):
+        raise MediaFetchError("not_installed", "yt-dlp is not installed.")
+
+    monkeypatch.setattr(app.state.media_fetcher, "expand", boom)
+
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+
+    first = _resolve(
+        client, auth_headers, material_id=material_id,
+        final_url="https://mediasite.example.edu/Mediasite/Play/xyz",
+    )
+    assert first.status_code == 503
+
+    # The failure itself must have landed a durable 'failed' row -- this is
+    # the crux of the fix, not just a side effect re-checked below.
+    with db_session_factory() as session:
+        after_failure = session.execute(
+            select(LtiResolution).where(LtiResolution.material_id == material_id)
+        ).scalar_one()
+        assert after_failure.status == "failed"
+
+    # The material must still be offered as a candidate (failed rows retry).
+    candidates = client.get(f"/api/ingest/lti-candidates?orgUnitId={ORG_UNIT_ID}", headers=auth_headers).json()
+    assert [c["materialId"] for c in candidates["candidates"]] == [material_id]
+
+    monkeypatch.setattr(app.state.media_fetcher, "expand", real_expand)
+
+    second = _resolve(
+        client, auth_headers, material_id=material_id,
+        final_url="https://mediasite.example.edu/Mediasite/Play/xyz",
+    )
+    assert second.status_code == 200
+    assert second.json()["status"] == "resolved"
+
+    with db_session_factory() as session:
+        rows = list(
+            session.execute(select(LtiResolution).where(LtiResolution.material_id == material_id)).scalars().all()
+        )
+        assert len(rows) == 1
+        assert rows[0].status == "resolved"

@@ -644,12 +644,26 @@ def lti_resolution(
     # Recognized: run the IDENTICAL expand-and-upsert path api/media.py's
     # manual-add endpoint uses, against the resolved final URL. Any
     # MediaFetchError propagates through the same _map_expand_error mapping
-    # add_media_url uses -- this endpoint's "always 200" shape only covers
-    # the three resolution outcomes the brief defines, not fetch failures,
-    # which the extension's per-candidate error isolation already handles.
-    added, _skipped, total, touched = expand_and_upsert_media(
-        session, course.id, fetcher, payload.final_url, None
-    )
+    # add_media_url uses (502/503), as does the 400 "nothing classified"
+    # case -- but unlike add_media_url (a live user request that just sees
+    # the error), a failure here must still leave a durable `failed` row:
+    # without one, the drawer would keep saying "Will resolve automatically
+    # on your next sync" forever while the extension re-launches a
+    # background tab on every single sync. Upsert-then-re-raise, and commit
+    # before re-raising -- the session dependency only closes (no implicit
+    # rollback of already-committed work) on the way out, so the row
+    # survives the request that's about to fail.
+    try:
+        added, _skipped, total, touched = expand_and_upsert_media(
+            session, course.id, fetcher, payload.final_url, None
+        )
+    except HTTPException as exc:
+        _upsert_lti_resolution(
+            session, course.id, payload.material_id, launch_url,
+            final_url=payload.final_url, platform=None, status="failed", error=exc.detail,
+        )
+        session.commit()
+        raise
 
     _upsert_lti_resolution(
         session, course.id, payload.material_id, launch_url,
