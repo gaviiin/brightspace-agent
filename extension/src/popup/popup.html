@@ -128,6 +128,26 @@
         color: #5f6368;
         margin: 4px 0 0;
       }
+      #pair-status a {
+        color: #1a73e8;
+      }
+      .divider {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 12px 0 8px;
+        color: #9aa0a6;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .divider::before,
+      .divider::after {
+        content: "";
+        flex: 1;
+        height: 1px;
+        background: #e0e0e0;
+      }
     </style>
   </head>
   <body>
@@ -135,6 +155,12 @@
 
     <section id="backend-section">
       <h2>Backend</h2>
+      <button id="pair-connect" type="button">Connect to BrightSpace Agent</button>
+      <p id="pair-status" class="muted"></p>
+      <p id="pair-paired" class="muted" style="display: none">Connected.</p>
+
+      <div class="divider"><span>or paste a token manually</span></div>
+
       <label for="token">Pairing token</label>
       <input id="token" type="text" autocomplete="off" />
       <div class="row">
@@ -166,6 +192,7 @@
       <div id="progress-bar-track"><div id="progress-bar-fill"></div></div>
       <p id="progress-text" class="muted">No sync running</p>
       <p id="error-count" class="muted"></p>
+      <p id="lti-status" class="muted"></p>
       <div id="needs-login-banner">
         <span>Brightspace login expired.</span>
         <button id="resume" type="button">Resume</button>

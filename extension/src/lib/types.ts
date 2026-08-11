@@ -73,6 +73,67 @@ export interface CompletePayload {
   errors: { d2lTopicId: number | null; message: string }[];
 }
 
+/** One still-unresolved LTI quicklink material — mirrors `LtiCandidateOut`
+ * in api/ingest.py. `launchUrl` may be relative to the tenant origin. */
+export interface LtiCandidate {
+  materialId: number;
+  title: string;
+  launchUrl: string;
+}
+
+/** `GET /api/ingest/lti-candidates` — mirrors `LtiCandidatesResponse`. */
+export interface LtiCandidatesResponse {
+  courseId: number;
+  candidates: LtiCandidate[];
+}
+
+/** `POST /api/ingest/lti-resolution` request body — mirrors
+ * `LtiResolutionRequest`. */
+export interface LtiResolutionPayload {
+  orgUnitId: number;
+  materialId: number;
+  finalUrl: string | null;
+  error: string | null;
+}
+
+export type LtiResolutionStatus = "resolved" | "unrecognized" | "failed";
+
+/** `POST /api/ingest/lti-resolution` response body — mirrors
+ * `LtiResolutionResponse`. The backend route uses
+ * `response_model_exclude_none`, so `platform`/`added`/`total` are ABSENT
+ * (not null) on the 'unrecognized'/'failed' outcomes -- optional here,
+ * never assume they're present without checking `status` first. */
+export interface LtiResolutionResponse {
+  status: LtiResolutionStatus;
+  platform?: string;
+  added?: number;
+  total?: number;
+}
+
+// ---------------------------------------------------------------------------
+// One-click pairing (api/pair.py, M2.7) — request/approve/claim. Both of
+// these are the extension's side of the handshake and are called BEFORE the
+// extension has a pairing token (that's the entire point of the flow), so
+// BackendClient.pairRequest/pairClaim attach no Authorization header — see
+// backend-client.ts.
+// ---------------------------------------------------------------------------
+
+/** `POST /api/pair/request` response — mirrors `PairRequestResponse`. */
+export interface PairRequestResponse {
+  requestId: string;
+}
+
+export type PairClaimStatus = "pending" | "approved";
+
+/** `GET /api/pair/claim` response — mirrors `PairClaimResponse`. The
+ * backend uses `response_model_exclude_none`, so `pairingToken` is ABSENT
+ * (not null) on the 'pending' outcome — never assume it's present without
+ * checking `status` first. */
+export interface PairClaimResponse {
+  status: PairClaimStatus;
+  pairingToken?: string;
+}
+
 // ---------------------------------------------------------------------------
 // D2L shapes (subset we rely on)
 // ---------------------------------------------------------------------------

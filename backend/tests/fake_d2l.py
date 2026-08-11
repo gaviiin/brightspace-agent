@@ -86,6 +86,23 @@ Named rather than inlined below because e2e.py asserts on it by title:
 renaming the announcement without renaming this constant would quietly
 delete that coverage."""
 
+LTI_HINT_MEDIASITE_TITLE = "Mediasite Channel (Week 2 Lectures)"
+"""M2.7: title of `toc_sample.json`'s TOPIC-1007, one of two Link topics
+shaped exactly like an LTI-embedded recording channel (a `type=lti`
+quicklink `Url` plus a title `_LTI_HINT_TITLE_RE`/api/media.py matches) --
+the real-world shape this whole milestone started from. scripts/e2e.py
+resolves this one to a mediasite-shaped `finalUrl` and asserts the
+`resolved` round-trip. Named (not inlined) for the same reason as
+`ADMIN_NEWS_TITLE` above: e2e.py looks it up by title in the
+`lti-candidates` response, since the material's DB id isn't known ahead of
+a sync."""
+
+LTI_HINT_ZOOM_TITLE = "Zoom Recordings (Week 2 Lab)"
+"""M2.7: title of `toc_sample.json`'s TOPIC-1008, the second LTI-shaped Link
+topic -- see `LTI_HINT_MEDIASITE_TITLE` above. scripts/e2e.py resolves this
+one to a URL `classify_url` does not recognize and asserts the
+`unrecognized` round-trip."""
+
 NEWS: list[dict[str, Any]] = [
     {
         "Id": 1,

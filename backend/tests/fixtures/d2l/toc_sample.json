@@ -74,6 +74,34 @@
           "IsHidden": false,
           "LastModifiedDate": "2026-01-10T09:00:00.000Z",
           "SizeBytes": 3000000
+        },
+        {
+          "Identifier": "TOPIC-1007",
+          "TopicId": 1007,
+          "Title": "Mediasite Channel (Week 2 Lectures)",
+          "ShortTitle": null,
+          "Type": 3,
+          "TypeIdentifier": "Link",
+          "Url": "/d2l/common/dialogs/quickLink/quickLink.d2l?ou=555&type=lti&rcode=week2-mediasite",
+          "StartDate": null,
+          "EndDate": null,
+          "IsHidden": false,
+          "LastModifiedDate": null,
+          "SizeBytes": null
+        },
+        {
+          "Identifier": "TOPIC-1008",
+          "TopicId": 1008,
+          "Title": "Zoom Recordings (Week 2 Lab)",
+          "ShortTitle": null,
+          "Type": 3,
+          "TypeIdentifier": "Link",
+          "Url": "/d2l/common/dialogs/quickLink/quickLink.d2l?ou=555&type=lti&rcode=week2-zoom",
+          "StartDate": null,
+          "EndDate": null,
+          "IsHidden": false,
+          "LastModifiedDate": null,
+          "SizeBytes": null
         }
       ],
       "Modules": [

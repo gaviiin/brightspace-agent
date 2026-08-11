@@ -150,6 +150,30 @@ _MATERIAL_TOPICS_METHOD_INHERITED = (
     "ALTER TABLE material_topics_new RENAME TO material_topics;"
 )
 
+# Migration 7 (M2.7) adds the lti_resolutions table: one row per material
+# recording the extension's LTI-launch resolution attempt (the real
+# Mediasite/Zoom URL behind a D2L quicklink only materializes once a
+# logged-in browser performs the launch -- see api/ingest.py's
+# lti-candidates/lti-resolution routes). Brand new table, same
+# "CREATE TABLE IF NOT EXISTS, also in schema.sql" shape as migration 3's
+# media_sources: a no-op for a fresh database (schema.sql already creates
+# it at migration 1), real work only for a database at version <= 6.
+_LTI_RESOLUTIONS_TABLE = (
+    "CREATE TABLE IF NOT EXISTS lti_resolutions (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,\n"
+    "    material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,\n"
+    "    launch_url TEXT NOT NULL,\n"
+    "    final_url TEXT,\n"
+    "    platform TEXT,\n"
+    "    status TEXT NOT NULL CHECK(status IN ('resolved','unrecognized','failed')),\n"
+    "    error TEXT,\n"
+    "    created_at TEXT NOT NULL,\n"
+    "    updated_at TEXT NOT NULL,\n"
+    "    UNIQUE(material_id)\n"
+    ");"
+)
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _SCHEMA_SQL),
     (2, _ENRICHMENT_UNIQUE_INDEX),
@@ -157,6 +181,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (4, _MEDIA_SOURCES_MATERIAL_ID_NULLABLE),
     (5, _MATERIALS_IS_ADMINISTRATIVE_COLUMN),
     (6, _MATERIAL_TOPICS_METHOD_INHERITED),
+    (7, _LTI_RESOLUTIONS_TABLE),
 ]
 
 

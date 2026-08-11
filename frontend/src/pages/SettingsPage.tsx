@@ -1,9 +1,9 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Copy } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 
-import { getSettings } from "../api/client";
+import { approvePair, getPairPending, getSettings } from "../api/client";
 
 export function SettingsPage() {
   const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: getSettings });
@@ -19,6 +19,8 @@ export function SettingsPage() {
         </Link>
       </div>
       <h1 className="mb-4 text-xl font-semibold text-neutral-900 dark:text-neutral-100">Settings</h1>
+
+      <PairApprovalBanner />
 
       {settingsQuery.isLoading && (
         <p className="text-neutral-500 dark:text-neutral-400">Loading settings…</p>
@@ -92,6 +94,45 @@ export function SettingsPage() {
           </section>
         </div>
       )}
+    </div>
+  );
+}
+
+/** M2.7 one-click pairing: while this page is mounted, polls whether the
+ * extension has a pairing request waiting on the user's Approve click
+ * (`GET /api/pair/pending`) and, if so, shows this banner. Approving POSTs
+ * `/api/pair/approve` and invalidates the poll, which is also what makes
+ * the banner disappear once the backend reflects it back as not-pending --
+ * no local "I clicked it" state to fall out of sync with the server. */
+function PairApprovalBanner() {
+  const queryClient = useQueryClient();
+  const pendingQuery = useQuery({
+    queryKey: ["pair-pending"],
+    queryFn: getPairPending,
+    refetchInterval: 2000,
+  });
+
+  const approveMutation = useMutation({
+    mutationFn: approvePair,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["pair-pending"] }),
+  });
+
+  if (!pendingQuery.data?.pending) return null;
+
+  return (
+    <div className="mb-4 flex items-center justify-between gap-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+      <p>
+        A browser extension is asking to connect. Approve only if you just clicked Connect in the
+        BrightSpace Agent extension.
+      </p>
+      <button
+        type="button"
+        onClick={() => approveMutation.mutate()}
+        disabled={approveMutation.isPending}
+        className="shrink-0 rounded-md border border-amber-300 bg-white px-3 py-1.5 text-sm font-medium text-amber-900 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-amber-700 dark:bg-neutral-900 dark:text-amber-200 dark:hover:bg-neutral-800"
+      >
+        Approve
+      </button>
     </div>
   );
 }

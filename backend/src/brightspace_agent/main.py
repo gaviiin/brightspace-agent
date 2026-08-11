@@ -20,6 +20,7 @@ from brightspace_agent.api.graph import router as graph_router
 from brightspace_agent.api.ingest import router as ingest_router
 from brightspace_agent.api.materials import router as materials_router
 from brightspace_agent.api.media import router as media_router
+from brightspace_agent.api.pair import router as pair_router
 from brightspace_agent.api.pipeline import router as pipeline_router
 from brightspace_agent.api.settings import router as settings_router
 from brightspace_agent.api.taxonomy import router as taxonomy_router
@@ -42,6 +43,18 @@ FRONTEND_DIST = REPO_ROOT / "frontend" / "dist"
 # origin; a drive-by page on another origin can request the mutation, but
 # the browser will never attach the header for it, so it 403s before doing
 # anything (in particular, before spending on an LLM call).
+#
+# M2.7: `POST /api/pair/request` is extension-facing and unauthenticated
+# (the whole point -- the extension has no pairing token yet) like
+# /api/ingest/* is, but it is deliberately NOT added to the exemption
+# below. The ingest routes get away with skipping this header because a
+# valid pairing-token bearer header is itself unforgeable cross-origin,
+# which already defeats CSRF; /api/pair/request has no token to check, so
+# that reasoning doesn't carry over, and leaving it guarded is what stops a
+# drive-by page from silently invalidating a real in-flight pairing
+# attempt (last-writer-wins in api/pair.py). The extension sets this header
+# on that call explicitly instead -- see api/pair.py's module docstring for
+# the full reasoning and backend-client.ts's `pairRequest`.
 _CSRF_HEADER = "X-BSA-Request"
 _CSRF_EXEMPT_PREFIX = "/api/ingest/"
 _CSRF_GUARDED_METHODS = {"POST", "PUT", "DELETE"}
@@ -82,6 +95,9 @@ def create_app() -> FastAPI:
 
     app = FastAPI()
     app.state.pairing_token = pairing_token
+    # M2.7 one-click pairing (api/pair.py): the single outstanding
+    # request/approve/claim attempt, or None. See that module's docstring.
+    app.state.pending_pair = None
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.blob_store = blob_store
@@ -128,6 +144,7 @@ def create_app() -> FastAPI:
     app.include_router(graph_router)
     app.include_router(materials_router)
     app.include_router(media_router)
+    app.include_router(pair_router)
     app.include_router(pipeline_router)
     app.include_router(enrichment_router)
     app.include_router(events_router)

@@ -25,14 +25,17 @@ from urllib.parse import unquote
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic.alias_generators import to_camel
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from brightspace_agent.api.deps import get_blob_store, get_session, require_pairing_token
-from brightspace_agent.db.models import SyncRun
+from brightspace_agent.api.deps import get_blob_store, get_media_fetcher, get_session, require_pairing_token
+from brightspace_agent.api.media import _is_absolute_http_url, expand_and_upsert_media, lti_candidate_rows
+from brightspace_agent.db.models import LtiResolution, SyncRun
 from brightspace_agent.ingest import repo, zip_import
 from brightspace_agent.ingest.diff import compute_needed, is_file_topic, parse_toc
 from brightspace_agent.ingest.store import BlobStore
-from brightspace_agent.media.detect import detect_media_sources
+from brightspace_agent.media.detect import classify_url, detect_media_sources
+from brightspace_agent.media.fetch import MediaFetcher
 
 logger = logging.getLogger(__name__)
 
@@ -480,3 +483,194 @@ def import_zip(
     )
 
     return ZipImportResponse(status=sync_run.status, stats=stats)
+
+
+# --------------------------------------------------------------------------
+# /lti-candidates, /lti-resolution -- M2.7 zero-paste discovery.
+#
+# The D2L ToC only ever gives us an LTI quicklink stub for a channel like
+# this (`_compute_lti_hints`/`lti_candidate_rows` in api/media.py, shared
+# with these two routes, is the exact heuristic for spotting one); the real
+# Mediasite/Zoom URL behind it only materializes once a logged-in browser
+# *performs* the launch. The extension is that browser: after a sync it
+# calls the GET below to find still-unresolved candidates, opens each
+# quicklink in a background tab, reads where the redirect chain lands, and
+# POSTs the result to the endpoint below. A recognized final URL is fed
+# through the SAME expand-and-upsert path api/media.py's manual paste-a-URL
+# endpoint uses (`expand_and_upsert_media`), so a channel resolves into one
+# `media_sources` row per lecture with zero typing.
+# --------------------------------------------------------------------------
+
+
+class LtiCandidateOut(CamelModel):
+    material_id: int
+    title: str
+    launch_url: str
+
+
+class LtiCandidatesResponse(CamelModel):
+    course_id: int
+    candidates: list[LtiCandidateOut]
+
+
+@router.get("/lti-candidates", response_model=LtiCandidatesResponse)
+def lti_candidates(
+    org_unit_id: int = Query(alias="orgUnitId"),
+    session: Session = Depends(get_session),
+) -> LtiCandidatesResponse:
+    course = repo.get_course_by_org_unit(session, org_unit_id)
+    if course is None:
+        raise HTTPException(status_code=404, detail="unknown course; run handshake first")
+
+    # Materials already settled (resolved to a supported platform, or
+    # confirmed to be something else entirely) drop out of the worklist.
+    # 'failed' rows stay in it -- a closed tab or an off-origin launch URL
+    # is transient, and the point of a background-tab retry is that the
+    # NEXT sync gets another shot at it.
+    settled_material_ids = set(
+        session.execute(
+            select(LtiResolution.material_id).where(
+                LtiResolution.course_id == course.id,
+                LtiResolution.status.in_(("resolved", "unrecognized")),
+            )
+        ).scalars()
+    )
+
+    candidates = [
+        LtiCandidateOut(material_id=material_id, title=title, launch_url=launch_url)
+        for material_id, title, launch_url in lti_candidate_rows(session, course.id)
+        if material_id not in settled_material_ids
+    ]
+    return LtiCandidatesResponse(course_id=course.id, candidates=candidates)
+
+
+class LtiResolutionRequest(CamelModel):
+    org_unit_id: int
+    material_id: int
+    final_url: str | None
+    error: str | None = None
+
+
+class LtiResolutionResponse(CamelModel):
+    # platform/added/total only ever apply to the 'resolved' outcome --
+    # `response_model_exclude_none` on the route below drops them from the
+    # wire body for 'unrecognized'/'failed', matching the brief's exact
+    # per-status shapes ({"status": "failed"} etc.) rather than sending
+    # three always-null fields the extension would have to ignore.
+    status: str
+    platform: str | None = None
+    added: int | None = None
+    total: int | None = None
+
+
+def _upsert_lti_resolution(
+    session: Session,
+    course_id: int,
+    material_id: int,
+    launch_url: str,
+    *,
+    final_url: str | None,
+    platform: str | None,
+    status: str,
+    error: str | None,
+) -> LtiResolution:
+    """One row per material (`UNIQUE(material_id)`); a re-resolution
+    overwrites final_url/platform/status/error and bumps updated_at rather
+    than inserting a second row -- the extension is expected to re-POST a
+    'failed' material on its next sync, and a repeat launch of an already-
+    resolved one must never duplicate."""
+    existing = session.execute(
+        select(LtiResolution).where(LtiResolution.material_id == material_id)
+    ).scalar_one_or_none()
+    now = repo.now_iso()
+
+    if existing is None:
+        row = LtiResolution(
+            course_id=course_id, material_id=material_id, launch_url=launch_url,
+            final_url=final_url, platform=platform, status=status, error=error,
+            created_at=now, updated_at=now,
+        )
+        session.add(row)
+        session.flush()
+        return row
+
+    existing.launch_url = launch_url
+    existing.final_url = final_url
+    existing.platform = platform
+    existing.status = status
+    existing.error = error
+    existing.updated_at = now
+    return existing
+
+
+@router.post("/lti-resolution", response_model=LtiResolutionResponse, response_model_exclude_none=True)
+def lti_resolution(
+    payload: LtiResolutionRequest,
+    session: Session = Depends(get_session),
+    fetcher: MediaFetcher = Depends(get_media_fetcher),
+) -> LtiResolutionResponse:
+    course = repo.get_course_by_org_unit(session, payload.org_unit_id)
+    if course is None:
+        raise HTTPException(status_code=404, detail="unknown course; run handshake first")
+
+    # The materialId must be one the backend itself flagged -- checked
+    # against the UNFILTERED candidate query (not the GET's settled-minus
+    # list above), so a material already resolved/unrecognized can still be
+    # re-resolved on request.
+    candidate = next(
+        (row for row in lti_candidate_rows(session, course.id) if row[0] == payload.material_id), None
+    )
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="material is not a known LTI candidate for this course")
+    _material_id, _title, launch_url = candidate
+
+    if not _is_absolute_http_url(payload.final_url):
+        _upsert_lti_resolution(
+            session, course.id, payload.material_id, launch_url,
+            final_url=payload.final_url, platform=None, status="failed", error=payload.error,
+        )
+        session.commit()
+        return LtiResolutionResponse(status="failed")
+
+    classified = classify_url(payload.final_url)
+    if classified is None:
+        _upsert_lti_resolution(
+            session, course.id, payload.material_id, launch_url,
+            final_url=payload.final_url, platform=None, status="unrecognized", error=None,
+        )
+        session.commit()
+        return LtiResolutionResponse(status="unrecognized")
+
+    # Recognized: run the IDENTICAL expand-and-upsert path api/media.py's
+    # manual-add endpoint uses, against the resolved final URL. Any
+    # MediaFetchError propagates through the same _map_expand_error mapping
+    # add_media_url uses (502/503), as does the 400 "nothing classified"
+    # case -- but unlike add_media_url (a live user request that just sees
+    # the error), a failure here must still leave a durable `failed` row:
+    # without one, the drawer would keep saying "Will resolve automatically
+    # on your next sync" forever while the extension re-launches a
+    # background tab on every single sync. Upsert-then-re-raise, and commit
+    # before re-raising -- the session dependency only closes (no implicit
+    # rollback of already-committed work) on the way out, so the row
+    # survives the request that's about to fail.
+    try:
+        added, _skipped, total, touched = expand_and_upsert_media(
+            session, course.id, fetcher, payload.final_url, None
+        )
+    except HTTPException as exc:
+        _upsert_lti_resolution(
+            session, course.id, payload.material_id, launch_url,
+            final_url=payload.final_url, platform=None, status="failed", error=exc.detail,
+        )
+        session.commit()
+        raise
+
+    _upsert_lti_resolution(
+        session, course.id, payload.material_id, launch_url,
+        final_url=payload.final_url, platform=classified.platform, status="resolved", error=None,
+    )
+    session.commit()
+    for row in touched:
+        session.refresh(row)
+
+    return LtiResolutionResponse(status="resolved", platform=classified.platform, added=added, total=total)

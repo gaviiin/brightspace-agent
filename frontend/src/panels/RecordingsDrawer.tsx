@@ -155,6 +155,8 @@ export function RecordingsDrawer({ courseId, onClose }: RecordingsDrawerProps) {
             <p className="text-xs text-red-600 dark:text-red-400">{errorMessage(processAllMutation.error)}</p>
           )}
 
+          <HintsSection hints={hints} />
+
           <AddUrlSection
             active={active}
             onAdd={(url, passcode) => addMutation.mutate({ url, passcode })}
@@ -162,8 +164,6 @@ export function RecordingsDrawer({ courseId, onClose }: RecordingsDrawerProps) {
             addedCount={addMutation.isSuccess ? addMutation.data.added : null}
             errorText={addMutation.isError ? errorMessage(addMutation.error) : null}
           />
-
-          <HintsSection hints={hints} />
 
           {mediaQuery.data && sources.length === 0 && (
             <div>
@@ -277,28 +277,71 @@ interface HintsSectionProps {
   hints: MediaHint[];
 }
 
-/** Points the user at the paste-a-URL workaround above BEFORE they go
- * looking for it -- link materials that look LTI-embedded and are titled
- * like a recording channel (api/media.py's `_compute_lti_hints`), i.e. the
- * exact real-world shape this task started from (Mediasite behind an
- * LTI-embedded D2L quicklink). */
+/** M2.7: link materials that look LTI-embedded and are titled like a
+ * recording channel (api/media.py's `_compute_lti_hints`) -- the exact
+ * real-world shape this started from (Mediasite behind an LTI-embedded D2L
+ * quicklink). Status-first, not paste-first: the extension's background-tab
+ * resolver (lti-resolver.ts) already tries each of these automatically on
+ * every sync, so this section reports what that attempt found (or that
+ * none has happened yet) rather than immediately pointing at the manual
+ * workaround. A `resolved` hint already has a real row in the sources list
+ * above -- nothing left to say here, so it's dropped from this box
+ * entirely rather than sitting alongside genuinely unresolved ones. */
 function HintsSection({ hints }: HintsSectionProps) {
-  if (hints.length === 0) return null;
+  const unresolved = hints.filter((hint) => hint.resolution?.status !== "resolved");
+  if (unresolved.length === 0) return null;
 
   return (
-    <div className="space-y-1 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+    <div className="space-y-1.5 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
       <p className="font-medium">These look like recording channels the sync can't read:</p>
-      <ul className="list-disc space-y-0.5 pl-4">
-        {hints.map((hint) => (
-          <li key={hint.materialId}>{hint.title}</li>
+      <ul className="space-y-1.5">
+        {unresolved.map((hint) => (
+          <li key={hint.materialId}>
+            <p className="font-medium">{hint.title}</p>
+            <HintStatus resolution={hint.resolution} />
+          </li>
         ))}
       </ul>
       <p>
-        Open it in Brightspace, copy the page URL from the embedded player (right-click → open frame in new tab
-        if needed), and paste it above.
+        Meanwhile: open it in Brightspace, copy the page URL from the embedded player (right-click → open frame
+        in new tab if needed), and paste it below.
       </p>
     </div>
   );
+}
+
+interface HintStatusProps {
+  resolution: MediaHint["resolution"];
+}
+
+/** What the extension's background-tab launch found for this hint's
+ * material, if it has run yet -- the three `lti_resolutions.status` values
+ * (api/media.py's `HintResolutionOut`), plus the pre-attempt null case.
+ * `resolved` never reaches here: `HintsSection` filters it out above. */
+function HintStatus({ resolution }: HintStatusProps) {
+  if (resolution === null) {
+    return <p>Will resolve automatically on your next sync.</p>;
+  }
+
+  if (resolution.status === "unrecognized") {
+    const finalUrl = resolution.finalUrl;
+    return (
+      <p>
+        Launch landed at{" "}
+        {finalUrl !== null && isSafeHttpUrl(finalUrl) ? (
+          <a href={finalUrl} target="_blank" rel="noopener noreferrer" className="underline">
+            {finalUrl}
+          </a>
+        ) : (
+          (finalUrl ?? "an unknown page")
+        )}{" "}
+        — not a recognized platform.
+      </p>
+    );
+  }
+
+  // status === "failed"
+  return <p>{resolution.error ?? "The launch didn't resolve."}</p>;
 }
 
 interface SourceRowProps {

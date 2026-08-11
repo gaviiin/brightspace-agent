@@ -8,6 +8,11 @@ import type {
   CompletePayload,
   HandshakePayload,
   HandshakeResponse,
+  LtiCandidatesResponse,
+  LtiResolutionPayload,
+  LtiResolutionResponse,
+  PairClaimResponse,
+  PairRequestResponse,
   TocPayload,
   TocResponse,
 } from "./types";
@@ -103,6 +108,57 @@ export class BackendClient {
 
   complete(payload: CompletePayload): Promise<{ status: string }> {
     return this.request<{ status: string }>("POST", "/api/ingest/complete", payload);
+  }
+
+  /** M2.7: still-unresolved LTI quicklinks for one course, for the
+   * background-tab resolver (lti-resolver.ts) to work through. */
+  ltiCandidates(orgUnitId: number): Promise<LtiCandidatesResponse> {
+    return this.request<LtiCandidatesResponse>("GET", `/api/ingest/lti-candidates?orgUnitId=${orgUnitId}`);
+  }
+
+  /** M2.7: reports where a background-tab LTI launch actually landed. A
+   * non-2xx here (e.g. an expand failure on the backend) throws
+   * BackendError like any other method -- the caller's per-candidate error
+   * isolation is responsible for not letting that abort the resolve loop. */
+  reportLtiResolution(payload: LtiResolutionPayload): Promise<LtiResolutionResponse> {
+    return this.request<LtiResolutionResponse>("POST", "/api/ingest/lti-resolution", payload);
+  }
+
+  /** M2.7 one-click pairing, step 1: bootstraps a pairing attempt. Unlike
+   * every method above, this attaches NO Authorization header — the
+   * extension doesn't have a pairing token yet, which is the entire point
+   * of this flow. It DOES set the CSRF header the frontend's mutating
+   * POSTs carry: unlike /api/ingest/*, this route has no token to defeat
+   * CSRF with on its own, so the backend still guards it (see
+   * api/pair.py's module docstring) — and setting the header costs an
+   * extension context nothing, since it isn't subject to the CORS
+   * preflight the header exists to force for an ordinary page. */
+  pairRequest(): Promise<PairRequestResponse> {
+    return this.requestUnauthenticated<PairRequestResponse>("POST", "/api/pair/request", {
+      "X-BSA-Request": "1",
+    });
+  }
+
+  /** M2.7 one-click pairing, step 3: polls whether the request this popup
+   * created has been approved yet. Also unauthenticated, same bootstrap
+   * reasoning as `pairRequest`. A non-2xx (unknown/expired requestId)
+   * throws BackendError like any other method — the popup's poll loop
+   * treats that the same as a `{status: "pending"}` body, up to its own
+   * 3-minute timeout (see popup/main.ts). */
+  pairClaim(requestId: string): Promise<PairClaimResponse> {
+    return this.requestUnauthenticated<PairClaimResponse>(
+      "GET",
+      `/api/pair/claim?requestId=${encodeURIComponent(requestId)}`,
+    );
+  }
+
+  private async requestUnauthenticated<T>(
+    method: string,
+    path: string,
+    headers?: Record<string, string>,
+  ): Promise<T> {
+    const response = await fetch(`${this.baseUrl}${path}`, { method, headers });
+    return this.parseJsonOrThrow<T>(response);
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {

@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from brightspace_agent.db.models import Course, Material, MaterialTopic, Module, SyncRun, Topic
+from brightspace_agent.db.models import Course, LtiResolution, Material, MaterialTopic, Module, SyncRun, Topic
 from brightspace_agent.ingest.diff import infer_kind
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "d2l"
@@ -47,6 +47,10 @@ def find_topic(toc: dict, topic_id: int) -> dict:
 @pytest.fixture
 def data_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("BSA_DATA_DIR", str(tmp_path))
+    # M2.7: /api/ingest/lti-resolution reuses api/media.py's expand-and-
+    # upsert path (MediaFetcher.expand), same as the manual-add endpoint --
+    # forces the offline mock fetcher, no real subprocess/network here.
+    monkeypatch.setenv("BSA_MOCK_LLM", "1")
     return tmp_path
 
 
@@ -856,3 +860,481 @@ def test_infer_kind_mp4_is_video():
 
 def test_infer_kind_unknown_extension_is_other():
     assert infer_kind("Mystery File", "https://x/y/file.xyz") == "other"
+
+
+# --------------------------------------------------------------------------
+# 12. M2.7 zero-paste discovery: GET /api/ingest/lti-candidates,
+# POST /api/ingest/lti-resolution.
+#
+# The D2L ToC only ever gives us the LTI quicklink stub -- the real
+# Mediasite/Zoom URL behind it only materializes once a logged-in browser
+# performs the launch. The extension does that (background tab), then
+# reports the final URL here. Candidates = the same LTI-hint heuristic
+# api/media.py's drawer hints use (LTI-marker source_url + a recording-
+# sounding title), minus materials already resolved/unrecognized.
+# --------------------------------------------------------------------------
+
+LTI_LAUNCH_URL = "/d2l/common/dialogs/quickLink/quickLink.d2l?ou=524044&type=lti&rcode=abc123"
+
+
+def _add_link_material(db_session_factory, course_id, *, title, source_url):
+    with db_session_factory() as session:
+        material = Material(
+            course_id=course_id, kind="link", title=title, source_url=source_url, status="fetched",
+        )
+        session.add(material)
+        session.commit()
+        return material.id
+
+
+def _add_lti_resolution(
+    db_session_factory, course_id, material_id, *,
+    status, final_url=None, platform=None, error=None, launch_url=LTI_LAUNCH_URL,
+):
+    with db_session_factory() as session:
+        row = LtiResolution(
+            course_id=course_id, material_id=material_id, launch_url=launch_url,
+            final_url=final_url, platform=platform, status=status, error=error,
+            created_at="2026-01-01T00:00:00+00:00", updated_at="2026-01-01T00:00:00+00:00",
+        )
+        session.add(row)
+        session.commit()
+        return row.id
+
+
+# -- 12a. lti-candidates GET -------------------------------------------------
+
+
+def test_lti_candidates_seeded_link_material_appears(client, auth_headers, db_session_factory):
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel (Stern)", source_url=LTI_LAUNCH_URL,
+    )
+
+    resp = client.get(f"/api/ingest/lti-candidates?orgUnitId={ORG_UNIT_ID}", headers=auth_headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["courseId"] == course_id
+    assert len(body["candidates"]) == 1
+    candidate = body["candidates"][0]
+    assert candidate["materialId"] == material_id
+    assert candidate["title"] == "Mediasite Channel (Stern)"
+    assert candidate["launchUrl"] == LTI_LAUNCH_URL
+
+
+def test_lti_candidates_non_lti_link_excluded(client, auth_headers, db_session_factory):
+    course_id = handshake(client, auth_headers)
+    _add_link_material(
+        db_session_factory, course_id, title="Zoom Recordings", source_url="https://zoom.us/some/plain/link",
+    )
+
+    resp = client.get(f"/api/ingest/lti-candidates?orgUnitId={ORG_UNIT_ID}", headers=auth_headers)
+
+    assert resp.json()["candidates"] == []
+
+
+def test_lti_candidates_resolved_material_excluded(client, auth_headers, db_session_factory):
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+    _add_lti_resolution(
+        db_session_factory, course_id, material_id, status="resolved",
+        final_url="https://mediasite.example.edu/Mediasite/Play/xyz", platform="mediasite",
+    )
+
+    resp = client.get(f"/api/ingest/lti-candidates?orgUnitId={ORG_UNIT_ID}", headers=auth_headers)
+
+    assert resp.json()["candidates"] == []
+
+
+def test_lti_candidates_unrecognized_material_excluded(client, auth_headers, db_session_factory):
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+    _add_lti_resolution(
+        db_session_factory, course_id, material_id, status="unrecognized",
+        final_url="https://example.com/some/landing/page",
+    )
+
+    resp = client.get(f"/api/ingest/lti-candidates?orgUnitId={ORG_UNIT_ID}", headers=auth_headers)
+
+    assert resp.json()["candidates"] == []
+
+
+def test_lti_candidates_failed_material_still_listed(client, auth_headers, db_session_factory):
+    """Transient launch failures (e.g. the tab got closed) must retry on the
+    next sync -- unlike resolved/unrecognized, a failed row does NOT remove
+    the material from the candidate list."""
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+    _add_lti_resolution(db_session_factory, course_id, material_id, status="failed", error="tab closed")
+
+    resp = client.get(f"/api/ingest/lti-candidates?orgUnitId={ORG_UNIT_ID}", headers=auth_headers)
+
+    candidates = resp.json()["candidates"]
+    assert len(candidates) == 1
+    assert candidates[0]["materialId"] == material_id
+
+
+def test_lti_candidates_unknown_org_unit_404(client, auth_headers):
+    resp = client.get("/api/ingest/lti-candidates?orgUnitId=99999", headers=auth_headers)
+    assert resp.status_code == 404
+
+
+def test_lti_candidates_requires_pairing_token(client):
+    no_auth = client.get(f"/api/ingest/lti-candidates?orgUnitId={ORG_UNIT_ID}")
+    assert no_auth.status_code == 401
+
+    wrong_auth = client.get(
+        f"/api/ingest/lti-candidates?orgUnitId={ORG_UNIT_ID}", headers={"Authorization": "Bearer wrong-token"}
+    )
+    assert wrong_auth.status_code == 401
+
+
+# -- 12b. lti-resolution POST -------------------------------------------------
+
+
+def _resolve(client, auth_headers, *, org_unit_id=ORG_UNIT_ID, material_id, final_url, error=None):
+    return client.post(
+        "/api/ingest/lti-resolution",
+        headers=auth_headers,
+        json={"orgUnitId": org_unit_id, "materialId": material_id, "finalUrl": final_url, "error": error},
+    )
+
+
+def test_lti_resolution_recognized_url_expands_and_upserts_media_sources(
+    client, auth_headers, db_session_factory
+):
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+
+    # A catalog/channel-shaped URL: recognized by classify_url directly (the
+    # "/mediasite/catalog/" path marker) AND matched by MockMediaFetcher's
+    # "mock-channel" substring, so expand() fans it out into three entries.
+    resp = _resolve(
+        client, auth_headers, material_id=material_id,
+        final_url="https://mediasite.example.edu/Mediasite/Catalog/mock-channel",
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "resolved"
+    assert body["platform"] == "mediasite"
+    assert body["added"] == 3
+    assert body["total"] == 3
+
+    with db_session_factory() as session:
+        from brightspace_agent.db.models import MediaSource
+
+        rows = list(session.execute(select(MediaSource).where(MediaSource.course_id == course_id)).scalars().all())
+        assert len(rows) == 3
+        assert all(row.platform == "mediasite" for row in rows)
+
+        resolution = session.execute(
+            select(LtiResolution).where(LtiResolution.material_id == material_id)
+        ).scalar_one()
+        assert resolution.status == "resolved"
+        assert resolution.platform == "mediasite"
+        assert resolution.final_url == "https://mediasite.example.edu/Mediasite/Catalog/mock-channel"
+        assert resolution.launch_url == LTI_LAUNCH_URL
+
+
+def test_lti_resolution_unrecognized_url_stores_unrecognized_and_final_url(
+    client, auth_headers, db_session_factory
+):
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+
+    resp = _resolve(
+        client, auth_headers, material_id=material_id, final_url="https://example.com/some/landing/page",
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "unrecognized"}
+
+    with db_session_factory() as session:
+        resolution = session.execute(
+            select(LtiResolution).where(LtiResolution.material_id == material_id)
+        ).scalar_one()
+        assert resolution.status == "unrecognized"
+        assert resolution.final_url == "https://example.com/some/landing/page"
+        assert resolution.platform is None
+        assert resolution.course_id == course_id
+
+
+def test_lti_resolution_null_final_url_stores_failed_and_error(client, auth_headers, db_session_factory):
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+
+    resp = _resolve(client, auth_headers, material_id=material_id, final_url=None, error="tab closed")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "failed"}
+
+    with db_session_factory() as session:
+        resolution = session.execute(
+            select(LtiResolution).where(LtiResolution.material_id == material_id)
+        ).scalar_one()
+        assert resolution.status == "failed"
+        assert resolution.final_url is None
+        assert resolution.error == "tab closed"
+
+
+def test_lti_resolution_javascript_scheme_final_url_stores_failed_never_touches_media_sources(
+    client, auth_headers, db_session_factory
+):
+    """A javascript:-shaped URL that is otherwise Zoom-host-shaped must never
+    reach classify_url/media_sources -- same defense-in-depth as
+    api/media.py's manual-add `_require_absolute_http_url` guard, just
+    non-raising here since this endpoint always returns 200 with a status
+    field rather than a 422."""
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+
+    resp = _resolve(client, auth_headers, material_id=material_id, final_url="javascript://zoom.us/rec/share/x")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "failed"}
+
+    with db_session_factory() as session:
+        from brightspace_agent.db.models import MediaSource
+
+        assert session.execute(select(MediaSource)).scalars().all() == []
+        resolution = session.execute(
+            select(LtiResolution).where(LtiResolution.material_id == material_id)
+        ).scalar_one()
+        assert resolution.status == "failed"
+
+
+def test_lti_resolution_re_post_overwrites_no_duplicate_row(client, auth_headers, db_session_factory):
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+
+    first = _resolve(client, auth_headers, material_id=material_id, final_url="https://example.com/landing")
+    assert first.json() == {"status": "unrecognized"}
+
+    second = _resolve(
+        client, auth_headers, material_id=material_id,
+        final_url="https://mediasite.example.edu/Mediasite/Play/xyz",
+    )
+    assert second.status_code == 200
+    assert second.json()["status"] == "resolved"
+
+    with db_session_factory() as session:
+        rows = list(
+            session.execute(select(LtiResolution).where(LtiResolution.material_id == material_id)).scalars().all()
+        )
+        assert len(rows) == 1  # not duplicated -- UNIQUE(material_id) upsert
+        assert rows[0].status == "resolved"
+        assert rows[0].final_url == "https://mediasite.example.edu/Mediasite/Play/xyz"
+
+
+def test_lti_resolution_non_candidate_material_id_404(client, auth_headers, db_session_factory):
+    course_id = handshake(client, auth_headers)
+    # A plain (non-LTI) link material -- never a candidate in the first place.
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Syllabus", source_url="https://zoom.us/some/plain/link",
+    )
+
+    resp = _resolve(
+        client, auth_headers, material_id=material_id, final_url="https://mediasite.example.edu/Mediasite/Play/xyz",
+    )
+
+    assert resp.status_code == 404
+
+
+def test_lti_resolution_unknown_material_id_404(client, auth_headers):
+    handshake(client, auth_headers)
+    resp = _resolve(client, auth_headers, material_id=999999, final_url="https://example.com/x")
+    assert resp.status_code == 404
+
+
+def test_lti_resolution_unknown_org_unit_404(client, auth_headers, db_session_factory):
+    resp = client.post(
+        "/api/ingest/lti-resolution",
+        headers=auth_headers,
+        json={"orgUnitId": 99999, "materialId": 1, "finalUrl": "https://example.com/x", "error": None},
+    )
+    assert resp.status_code == 404
+
+
+def test_lti_resolution_requires_pairing_token(client, db_session_factory):
+    resp = client.post(
+        "/api/ingest/lti-resolution",
+        json={"orgUnitId": ORG_UNIT_ID, "materialId": 1, "finalUrl": None, "error": None},
+    )
+    assert resp.status_code == 401
+
+
+def test_lti_resolution_resolved_material_disappears_from_candidates(client, auth_headers, db_session_factory):
+    """The payoff, end to end: a resolved material is no longer offered as a
+    candidate on the next sync's GET."""
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+
+    _resolve(
+        client, auth_headers, material_id=material_id,
+        final_url="https://mediasite.example.edu/Mediasite/Play/xyz",
+    )
+
+    resp = client.get(f"/api/ingest/lti-candidates?orgUnitId={ORG_UNIT_ID}", headers=auth_headers)
+    assert resp.json()["candidates"] == []
+
+
+# -- 12c. lti-resolution POST: expand_and_upsert_media failure must still --
+# leave a durable `failed` row (fix-wave item 1). On a DEFAULT install (no
+# `--group media`), every recognized Mediasite/Zoom channel hits the
+# not_installed 503 below -- if that path left no row, the drawer would say
+# "Will resolve automatically on your next sync" forever while the extension
+# re-launches a background tab on every single sync.
+
+
+def test_lti_resolution_expand_not_installed_leaves_failed_row_and_503(
+    client, app, auth_headers, db_session_factory, monkeypatch
+):
+    from brightspace_agent.media.fetch import MediaFetchError
+
+    def boom(url):
+        raise MediaFetchError("not_installed", "yt-dlp is not installed. Run `uv sync --group media` to install it.")
+
+    monkeypatch.setattr(app.state.media_fetcher, "expand", boom)
+
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+
+    resp = _resolve(
+        client, auth_headers, material_id=material_id,
+        final_url="https://mediasite.example.edu/Mediasite/Play/xyz",
+    )
+
+    assert resp.status_code == 503
+    assert "yt-dlp is not installed" in resp.json()["detail"]
+
+    with db_session_factory() as session:
+        from brightspace_agent.db.models import MediaSource
+
+        assert session.execute(select(MediaSource)).scalars().all() == []
+        resolution = session.execute(
+            select(LtiResolution).where(LtiResolution.material_id == material_id)
+        ).scalar_one()
+        assert resolution.status == "failed"
+        assert resolution.final_url == "https://mediasite.example.edu/Mediasite/Play/xyz"
+        assert resolution.error is not None
+        assert "yt-dlp is not installed" in resolution.error
+
+    # Visible in the drawer's hints resolution state, not just the raw row.
+    hints = client.get(f"/api/courses/{course_id}/media").json()["hints"]
+    hint = next(h for h in hints if h["materialId"] == material_id)
+    assert hint["resolution"]["status"] == "failed"
+    assert "yt-dlp is not installed" in hint["resolution"]["error"]
+
+
+def test_lti_resolution_expand_nothing_classified_leaves_failed_row_and_400(
+    client, app, auth_headers, db_session_factory, monkeypatch
+):
+    from brightspace_agent.media.fetch import ExpandedEntry
+
+    def expand_to_unclassifiable(url):
+        return [ExpandedEntry(url="https://example.com/some/random/page", title=None)]
+
+    monkeypatch.setattr(app.state.media_fetcher, "expand", expand_to_unclassifiable)
+
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+
+    resp = _resolve(
+        client, auth_headers, material_id=material_id,
+        # Classifies at the top-level classify_url gate, so expand() runs --
+        # its (mocked) entries are what fails to classify.
+        final_url="https://mediasite.example.edu/Mediasite/Play/xyz",
+    )
+
+    assert resp.status_code == 400
+    assert "recognized" in resp.json()["detail"].lower()
+
+    with db_session_factory() as session:
+        from brightspace_agent.db.models import MediaSource
+
+        assert session.execute(select(MediaSource)).scalars().all() == []
+        resolution = session.execute(
+            select(LtiResolution).where(LtiResolution.material_id == material_id)
+        ).scalar_one()
+        assert resolution.status == "failed"
+        assert resolution.final_url == "https://mediasite.example.edu/Mediasite/Play/xyz"
+        assert resolution.error is not None
+        assert "recognized" in resolution.error.lower()
+
+
+def test_lti_resolution_failed_expand_row_overwritten_by_later_success(
+    client, app, auth_headers, db_session_factory, monkeypatch
+):
+    """A `failed` row from an expand failure is exactly as retryable as any
+    other `failed` row -- a later successful re-resolution overwrites it."""
+    from brightspace_agent.media.fetch import MediaFetchError
+
+    real_expand = app.state.media_fetcher.expand
+
+    def boom(url):
+        raise MediaFetchError("not_installed", "yt-dlp is not installed.")
+
+    monkeypatch.setattr(app.state.media_fetcher, "expand", boom)
+
+    course_id = handshake(client, auth_headers)
+    material_id = _add_link_material(
+        db_session_factory, course_id, title="Mediasite Channel", source_url=LTI_LAUNCH_URL,
+    )
+
+    first = _resolve(
+        client, auth_headers, material_id=material_id,
+        final_url="https://mediasite.example.edu/Mediasite/Play/xyz",
+    )
+    assert first.status_code == 503
+
+    # The failure itself must have landed a durable 'failed' row -- this is
+    # the crux of the fix, not just a side effect re-checked below.
+    with db_session_factory() as session:
+        after_failure = session.execute(
+            select(LtiResolution).where(LtiResolution.material_id == material_id)
+        ).scalar_one()
+        assert after_failure.status == "failed"
+
+    # The material must still be offered as a candidate (failed rows retry).
+    candidates = client.get(f"/api/ingest/lti-candidates?orgUnitId={ORG_UNIT_ID}", headers=auth_headers).json()
+    assert [c["materialId"] for c in candidates["candidates"]] == [material_id]
+
+    monkeypatch.setattr(app.state.media_fetcher, "expand", real_expand)
+
+    second = _resolve(
+        client, auth_headers, material_id=material_id,
+        final_url="https://mediasite.example.edu/Mediasite/Play/xyz",
+    )
+    assert second.status_code == 200
+    assert second.json()["status"] == "resolved"
+
+    with db_session_factory() as session:
+        rows = list(
+            session.execute(select(LtiResolution).where(LtiResolution.material_id == material_id)).scalars().all()
+        )
+        assert len(rows) == 1
+        assert rows[0].status == "resolved"

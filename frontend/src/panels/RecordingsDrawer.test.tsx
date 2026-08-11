@@ -91,7 +91,7 @@ function fixtureMedia(overrides: Partial<MediaListResponse> = {}): MediaListResp
 }
 
 function hint(overrides: Partial<MediaHint> = {}): MediaHint {
-  return { materialId: 50, title: "Mediasite Channel (Stern)", ...overrides };
+  return { materialId: 50, title: "Mediasite Channel (Stern)", resolution: null, ...overrides };
 }
 
 function renderDrawer(onClose = vi.fn()) {
@@ -406,22 +406,6 @@ describe("RecordingsDrawer: add URL", () => {
 });
 
 describe("RecordingsDrawer: LTI channel hints", () => {
-  it("renders the hint title and instruction when hints are non-empty", async () => {
-    mockedGetMedia.mockResolvedValue(
-      fixtureMedia({ hints: [hint({ materialId: 50, title: "Mediasite Channel (Stern)" })] }),
-    );
-
-    renderDrawer();
-
-    await screen.findByText("These look like recording channels the sync can't read:");
-    expect(screen.getByText("Mediasite Channel (Stern)")).toBeTruthy();
-    expect(
-      screen.getByText(
-        /Open it in Brightspace, copy the page URL from the embedded player/,
-      ),
-    ).toBeTruthy();
-  });
-
   it("renders nothing when hints are empty", async () => {
     mockedGetMedia.mockResolvedValue(fixtureMedia({ hints: [] }));
 
@@ -429,6 +413,125 @@ describe("RecordingsDrawer: LTI channel hints", () => {
     await screen.findByText("Lecture 1 (Mediasite)");
 
     expect(screen.queryByText("These look like recording channels the sync can't read:")).toBeNull();
+  });
+
+  it("resolution == null: shows the title and a 'resolves automatically' status, plus the paste fallback note", async () => {
+    mockedGetMedia.mockResolvedValue(
+      fixtureMedia({ hints: [hint({ materialId: 50, title: "Mediasite Channel (Stern)", resolution: null })] }),
+    );
+
+    renderDrawer();
+
+    await screen.findByText("These look like recording channels the sync can't read:");
+    expect(screen.getByText("Mediasite Channel (Stern)")).toBeTruthy();
+    expect(screen.getByText("Will resolve automatically on your next sync.")).toBeTruthy();
+    expect(
+      screen.getByText(/open it in Brightspace, copy the page URL from the embedded player/i),
+    ).toBeTruthy();
+  });
+
+  it("resolution 'unrecognized': shows the landing URL as a guarded anchor plus the paste fallback", async () => {
+    mockedGetMedia.mockResolvedValue(
+      fixtureMedia({
+        hints: [
+          hint({
+            materialId: 51,
+            title: "Zoom Recordings (Week 2)",
+            resolution: { status: "unrecognized", finalUrl: "https://example.com/some/landing/page", error: null },
+          }),
+        ],
+      }),
+    );
+
+    renderDrawer();
+
+    const status = await screen.findByText(/Launch landed at/);
+    expect(status.textContent).toContain("not a recognized platform");
+    const link = within(status).getByRole("link", { name: "https://example.com/some/landing/page" });
+    expect(link.getAttribute("href")).toBe("https://example.com/some/landing/page");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toContain("noopener");
+    expect(
+      screen.getByText(/open it in Brightspace, copy the page URL from the embedded player/i),
+    ).toBeTruthy();
+  });
+
+  it("resolution 'unrecognized' with an unsafe finalUrl scheme renders text, never an anchor", async () => {
+    mockedGetMedia.mockResolvedValue(
+      fixtureMedia({
+        hints: [
+          hint({
+            materialId: 52,
+            title: "Sketchy Channel",
+            resolution: { status: "unrecognized", finalUrl: "javascript://evil", error: null },
+          }),
+        ],
+      }),
+    );
+
+    renderDrawer();
+
+    const status = await screen.findByText(/Launch landed at/);
+    expect(status.textContent).toContain("javascript://evil");
+    expect(within(status).queryByRole("link")).toBeNull();
+  });
+
+  it("resolution 'failed': shows the error text plus the paste fallback", async () => {
+    mockedGetMedia.mockResolvedValue(
+      fixtureMedia({
+        hints: [
+          hint({
+            materialId: 53,
+            title: "Panopto Lectures",
+            resolution: { status: "failed", finalUrl: null, error: "tab closed" },
+          }),
+        ],
+      }),
+    );
+
+    renderDrawer();
+
+    await screen.findByText("Panopto Lectures");
+    expect(screen.getByText("tab closed")).toBeTruthy();
+    expect(
+      screen.getByText(/open it in Brightspace, copy the page URL from the embedded player/i),
+    ).toBeTruthy();
+  });
+
+  it("resolution 'resolved' drops the hint from the list entirely (it already has a real recording row)", async () => {
+    mockedGetMedia.mockResolvedValue(
+      fixtureMedia({
+        hints: [
+          hint({
+            materialId: 54,
+            title: "Already Resolved Channel",
+            resolution: { status: "resolved", finalUrl: "https://mediasite.example.edu/Mediasite/Play/x", error: null },
+          }),
+        ],
+      }),
+    );
+
+    renderDrawer();
+    await screen.findByText("Lecture 1 (Mediasite)");
+
+    expect(screen.queryByText("These look like recording channels the sync can't read:")).toBeNull();
+    expect(screen.queryByText("Already Resolved Channel")).toBeNull();
+  });
+
+  it("renders the Add-URL box below the hints box", async () => {
+    mockedGetMedia.mockResolvedValue(
+      fixtureMedia({ hints: [hint({ materialId: 50, title: "Mediasite Channel (Stern)", resolution: null })] }),
+    );
+
+    renderDrawer();
+
+    const hintsHeading = await screen.findByText("These look like recording channels the sync can't read:");
+    const addUrlHeading = screen.getByText("Add recording or channel URL");
+    // DOCUMENT_POSITION_FOLLOWING (4) means addUrlHeading comes after
+    // hintsHeading in document order -- the hints box is no longer demoted
+    // below the paste box (M2.7: paste is now the fallback, not the front
+    // door), it's the other way around.
+    expect(hintsHeading.compareDocumentPosition(addUrlHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });
 
