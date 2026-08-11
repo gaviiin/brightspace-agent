@@ -182,6 +182,29 @@ def test_claim_with_no_request_ever_made_404s(client):
     assert resp.status_code == 404
 
 
+# --- Fix-wave item 2: a non-ASCII requestId must 404 like any other -------
+# mismatch, not 500. `secrets.compare_digest` raises TypeError on non-ASCII
+# str inputs, so this must never reach it with the raw request_id.
+
+
+def test_claim_non_ascii_request_id_404s_with_nothing_pending(client):
+    resp = client.get("/api/pair/claim", params={"requestId": "é"})
+    assert resp.status_code == 404
+
+
+def test_claim_non_ascii_request_id_404s_with_a_request_pending(client):
+    """The exact reproduction from the final review: `?requestId=%C3%A9`
+    against a pending request must 404 exactly like a mismatched ASCII id
+    does -- not 500. Before the fix this was the ONE case (pending +
+    non-ASCII) that hit `secrets.compare_digest` and raised TypeError."""
+    request_pair(client)
+
+    resp = client.get("/api/pair/claim", params={"requestId": "é"})
+
+    assert resp.status_code == 404
+    assert "pairingToken" not in resp.text
+
+
 # --- Security invariant 1: token released ONLY to the approved requestId ---
 
 

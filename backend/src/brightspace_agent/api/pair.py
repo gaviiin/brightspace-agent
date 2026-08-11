@@ -166,7 +166,16 @@ def claim_pairing(request: Request, request_id: str = Query(alias="requestId")) 
     # Constant-time compare, and a mismatch 404s exactly like "nothing
     # pending" -- an attacker probing with a wrong id learns nothing about
     # whether a real request is in flight, let alone its id or the token.
-    if pending is None or not secrets.compare_digest(pending["request_id"], request_id):
+    # Compared as UTF-8 bytes, not `str`: `secrets.compare_digest` raises
+    # TypeError on a non-ASCII `str` argument, which would otherwise turn a
+    # non-ASCII requestId probe into a 500 -- itself a leak (500 only when a
+    # request is pending, 404 otherwise) and a break of the invariant this
+    # comment claims. `real_request_id.encode()` is always plain ASCII
+    # (`secrets.token_urlsafe`'s alphabet), so this only ever changes what
+    # a non-ASCII `request_id` compares against, never the real id's bytes.
+    if pending is None or not secrets.compare_digest(
+        pending["request_id"].encode(), request_id.encode("utf-8", errors="surrogatepass")
+    ):
         raise HTTPException(status_code=404, detail="unknown or expired pairing request")
 
     if not pending["approved"]:
