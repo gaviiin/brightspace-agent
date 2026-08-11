@@ -4,6 +4,7 @@ import {
   LTI_MAX_CANDIDATES_PER_RUN,
   LTI_SETTLE_QUIET_MS,
   LTI_SETTLE_TIMEOUT_MS,
+  canonicalizeOrigin,
   resolveLtiCandidates,
 } from "./lti-resolver";
 import type { LtiResolverBackendLike, LtiResolverDeps, TabDriver } from "./lti-resolver";
@@ -290,6 +291,68 @@ describe("resolveLtiCandidates — off-origin launchUrl", () => {
       error: "launch URL not on tenant origin",
     });
     expect(summary).toEqual({ resolved: 0, unrecognized: 0, failed: 1, total: 1 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// canonicalizeOrigin (fix-wave item 3)
+//
+// `resolveOnOriginUrl` compares against `URL.origin`, which is always
+// canonical (lowercase host, no trailing slash, default port stripped). The
+// `origin` string `resolveLtiCandidates` receives comes from background.ts,
+// which reads it back out of the popup message or chrome.storage -- not
+// guaranteed to already be canonical. This small pure helper normalizes it;
+// it's exported (and lives here, in the pure module) purely because it
+// touches zero chrome.* itself, same house rule as everything else in this
+// file -- the actual call happens at the adapter seam, in background.ts,
+// before `origin` ever reaches `resolveLtiCandidates`.
+// ---------------------------------------------------------------------------
+
+describe("canonicalizeOrigin", () => {
+  it("lowercases the host", () => {
+    expect(canonicalizeOrigin("https://Tenant.example")).toBe("https://tenant.example");
+  });
+
+  it("strips a trailing slash", () => {
+    expect(canonicalizeOrigin("https://tenant.example/")).toBe("https://tenant.example");
+  });
+
+  it("strips the default port for the scheme", () => {
+    expect(canonicalizeOrigin("https://tenant.example:443")).toBe("https://tenant.example");
+  });
+
+  it("passes an unparseable origin through unchanged", () => {
+    // resolveOnOriginUrl's own try/catch + origin-mismatch check then
+    // rejects every candidate exactly as it does today for a badly-stored
+    // origin -- this helper doesn't hide that, it just doesn't make it worse.
+    expect(canonicalizeOrigin("not-a-url")).toBe("not-a-url");
+  });
+});
+
+describe("resolveLtiCandidates — canonicalized origin (regression, fix-wave item 3)", () => {
+  it("a non-canonical origin fails every candidate closed; the canonicalized form resolves normally", async () => {
+    // Uppercase host + trailing slash, exactly as chrome.storage might hold
+    // it (the popup writes whatever the tenant URL bar showed).
+    const rawOrigin = "https://Tenant.example/";
+    const tabs = makeFakeTabs({ finalUrlFor: () => "https://mediasite.example.edu/watch/abc" });
+    const backend = makeFakeBackend({
+      ltiCandidates: vi.fn().mockResolvedValue({ courseId: 1, candidates: [candidate(1, "/d2l/lti/launch/1")] }),
+      // Mirrors the real backend's contract closely enough for this test:
+      // an error means a client-side rejection (never reached the tab), no
+      // error means the launch actually happened and resolved.
+      reportLtiResolution: vi.fn((payload: LtiResolutionPayload) =>
+        Promise.resolve({ status: payload.error === null ? "resolved" : "failed" } as LtiResolutionResponse),
+      ),
+    });
+    const { deps } = makeDeps(tabs, backend);
+
+    const withRawOrigin = await resolveLtiCandidates(deps, rawOrigin, 1);
+    expect(withRawOrigin).toEqual({ resolved: 0, unrecognized: 0, failed: 1, total: 1 });
+    expect(tabs.open).not.toHaveBeenCalled();
+
+    const withCanonicalOrigin = await resolveLtiCandidates(deps, canonicalizeOrigin(rawOrigin), 1);
+    expect(withCanonicalOrigin).toEqual({ resolved: 1, unrecognized: 0, failed: 0, total: 1 });
+    expect(tabs.open).toHaveBeenCalledWith("https://tenant.example/d2l/lti/launch/1");
   });
 });
 

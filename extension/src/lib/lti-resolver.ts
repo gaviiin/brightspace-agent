@@ -221,3 +221,28 @@ function resolveOnOriginUrl(launchUrl: string, origin: string): string | null {
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
+
+/** Normalizes a tenant origin string to `URL.origin`'s canonical form
+ * (lowercase host, no trailing slash, default port stripped) -- exactly
+ * what `resolveOnOriginUrl` above compares `launchUrl`'s parsed origin
+ * against. `origin` here comes from background.ts, which reads it back out
+ * of the popup message or `chrome.storage`; it is NOT guaranteed to already
+ * be canonical (e.g. `https://Tenant.edu`, `https://tenant.edu/`, or
+ * `https://tenant.edu:443` are all plausible stored forms that a browser
+ * URL bar or a hand-typed tenant URL could produce), and a mismatch here
+ * fails EVERY candidate closed, forever, with no visible error. Exported so
+ * background.ts can call it at the adapter seam -- before `origin` ever
+ * reaches `resolveLtiCandidates` -- rather than this pure module reaching
+ * out to canonicalize its own input; it lives here only because, like
+ * everything else in this file, it touches zero chrome.* itself and so is
+ * directly testable. Falls back to `origin` unchanged if it isn't parseable
+ * at all -- `resolveOnOriginUrl`'s own try/catch and mismatch check then
+ * reject every candidate exactly as they do today for a badly-stored
+ * origin, rather than this helper silently hiding the problem. */
+export function canonicalizeOrigin(origin: string): string {
+  try {
+    return new URL(origin).origin;
+  } catch {
+    return origin;
+  }
+}

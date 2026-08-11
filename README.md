@@ -143,7 +143,7 @@ make test    # backend (pytest) + extension + frontend (vitest), all offline
 
 No API key or real tenant needed: LLM stages run against a deterministic
 mock (`BSA_MOCK_LLM=1`), and `make e2e` drives a fake D2L tenant through
-sync → LTI-launch autodiscovery → recordings → pipeline → graph end to end
+sync → recordings → LTI-launch autodiscovery → pipeline → graph end to end
 (the media stage runs against mock fetch/transcribe backends, so no yt-dlp
 or ASR is needed to run the suite). See `docs/OVERVIEW.md` for architecture
 detail and `docs/plan.md` for the roadmap (an MCP server is next).

@@ -5,7 +5,7 @@
 
 import { BackendClient } from "./lib/backend-client";
 import { D2LClient, RateLimitedFetcher } from "./lib/d2l-client";
-import { resolveLtiCandidates } from "./lib/lti-resolver";
+import { canonicalizeOrigin, resolveLtiCandidates } from "./lib/lti-resolver";
 import type { LtiResolverDeps, TabDriver } from "./lib/lti-resolver";
 import { discover, resume as resumeSync, syncCourse } from "./lib/sync-engine";
 import type { SyncDeps, SyncProgress, SyncState } from "./lib/sync-engine";
@@ -165,7 +165,12 @@ async function runLtiResolver(origin: string, orgUnitId: number): Promise<void> 
         chrome.runtime.sendMessage({ evt: "lti-progress", done: p.done, total: p.total }).catch(() => {});
       },
     };
-    const summary = await resolveLtiCandidates(deps, origin, orgUnitId);
+    // Canonicalize before comparing against launch URLs' parsed origins --
+    // `origin` here is whatever the popup message or chrome.storage held
+    // (uppercase host, trailing slash, explicit :443 are all plausible), and
+    // resolveLtiCandidates's origin check fails EVERY candidate closed,
+    // forever, on a mismatch. See lti-resolver.ts's canonicalizeOrigin.
+    const summary = await resolveLtiCandidates(deps, canonicalizeOrigin(origin), orgUnitId);
     if (summary.total > 0) {
       chrome.runtime
         .sendMessage({
